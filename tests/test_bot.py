@@ -146,3 +146,23 @@ def test_paper_runner_steps(cfg, tmp_path, monkeypatch):
     assert r.trader.trades, "expected the paper bot to trade"
     assert (tmp_path / "logs").exists() and any((tmp_path / "logs").iterdir())
     assert r.trader.equity(float(candles["close"].iloc[-1])) > 0
+
+
+def test_daytrade_flattens_and_blocks_late_entries(cfg):
+    cfg["daytrade"]["enabled"] = True
+    t = _trader(cfg)
+    # 10:00 Taipei = 02:00 UTC
+    opened = pd.Timestamp("2024-03-01T02:00:00Z")
+    assert t._entry_window(opened)[0]
+    t._open(100.0, Decision(BUY, TREND, stop_price=95.0), opened)
+    assert not t.session_check(101.0, pd.Timestamp("2024-03-01T10:00:00Z"))  # 18:00 Taipei
+    assert t.session_check(101.0, pd.Timestamp("2024-03-01T15:46:00Z"))  # 23:46 Taipei
+    assert t.position is None and t.trades[-1].reason == "day-trade session close"
+    assert not t._entry_window(pd.Timestamp("2024-03-01T15:30:00Z"))[0]  # 23:30 Taipei, past cutoff
+
+
+def test_optimize_runs(cfg):
+    from cryptobot.optimize import optimize
+    grid = {"strategy.stop_atr_mult": [2.0, 3.0]}
+    res = optimize(cfg, {"1h": synthetic(bars=1500, timeframe="1h", seed=2)}, grid=grid, workers=1)
+    assert len(res) == 2 and {"in", "out"} <= set(res[0])

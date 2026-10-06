@@ -30,6 +30,7 @@ class BacktestResult:
         by_regime: dict[str, int] = {}
         for t in self.trades:
             by_regime[t.regime] = by_regime.get(t.regime, 0) + 1
+        fees = sum(t.fees for t in self.trades)
         return {
             "start_equity": round(self.start_equity, 2),
             "end_equity": round(float(eq.iloc[-1]), 2),
@@ -41,6 +42,8 @@ class BacktestResult:
             "trades_by_regime": by_regime,
             "win_rate_pct": round(len(wins) / len(pnls) * 100, 1) if pnls else 0.0,
             "profit_factor": round(sum(wins) / -sum(losses), 2) if losses and sum(losses) < 0 else None,
+            "fees_paid": round(fees, 2),
+            "pnl_before_fees": round(sum(pnls) + fees, 2),
         }
 
 
@@ -58,6 +61,8 @@ def run_backtest(cfg: dict, candles: pd.DataFrame) -> BacktestResult:
     analyzed = trader.strategy.analyze(candles)  # indicators are causal, so precompute once
     warmup = trader.strategy.warmup
     equity_points = []
+    # Decisions happen when a bar closes, i.e. at open time + bar length.
+    step = analyzed.index.to_series().diff().median() if len(analyzed) > 1 else pd.Timedelta(0)
 
     for i in range(len(analyzed)):
         bar = analyzed.iloc[i]
@@ -66,7 +71,7 @@ def run_backtest(cfg: dict, candles: pd.DataFrame) -> BacktestResult:
             # 1) intrabar stops/targets for a position opened on a previous bar
             trader.check_exits(bar["low"], bar["high"], now=ts, open_=bar["open"])
             # 2) bar closed -> strategy decision on data up to and including this bar
-            trader.on_analyzed(analyzed.iloc[: i + 1], now=ts)
+            trader.on_analyzed(analyzed.iloc[: i + 1], now=ts + step)
         equity_points.append(trader.equity(bar["close"]))
 
     if trader.position is not None:  # mark-to-market close at the end

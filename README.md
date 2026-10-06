@@ -43,8 +43,15 @@ cp config.example.yaml config.yaml   # 依需求修改交易所、幣種、週�
 # 1. 回測（從交易所下載最近 90 天資料）
 python -m cryptobot backtest --days 90
 python -m cryptobot --symbol ETH/USDT --timeframe 1h backtest --days 180 --trades
-python -m cryptobot backtest --days 365 --save data/btc.csv   # 存下來，之後用 --csv 重複測試
+python -m cryptobot backtest --days 365 --refresh   # 下載的資料會快取在 data/，--refresh 重新下載
 python -m cryptobot backtest --synthetic                        # 離線用模擬行情測試
+
+# 參數最佳化：前 70% 資料找參數，後 30% 驗證(避免過度擬合)
+python -m cryptobot optimize                       # 測 1h、4h，一年資料
+python -m cryptobot --daytrade optimize            # 當沖：測 5m、15m
+
+# 當沖模式回測(台灣時間每天 23:45 強制平倉)
+python -m cryptobot --daytrade --timeframe 15m backtest --days 90
 
 # 2. 模擬交易：使用真實即時行情，但不會真的下單
 python -m cryptobot paper

@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -41,6 +41,7 @@ class Trade:
     amount: float
     pnl: float
     pnl_pct: float
+    fees: float
     reason: str
 
 
@@ -57,6 +58,8 @@ class Trader:
         self.last_atr: Optional[float] = None
         self.last_price: Optional[float] = None
         self.cooldown = 0  # candles to wait after a close before re-entering
+        self.trade_day: Optional[str] = None  # local date for the day-trade counter
+        self.trades_today = 0
         self.state_path = state_path
         self.journal_path = journal_path
         self._load_state()
@@ -72,6 +75,8 @@ class Trader:
         self.risk.load(data.get("risk", {}))
         self.last_atr = data.get("last_atr")
         self.cooldown = int(data.get("cooldown", 0))
+        self.trade_day = data.get("trade_day")
+        self.trades_today = int(data.get("trades_today", 0))
         log.info("restored state: position=%s", self.position)
 
     def _save_state(self) -> None:
@@ -86,6 +91,8 @@ class Trader:
                     "risk": self.risk.to_dict(),
                     "last_atr": self.last_atr,
                     "cooldown": self.cooldown,
+                    "trade_day": self.trade_day,
+                    "trades_today": self.trades_today,
                 },
                 fh,
                 indent=2,
@@ -113,6 +120,51 @@ class Trader:
         if isinstance(now, pd.Timestamp):
             now = now.to_pydatetime()
         return (now or datetime.now(timezone.utc)).isoformat()
+
+    # -------------------------------------------------------------- day trade
+    @property
+    def daytrade(self) -> dict:
+        dt = self.cfg.get("daytrade") or {}
+        return dt if dt.get("enabled") else {}
+
+    def _local(self, now) -> pd.Timestamp:
+        ts = pd.Timestamp(now)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert(self.daytrade.get("timezone", "Asia/Taipei"))
+
+    @staticmethod
+    def _hhmm(value: str) -> time:
+        h, m = str(value).split(":")
+        return time(int(h), int(m))
+
+    def session_check(self, price: float, now) -> bool:
+        """Day-trade mode: flatten at session end or once the local day rolls over."""
+        if not self.daytrade or self.position is None:
+            return False
+        local = self._local(now)
+        opened = self._local(self.position.opened_at)
+        if local.date() != opened.date() or local.time() >= self._hhmm(self.daytrade["session_end"]):
+            self._close(price, now, "day-trade session close")
+            return True
+        return False
+
+    def _entry_window(self, now) -> tuple[bool, str]:
+        dt = self.daytrade
+        if not dt:
+            return True, ""
+        local = self._local(now)
+        day = local.strftime("%Y-%m-%d")
+        if day != self.trade_day:
+            self.trade_day, self.trades_today = day, 0
+        t = local.time()
+        if t < self._hhmm(dt.get("session_start", "00:00")):
+            return False, "before day-trade session start"
+        if t >= self._hhmm(dt["no_new_entries_after"]) or t >= self._hhmm(dt["session_end"]):
+            return False, "too close to day-trade session end"
+        if self.trades_today >= int(dt.get("max_trades_per_day", 10**9)):
+            return False, "max trades per day reached"
+        return True, ""
 
     # ------------------------------------------------------------------ exits
     def check_exits(self, low: float, high: float, now=None, open_: float | None = None) -> bool:
@@ -152,6 +204,10 @@ class Trader:
         now = now if now is not None else analyzed.index[-1]
         self.risk.update(self.equity(price), pd.Timestamp(now).to_pydatetime())
 
+        if self.session_check(price, now):
+            self._save_state()
+            return "sell"
+
         decision = self.strategy.decide(analyzed, self.position)
         action = "hold"
         pos = self.position
@@ -175,9 +231,12 @@ class Trader:
             self.cooldown -= 1
         elif decision.action == BUY:
             ok, why = self.risk.can_open()
+            if ok:
+                ok, why = self._entry_window(now)
             if not ok:
-                log.warning("entry skipped: %s", why)
+                log.info("entry skipped: %s", why)
             elif self._open(price, decision, now):
+                self.trades_today += 1
                 action = "buy"
 
         self._save_state()
@@ -217,7 +276,9 @@ class Trader:
             log.error("could not close position (order rejected); will retry")
             return
         proceeds = fill.amount * fill.price - fill.fee
-        pnl = proceeds - pos.cost * (fill.amount / pos.amount)
+        frac = fill.amount / pos.amount
+        pnl = proceeds - pos.cost * frac
+        fees = (pos.cost - pos.amount * pos.entry_price) * frac + fill.fee
         trade = Trade(
             opened_at=pos.opened_at,
             closed_at=self._ts(now),
@@ -227,6 +288,7 @@ class Trader:
             amount=fill.amount,
             pnl=pnl,
             pnl_pct=pnl / pos.cost * 100 if pos.cost else 0.0,
+            fees=fees,
             reason=reason,
         )
         self.trades.append(trade)

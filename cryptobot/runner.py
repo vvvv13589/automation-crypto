@@ -57,6 +57,7 @@ class Runner:
         price = float(ticker.get("last") or ticker.get("close"))
         now = datetime.now(timezone.utc)
         self.trader.check_exits(price, price, now=now)
+        self.trader.session_check(price, now)  # day-trade forced close, even between candles
 
         # New closed candle -> re-evaluate market regime and signals.
         candles = fetch_recent(self.exchange, self.symbol, self.timeframe, self.cfg["history_bars"])

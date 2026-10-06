@@ -74,9 +74,14 @@ class AdaptiveStrategy:
             and row["plus_di"] > row["minus_di"]
         )
         bear_trend = regime == TREND and row["minus_di"] > row["plus_di"]
+        lookback = max(1, int(p.get("adx_rising_bars", 3)))
+        adx_rising = (
+            not p.get("adx_rising", True)
+            or row["adx"] > analyzed["adx"].iloc[-1 - lookback]
+        )
 
         if position is None:
-            if regime == TREND and bull_trend and row["rsi"] < p["rsi_overbought"]:
+            if regime == TREND and bull_trend and adx_rising and row["rsi"] < p["rsi_overbought"]:
                 return Decision(
                     BUY, TREND, f"trend entry ADX={row['adx']:.1f}",
                     stop_price=close - p["stop_atr_mult"] * atr,
@@ -85,6 +90,7 @@ class AdaptiveStrategy:
                 regime == RANGE
                 and close < row["bb_lower"]
                 and row["rsi"] < p["rsi_oversold"]
+                and (not p.get("range_requires_uptrend", True) or close > row["ema_trend"])
             ):
                 return Decision(
                     BUY, RANGE, f"range entry RSI={row['rsi']:.1f}",
@@ -97,7 +103,7 @@ class AdaptiveStrategy:
         if position.regime == TREND:
             if row["ema_fast"] < row["ema_slow"]:
                 return Decision(SELL, regime, "trend exit: EMA cross down")
-            if bear_trend:
+            if bear_trend and p.get("trend_exit_on_di", False):
                 return Decision(SELL, regime, "trend exit: bearish DI")
             return Decision(HOLD, regime, "riding trend")
 

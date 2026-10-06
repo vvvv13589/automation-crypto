@@ -4,11 +4,20 @@ exchange:
   id: binance            # 任何 ccxt 支援的交易所 id：binance, okx, bybit, kraken ...
   sandbox: false         # true = 使用交易所測試網(若支援)
 symbol: BTC/USDT
-timeframe: 15m           # 訊號使用的 K 線週期
-history_bars: 300        # 計算指標所需的 K 線數量
+timeframe: 1h            # 訊號使用的 K 線週期(15m 太頻繁，手續費會吃掉獲利)
+history_bars: 500        # 計算指標所需的 K 線數量
 poll_seconds: 10         # 每幾秒檢查一次即時價格(停損/停利)
 state_dir: state         # 持倉狀態儲存位置(重啟後可接續)
 log_dir: logs            # 交易紀錄 CSV
+
+# 當沖模式：當天開倉、當天平倉，不留倉過夜
+daytrade:
+  enabled: false
+  timezone: Asia/Taipei     # 以台灣時間計算「一天」
+  session_start: "00:00"    # 幾點後才開始開新倉
+  no_new_entries_after: "23:00"  # 幾點後不再開新倉
+  session_end: "23:45"      # 強制平倉時間(所有部位清空)
+  max_trades_per_day: 6     # 每天最多開幾次倉(限制手續費)
 
 paper:
   starting_cash: 10000   # 模擬起始資金(計價幣，例如 USDT)
@@ -28,8 +37,12 @@ strategy:
   adx_period: 14
   adx_trend: 25          # ADX >= 此值 => 趨勢盤
   adx_range: 20          # ADX <= 此值 => 盤整盤
-  stop_atr_mult: 2.0     # 初始停損 = 進場價 - 2 x ATR
-  trail_atr_mult: 3.0    # 趨勢單移動停損 = 最高價 - 3 x ATR
+  stop_atr_mult: 3.0     # 初始停損 = 進場價 - 3 x ATR
+  trail_atr_mult: 4.0    # 趨勢單移動停損 = 最高價 - 4 x ATR
+  adx_rising: true       # 趨勢進場需 ADX 正在上升(趨勢增強中)
+  adx_rising_bars: 3     # 與幾根 K 線前的 ADX 比較
+  trend_exit_on_di: false        # true = 空方 DI 轉強就出場(較敏感，交易次數多)
+  range_requires_uptrend: true   # 盤整抄底只在價格高於 EMA200 時進行(不接下跌的刀)
 
 risk:
   risk_per_trade: 0.01   # 每筆交易最多虧損總資產 1%
