@@ -17,6 +17,7 @@ class BacktestResult:
     trades: list
     start_equity: float
     buy_hold_return: float
+    halted_at: str | None = None
 
     def summary(self) -> dict:
         eq = self.equity
@@ -46,6 +47,7 @@ class BacktestResult:
             "profit_factor": round(sum(wins) / -sum(losses), 2) if losses and sum(losses) < 0 else None,
             "fees_paid": round(fees, 2),
             "funding_paid": round(funding, 2),
+            "max_drawdown_halt_at": self.halted_at,
             "pnl_before_costs": round(sum(pnls) + fees + funding, 2),
         }
 
@@ -94,7 +96,8 @@ def run_backtest(cfg: dict, candles: pd.DataFrame) -> BacktestResult:
     equity = pd.Series(equity_points, index=analyzed.index)
     first = analyzed["close"].iloc[min(warmup, len(analyzed) - 1)]
     bh = analyzed["close"].iloc[-1] / first - 1
-    return BacktestResult(equity.iloc[warmup:], trader.trades, cfg["paper"]["starting_cash"], float(bh))
+    return BacktestResult(equity.iloc[warmup:], trader.trades, cfg["paper"]["starting_cash"],
+                          float(bh), trader.halted_at)
 
 
 def make_paper_broker(cfg: dict) -> PaperBroker:

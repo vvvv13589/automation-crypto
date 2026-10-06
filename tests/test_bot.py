@@ -253,3 +253,16 @@ def test_paper_runner_steps(cfg, tmp_path, monkeypatch):
     assert r.trader.trades, "expected the paper bot to trade"
     assert any((tmp_path / "logs").iterdir())
     assert r.trader.equity(float(candles["close"].iloc[-1])) > 0
+
+
+def test_optimizer_only_recommends_robust_results():
+    from cryptobot.optimize import robust
+
+    def res(ret_in, ret_out, n_in=30, n_out=15):
+        return {"in": {"total_return_pct": ret_in, "trades": n_in},
+                "out": {"total_return_pct": ret_out, "trades": n_out}}
+
+    assert robust(res(5, 3))
+    assert not robust(res(-6.7, 13.0))  # lucky out-of-sample only (seen on real ETH data)
+    assert not robust(res(5, -1))
+    assert not robust(res(5, 3, n_in=4))  # too few trades to trust

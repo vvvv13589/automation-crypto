@@ -98,6 +98,7 @@ class Trader:
         self.session_key: Optional[str] = None
         self.trades_today = 0
         self._halted = False
+        self.halted_at: Optional[str] = None  # first time the circuit breaker stopped entries
         self.state_path = state_path
         self.journal_path = journal_path
         self._load_state()
@@ -390,7 +391,7 @@ class Trader:
         self.last_atr = atr if atr == atr else self.last_atr  # NaN-safe
         self._apply_funding(now)
         self.risk.update(self.equity(price), self._utc(now).to_pydatetime())
-        self._check_halt()
+        self._check_halt(now)
 
         if self.pending is not None:
             self.pending.bars_left -= 1
@@ -439,10 +440,12 @@ class Trader:
         self._save_state()
         return action
 
-    def _check_halt(self) -> None:
+    def _check_halt(self, now=None) -> None:
         ok, why = self.risk.can_open()
         if not ok and not self._halted:
             self.notify(f"⛔ 暫停開新倉: {why}")
+            if self.risk.drawdown_halt and self.halted_at is None:
+                self.halted_at = self._ts(now)
         self._halted = not ok
 
     # --------------------------------------------------------- close helper

@@ -65,12 +65,14 @@ def cmd_optimize(cfg: dict, args) -> int:
     print(format_report(results, top=args.top))
     print("\nIS = in-sample (used for ranking), OOS = out-of-sample (unseen data), "
           "n = trades, B&H = buy & hold")
-    best = next((r for r in results if r["out"]["total_return_pct"] > 0), None)
+    print("(circuit breakers are disabled here so every combination runs the full period)")
+    from .optimize import MIN_TRADES, robust
+    best = next((r for r in results if robust(r)), None)
     if best is None:
-        print("\nNo combination was profitable out-of-sample - do NOT trade this live.")
+        print(f"\n❌ No combination made money on BOTH the in-sample and out-of-sample data "
+              f"(with >= {MIN_TRADES} trades).\n   The strategy shows no edge here - do NOT trade it live.")
     else:
-        print("\nBest in-sample result that also made money out-of-sample. "
-              "Paste into config.yaml:\n")
+        print("\n✅ Best combination that was profitable on both halves. Paste into config.yaml:\n")
         print(best_yaml(best))
     return 0
 

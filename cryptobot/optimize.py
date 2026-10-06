@@ -43,6 +43,16 @@ def split(candles: pd.DataFrame, cfg: dict, ratio: float) -> tuple[pd.DataFrame,
     return candles.iloc[:cut], candles.iloc[max(0, cut - warmup):]
 
 
+MIN_TRADES = 20
+
+
+def robust(result: dict) -> bool:
+    """Profitable on BOTH halves with enough trades to mean something."""
+    a, b = result["in"], result["out"]
+    return (a["total_return_pct"] > 0 and b["total_return_pct"] > 0
+            and a["trades"] >= MIN_TRADES and b["trades"] >= MIN_TRADES // 2)
+
+
 def score(summary: dict) -> float:
     """Return penalised by drawdown; too few trades is not trustworthy."""
     if summary["trades"] < 5:
@@ -55,6 +65,10 @@ def _evaluate(job):
     logging.getLogger("cryptobot").setLevel(logging.WARNING)
     run_cfg = apply_overrides(cfg, overrides)
     run_cfg["timeframe"] = tf
+    # Judge the raw strategy: circuit breakers would cut every bad run short at
+    # the same drawdown and make all combinations look alike.
+    run_cfg["risk"]["max_drawdown"] = 1.0
+    run_cfg["risk"]["daily_loss_limit"] = 1.0
     s_in = run_backtest(run_cfg, ins).summary()
     s_out = run_backtest(run_cfg, oos).summary()
     return {"timeframe": tf, "params": overrides, "in": s_in, "out": s_out, "score": score(s_in)}
