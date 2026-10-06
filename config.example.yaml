@@ -1,0 +1,40 @@
+# 複製成 config.yaml 後修改：cp config.example.yaml config.yaml
+mode: paper              # paper = 模擬交易(預設，安全) | live = 真實下單
+exchange:
+  id: binance            # 任何 ccxt 支援的交易所 id：binance, okx, bybit, kraken ...
+  sandbox: false         # true = 使用交易所測試網(若支援)
+symbol: BTC/USDT
+timeframe: 15m           # 訊號使用的 K 線週期
+history_bars: 300        # 計算指標所需的 K 線數量
+poll_seconds: 10         # 每幾秒檢查一次即時價格(停損/停利)
+state_dir: state         # 持倉狀態儲存位置(重啟後可接續)
+log_dir: logs            # 交易紀錄 CSV
+
+paper:
+  starting_cash: 10000   # 模擬起始資金(計價幣，例如 USDT)
+  fee_rate: 0.001        # 手續費 0.1%
+  slippage: 0.0005       # 滑價 0.05%
+
+strategy:
+  ema_fast: 12
+  ema_slow: 26
+  ema_trend: 200         # 長期趨勢過濾
+  rsi_period: 14
+  rsi_oversold: 30
+  rsi_overbought: 70
+  bb_period: 20
+  bb_std: 2.0
+  atr_period: 14
+  adx_period: 14
+  adx_trend: 25          # ADX >= 此值 => 趨勢盤
+  adx_range: 20          # ADX <= 此值 => 盤整盤
+  stop_atr_mult: 2.0     # 初始停損 = 進場價 - 2 x ATR
+  trail_atr_mult: 3.0    # 趨勢單移動停損 = 最高價 - 3 x ATR
+
+risk:
+  risk_per_trade: 0.01   # 每筆交易最多虧損總資產 1%
+  max_position_pct: 0.5  # 單一部位最多佔總資產 50%
+  max_drawdown: 0.20     # 總資產從高點回撤 20% => 停止開新倉(需人工重置)
+  daily_loss_limit: 0.05 # 當日虧損 5% => 當天停止開新倉
+  min_notional: 10       # 小於此金額(計價幣)不下單
+  cooldown_bars: 3       # 平倉後等待幾根 K 線才可再進場(避免來回洗盤)
