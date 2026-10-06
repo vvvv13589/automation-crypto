@@ -94,7 +94,7 @@ def cmd_backtest(cfg: dict, args) -> int:
     print(json.dumps(result.summary(), indent=2, ensure_ascii=False))
     if args.trades:
         for t in result.trades:
-            print(f"{t.opened_at} -> {t.closed_at} [{t.regime:5}] {t.entry_price:.2f} -> "
+            print(f"{t.opened_at} -> {t.closed_at} {t.side:5} [{t.regime:5}] {t.entry_price:.2f} -> "
                   f"{t.exit_price:.2f} pnl={t.pnl:+.2f} ({t.pnl_pct:+.2f}%) {t.reason}")
     return 0
 
@@ -106,6 +106,10 @@ def cmd_run(cfg: dict, args, live: bool) -> int:
         if not args.confirm_live:
             print("Refusing to trade real money without --confirm-live.", file=sys.stderr)
             return 2
+        if cfg.get("market") == "future":
+            f = cfg["futures"]
+            print(f"LIVE futures: {cfg['symbol']} {f['leverage']}x {f['margin_mode']}, "
+                  f"risk {cfg['risk']['risk_per_trade']*100:.1f}%/trade")
         cfg["mode"] = "live"
     Runner(cfg, live=live).run()
     return 0
@@ -117,7 +121,9 @@ def main(argv=None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--symbol", help="override symbol, e.g. ETH/USDT")
     parser.add_argument("--timeframe", help="override timeframe, e.g. 1h")
-    parser.add_argument("--daytrade", action="store_true", help="enable day-trade mode (flat every day)")
+    parser.add_argument("--daytrade", action="store_true", help="force day-trade mode on")
+    parser.add_argument("--no-daytrade", action="store_true", help="force day-trade mode off")
+    parser.add_argument("--spot", action="store_true", help="spot long-only instead of futures")
     sub = parser.add_subparsers(dest="command", required=True)
 
     bt = sub.add_parser("backtest", help="test the strategy on historical data")
@@ -143,6 +149,7 @@ def main(argv=None) -> int:
     op.add_argument("--seed", type=int, default=42)
 
     sub.add_parser("paper", help="real-time simulated trading with live market data")
+    sub.add_parser("notify-test", help="send a Telegram test message")
     live = sub.add_parser("live", help="REAL trading with real funds")
     live.add_argument("--confirm-live", action="store_true", help="required: I accept the risk")
 
@@ -156,6 +163,13 @@ def main(argv=None) -> int:
         cfg["timeframe"] = args.timeframe
     if args.daytrade:
         cfg["daytrade"]["enabled"] = True
+    if args.no_daytrade:
+        cfg["daytrade"]["enabled"] = False
+    if args.spot:
+        cfg["market"] = "spot"
+        cfg["strategy"]["allow_short"] = False
+        if cfg["symbol"].endswith(":USDT"):
+            cfg["symbol"] = cfg["symbol"].split(":")[0]
     if getattr(args, "days", 0) is None:
         args.days = 120 if cfg["daytrade"].get("enabled") else 365
 
@@ -165,6 +179,15 @@ def main(argv=None) -> int:
         return cmd_backtest(cfg, args)
     if args.command == "optimize":
         return cmd_optimize(cfg, args)
+    if args.command == "notify-test":
+        from .notify import make_notifier
+        n = make_notifier(cfg, "live")
+        if n is None:
+            print("Telegram not configured: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
+            return 1
+        ok = n("✅ Telegram 通知設定成功")
+        print("sent" if ok else "failed - check token / chat id")
+        return 0 if ok else 1
     return cmd_run(cfg, args, live=args.command == "live")
 
 

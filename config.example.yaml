@@ -1,30 +1,48 @@
 # 複製成 config.yaml 後修改：cp config.example.yaml config.yaml
-mode: paper              # paper = 模擬交易(預設，安全) | live = 真實下單
+# 以下預設值 = 你選的設定：Binance ETH 永續合約、5 倍逐倉、多空當沖、每筆風險 2%
+
+market: future           # future = USDT 永續合約(可做空、槓桿) | spot = 現貨(只做多)
 exchange:
-  id: binance            # 任何 ccxt 支援的交易所 id：binance, okx, bybit, kraken ...
-  sandbox: false         # true = 使用交易所測試網(若支援)
-symbol: BTC/USDT
-timeframe: 1h            # 訊號使用的 K 線週期(15m 太頻繁，手續費會吃掉獲利)
+  id: binance
+  demo: false            # true = Binance 模擬交易(Demo Trading)帳戶，需另外申請 demo API key
+symbol: ETH/USDT:USDT    # 永續合約寫法；現貨請改成 ETH/USDT
+timeframe: 15m           # 訊號 K 線週期，當沖建議 5m 或 15m
 history_bars: 500        # 計算指標所需的 K 線數量
-poll_seconds: 10         # 每幾秒檢查一次即時價格(停損/停利)
-state_dir: state         # 持倉狀態儲存位置(重啟後可接續)
+poll_seconds: 5          # 每幾秒檢查一次即時價格(停損/停利/限價單成交)
+state_dir: state         # 持倉狀態(重啟後可接續)
 log_dir: logs            # 交易紀錄 CSV
 
-# 當沖模式：當天開倉、當天平倉，不留倉過夜
-daytrade:
-  enabled: false
-  timezone: Asia/Taipei     # 以台灣時間計算「一天」
-  session_start: "00:00"    # 幾點後才開始開新倉
-  no_new_entries_after: "23:00"  # 幾點後不再開新倉
-  session_end: "23:45"      # 強制平倉時間(所有部位清空)
-  max_trades_per_day: 6     # 每天最多開幾次倉(限制手續費)
+futures:
+  leverage: 5            # 槓桿倍數(交易所設定)
+  margin_mode: isolated  # isolated 逐倉 | cross 全倉
+  exchange_stop: true    # 在交易所端同步掛停損單：伺服器斷線也會停損(強烈建議開啟)
+  funding_rate: 0.0001   # 回測/模擬用的資金費率估計(每 8 小時)，保守地多空都扣
 
-paper:
-  starting_cash: 10000   # 模擬起始資金(計價幣，例如 USDT)
-  fee_rate: 0.001        # 手續費 0.1%
-  slippage: 0.0005       # 滑價 0.05%
+orders:
+  entry_type: limit      # limit = 進場掛 post-only 限價單(maker 0.02%) | market = 市價進場(taker 0.05%)
+  limit_offset_bps: 0    # 限價比訊號價再好幾個 0.01%(越大越省但越難成交)
+  limit_ttl_bars: 1      # 限價單幾根 K 線沒成交就取消
+# 出場(停損/停利/平倉)一律用市價，確保一定出得去
+
+paper:                   # 回測與模擬交易
+  starting_cash: 300     # 起始資金(USDT)
+  maker_fee: 0.0002      # Binance 合約 maker 0.02%
+  taker_fee: 0.0005      # Binance 合約 taker 0.05%
+  slippage: 0.0003       # 市價單滑價 0.03%
+
+daytrade:                # 當沖：不留倉過夜
+  enabled: true
+  timezone: Asia/Taipei
+  session_end: "07:45"   # 每天這個時間全部平倉，07:45 之後算新的一天
+  no_entry_minutes_before_end: 60   # 收盤前 60 分鐘(06:45 後)不開新倉
+  max_trades_per_day: 6  # 每天最多開幾次倉(限制手續費與過度交易)
+
+notify:
+  telegram: true         # 需在 .env 設定 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID
 
 strategy:
+  allow_long: true
+  allow_short: true
   ema_fast: 12
   ema_slow: 26
   ema_trend: 200         # 長期趨勢過濾
@@ -35,19 +53,19 @@ strategy:
   bb_std: 2.0
   atr_period: 14
   adx_period: 14
-  adx_trend: 25          # ADX >= 此值 => 趨勢盤
-  adx_range: 20          # ADX <= 此值 => 盤整盤
-  stop_atr_mult: 3.0     # 初始停損 = 進場價 - 3 x ATR
-  trail_atr_mult: 4.0    # 趨勢單移動停損 = 最高價 - 4 x ATR
-  adx_rising: true       # 趨勢進場需 ADX 正在上升(趨勢增強中)
-  adx_rising_bars: 3     # 與幾根 K 線前的 ADX 比較
-  trend_exit_on_di: false        # true = 空方 DI 轉強就出場(較敏感，交易次數多)
-  range_requires_uptrend: true   # 盤整抄底只在價格高於 EMA200 時進行(不接下跌的刀)
+  adx_trend: 25          # ADX >= 此值 => 趨勢盤(順勢做多/做空)
+  adx_range: 20          # ADX <= 此值 => 盤整盤(布林通道高空低多)
+  stop_atr_mult: 2.5     # 初始停損距離 = 2.5 x ATR
+  trail_atr_mult: 3.5    # 趨勢單移動停損 = 最有利價格 -/+ 3.5 x ATR
+  adx_rising: true       # 趨勢進場需 ADX 正在上升
+  adx_rising_bars: 3
+  trend_exit_on_di: false        # true = 反向 DI 轉強就出場(較敏感)
+  range_trend_filter: true       # 盤整單只順著 EMA200 方向做(不逆勢接刀)
 
 risk:
-  risk_per_trade: 0.01   # 每筆交易最多虧損總資產 1%
-  max_position_pct: 0.5  # 單一部位最多佔總資產 50%
-  max_drawdown: 0.20     # 總資產從高點回撤 20% => 停止開新倉(需人工重置)
-  daily_loss_limit: 0.05 # 當日虧損 5% => 當天停止開新倉
-  min_notional: 10       # 小於此金額(計價幣)不下單
-  cooldown_bars: 3       # 平倉後等待幾根 K 線才可再進場(避免來回洗盤)
+  risk_per_trade: 0.02   # 每筆停損最多虧總資金 2%(槓桿只影響保證金，不影響這個風險)
+  max_exposure: 5.0      # 部位名目價值最多 = 5 倍總資金
+  max_drawdown: 0.20     # 從高點回撤 20% => 停止開新倉(刪除 state 檔才恢復)
+  daily_loss_limit: 0.06 # 當日虧損 6% => 當天停止開新倉
+  min_notional: 20       # Binance ETH 合約最小下單金額約 20 USDT
+  cooldown_bars: 2       # 平倉後等幾根 K 線才再進場

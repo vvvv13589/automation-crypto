@@ -3,36 +3,61 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
 import json
 import logging
 import os
 from dataclasses import asdict, dataclass
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import pandas as pd
 
 from .risk import RiskManager
-from .strategy import ADAPT, BUY, RANGE, SELL, TREND, AdaptiveStrategy
+from .strategy import ADAPT, ENTER, EXIT, LONG, RANGE, TREND, AdaptiveStrategy
 
 log = logging.getLogger(__name__)
+
+FUNDING_HOURS_UTC = (0, 8, 16)  # Binance perpetual funding times
+
+
+def _sign(side: str) -> int:
+    return 1 if side == LONG else -1
 
 
 @dataclass
 class Position:
+    side: str
     amount: float
     entry_price: float
     stop_price: float
     take_profit: Optional[float]
     regime: str
-    highest: float
+    best: float  # most favourable price seen (high for long, low for short)
     opened_at: str
-    cost: float  # quote spent including fees
+    entry_fee: float = 0.0
+    funding: float = 0.0
+    last_funding_check: Optional[str] = None
+    stop_order_id: Optional[str] = None
+
+
+@dataclass
+class PendingEntry:
+    order_id: str
+    side: str
+    amount: float
+    price: float
+    stop_dist: float
+    take_profit: Optional[float]
+    regime: str
+    bars_left: int
+    reason: str
 
 
 @dataclass
 class Trade:
+    side: str
     opened_at: str
     closed_at: str
     regime: str
@@ -40,26 +65,39 @@ class Trade:
     exit_price: float
     amount: float
     pnl: float
-    pnl_pct: float
+    pnl_pct: float  # % of position notional at entry
     fees: float
+    funding: float
     reason: str
+
+
+def _from_dict(cls, data: dict):
+    names = {f.name for f in dataclasses.fields(cls)}
+    return cls(**{k: v for k, v in data.items() if k in names})
 
 
 class Trader:
     def __init__(self, cfg: dict, broker, state_path: str | None = None,
-                 journal_path: str | None = None):
+                 journal_path: str | None = None, notify: Callable[[str], None] | None = None):
         self.cfg = cfg
         self.symbol = cfg["symbol"]
-        self.strategy = AdaptiveStrategy(cfg["strategy"])
+        self.futures = cfg.get("market", "spot") == "future"
+        self.leverage = float(cfg["futures"]["leverage"]) if self.futures else 1.0
+        params = dict(cfg["strategy"])
+        if not self.futures:
+            params["allow_short"] = False
+        self.strategy = AdaptiveStrategy(params)
         self.risk = RiskManager(cfg["risk"])
         self.broker = broker
+        self.notify = notify or (lambda text: None)
         self.position: Optional[Position] = None
+        self.pending: Optional[PendingEntry] = None
         self.trades: list[Trade] = []
         self.last_atr: Optional[float] = None
-        self.last_price: Optional[float] = None
-        self.cooldown = 0  # candles to wait after a close before re-entering
-        self.trade_day: Optional[str] = None  # local date for the day-trade counter
+        self.cooldown = 0
+        self.session_key: Optional[str] = None
         self.trades_today = 0
+        self._halted = False
         self.state_path = state_path
         self.journal_path = journal_path
         self._load_state()
@@ -71,13 +109,20 @@ class Trader:
         with open(self.state_path, encoding="utf-8") as fh:
             data = json.load(fh)
         if data.get("position"):
-            self.position = Position(**data["position"])
+            pos = dict(data["position"])
+            pos.setdefault("side", LONG)
+            pos.setdefault("best", pos.get("highest", pos.get("entry_price")))
+            self.position = _from_dict(Position, pos)
+        if data.get("pending"):
+            self.pending = _from_dict(PendingEntry, data["pending"])
         self.risk.load(data.get("risk", {}))
         self.last_atr = data.get("last_atr")
         self.cooldown = int(data.get("cooldown", 0))
-        self.trade_day = data.get("trade_day")
+        self.session_key = data.get("session_key")
         self.trades_today = int(data.get("trades_today", 0))
-        log.info("restored state: position=%s", self.position)
+        if data.get("broker") and hasattr(self.broker, "load"):
+            self.broker.load(data["broker"])
+        log.info("restored state: position=%s pending=%s", self.position, self.pending)
 
     def _save_state(self) -> None:
         if not self.state_path:
@@ -88,11 +133,13 @@ class Trader:
             json.dump(
                 {
                     "position": asdict(self.position) if self.position else None,
+                    "pending": asdict(self.pending) if self.pending else None,
                     "risk": self.risk.to_dict(),
                     "last_atr": self.last_atr,
                     "cooldown": self.cooldown,
-                    "trade_day": self.trade_day,
+                    "session_key": self.session_key,
                     "trades_today": self.trades_today,
+                    "broker": self.broker.to_dict() if hasattr(self.broker, "to_dict") else None,
                 },
                 fh,
                 indent=2,
@@ -112,14 +159,18 @@ class Trader:
 
     # ---------------------------------------------------------------- helpers
     def equity(self, price: float) -> float:
-        cash, base = self.broker.balances(self.symbol)
-        return cash + base * price
+        return self.broker.equity(price)
 
     @staticmethod
     def _ts(now) -> str:
-        if isinstance(now, pd.Timestamp):
-            now = now.to_pydatetime()
-        return (now or datetime.now(timezone.utc)).isoformat()
+        if now is None:
+            return datetime.now(timezone.utc).isoformat()
+        return pd.Timestamp(now).isoformat()
+
+    @staticmethod
+    def _utc(now) -> pd.Timestamp:
+        ts = pd.Timestamp(now)
+        return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
     # -------------------------------------------------------------- day trade
     @property
@@ -128,23 +179,36 @@ class Trader:
         return dt if dt.get("enabled") else {}
 
     def _local(self, now) -> pd.Timestamp:
-        ts = pd.Timestamp(now)
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC")
-        return ts.tz_convert(self.daytrade.get("timezone", "Asia/Taipei"))
+        return self._utc(now).tz_convert(self.daytrade.get("timezone", "Asia/Taipei"))
 
     @staticmethod
     def _hhmm(value: str) -> time:
         h, m = str(value).split(":")
         return time(int(h), int(m))
 
-    def session_check(self, price: float, now) -> bool:
-        """Day-trade mode: flatten at session end or once the local day rolls over."""
-        if not self.daytrade or self.position is None:
-            return False
+    def _session_of(self, now) -> str:
+        """Trading-day label; a new day starts at ``session_end`` local time."""
+        end = self._hhmm(self.daytrade["session_end"])
+        shifted = self._local(now) - timedelta(hours=end.hour, minutes=end.minute)
+        return shifted.strftime("%Y-%m-%d")
+
+    def _minutes_to_session_end(self, now) -> float:
         local = self._local(now)
-        opened = self._local(self.position.opened_at)
-        if local.date() != opened.date() or local.time() >= self._hhmm(self.daytrade["session_end"]):
+        end = self._hhmm(self.daytrade["session_end"])
+        nxt = local.normalize() + timedelta(hours=end.hour, minutes=end.minute)
+        if nxt <= local:
+            nxt += timedelta(days=1)
+        return (nxt - local).total_seconds() / 60
+
+    def session_check(self, price: float, now) -> bool:
+        """Day-trade mode: flatten once the trading day has rolled over."""
+        if not self.daytrade:
+            return False
+        if self.pending and self._minutes_to_session_end(now) < self.daytrade["no_entry_minutes_before_end"]:
+            self._cancel_pending(now, "day-trade entry window closed")
+        if self.position is None:
+            return False
+        if self._session_of(now) != self._session_of(self.position.opened_at):
             self._close(price, now, "day-trade session close")
             return True
         return False
@@ -153,69 +217,198 @@ class Trader:
         dt = self.daytrade
         if not dt:
             return True, ""
-        local = self._local(now)
-        day = local.strftime("%Y-%m-%d")
-        if day != self.trade_day:
-            self.trade_day, self.trades_today = day, 0
-        t = local.time()
-        if t < self._hhmm(dt.get("session_start", "00:00")):
-            return False, "before day-trade session start"
-        if t >= self._hhmm(dt["no_new_entries_after"]) or t >= self._hhmm(dt["session_end"]):
+        key = self._session_of(now)
+        if key != self.session_key:
+            self.session_key, self.trades_today = key, 0
+        if self._minutes_to_session_end(now) < dt["no_entry_minutes_before_end"]:
             return False, "too close to day-trade session end"
-        if self.trades_today >= int(dt.get("max_trades_per_day", 10**9)):
+        if self.trades_today >= int(dt["max_trades_per_day"]):
             return False, "max trades per day reached"
         return True, ""
 
-    # ------------------------------------------------------------------ exits
-    def check_exits(self, low: float, high: float, now=None, open_: float | None = None) -> bool:
-        """Intrabar / real-time stop-loss, trailing and take-profit checks.
+    # ---------------------------------------------------------------- funding
+    def _apply_funding(self, now) -> None:
+        """Paper/backtest only: perpetual funding, charged conservatively to either side."""
+        pos = self.position
+        if pos is None or not self.futures or self.broker.live:
+            return
+        rate = float(self.cfg["futures"].get("funding_rate", 0.0))
+        now_utc = self._utc(now)
+        last = self._utc(pos.last_funding_check or pos.opened_at)
+        t = last.floor("h") + timedelta(hours=1)
+        while t <= now_utc:
+            if t.hour in FUNDING_HOURS_UTC:
+                cost = pos.amount * pos.entry_price * rate
+                self.broker.charge(cost)
+                pos.funding += cost
+            t += timedelta(hours=1)
+        pos.last_funding_check = now_utc.isoformat()
 
-        For live trading call with low == high == latest price.
-        Returns True if the position was closed.
+    # ------------------------------------------------------------------ entry
+    def check_pending(self, low: float, high: float, now=None) -> bool:
+        """Has the working limit entry filled? Returns True if a position opened."""
+        p = self.pending
+        if p is None:
+            return False
+        status = self.broker.poll_limit(p.order_id, low, high)
+        if not status.done:
+            return False
+        self.pending = None
+        if status.filled > 0:
+            self._on_entry_fill(p.side, status.filled, status.price, status.fee, p.stop_dist,
+                                p.take_profit, p.regime, now, p.reason)
+            return True
+        log.info("limit entry %s not filled (expired / post-only rejected)", p.order_id)
+        self._save_state()
+        return False
+
+    def _cancel_pending(self, now, why: str) -> None:
+        p = self.pending
+        if p is None:
+            return
+        status = self.broker.cancel_limit(p.order_id)
+        self.pending = None
+        log.info("limit entry cancelled: %s", why)
+        if status.filled > 0:  # partially filled before the cancel
+            self._on_entry_fill(p.side, status.filled, status.price, status.fee, p.stop_dist,
+                                p.take_profit, p.regime, now, p.reason + " (partial)")
+        self._save_state()
+
+    def _open(self, price: float, decision, now) -> bool:
+        equity = self.equity(price)
+        free = self.broker.free_margin(price)
+        amount = self.risk.position_size(equity, free, price, decision.stop_price, self.leverage)
+        if amount <= 0:
+            return False
+        stop_dist = abs(price - decision.stop_price)
+        orders = self.cfg.get("orders", {})
+        use_limit = orders.get("entry_type", "market") == "limit" and self.broker.supports_limit
+        if use_limit:
+            offset = orders.get("limit_offset_bps", 0) / 10000 * price
+            limit = price - offset if decision.side == LONG else price + offset
+            oid = self.broker.place_limit(decision.side, amount, limit)
+            if not oid:
+                return False
+            self.pending = PendingEntry(oid, decision.side, amount, limit, stop_dist,
+                                        decision.take_profit, decision.regime,
+                                        int(orders.get("limit_ttl_bars", 1)), decision.reason)
+            log.info("LIMIT %s %.6f %s @ %.2f | %s", decision.side.upper(), amount, self.symbol,
+                     limit, decision.reason)
+            self._save_state()
+            return True
+        fill = self.broker.market_open(decision.side, amount, price)
+        if fill is None or fill.amount <= 0:
+            return False
+        self._on_entry_fill(decision.side, fill.amount, fill.price, fill.fee, stop_dist,
+                            decision.take_profit, decision.regime, now, decision.reason)
+        return True
+
+    def _on_entry_fill(self, side, amount, price, fee, stop_dist, take_profit, regime, now, reason):
+        stop = price - _sign(side) * stop_dist  # same distance from the actual fill
+        self.position = Position(
+            side=side, amount=amount, entry_price=price, stop_price=stop,
+            take_profit=take_profit, regime=regime, best=price, opened_at=self._ts(now),
+            entry_fee=fee, last_funding_check=self._ts(now),
+        )
+        self._sync_exchange_stop()
+        msg = (f"🟢 開倉 {side.upper()} {amount:.4f} {self.symbol} @ {price:.2f}\n"
+               f"停損 {stop:.2f}" + (f" 停利 {take_profit:.2f}" if take_profit else "") +
+               f"\n[{regime}] {reason}")
+        log.info(msg.replace("\n", " | "))
+        self.notify(msg)
+        self._save_state()
+
+    def _sync_exchange_stop(self) -> None:
+        pos = self.position
+        if pos is None or not self.cfg.get("futures", {}).get("exchange_stop", True):
+            return
+        try:
+            pos.stop_order_id = self.broker.set_stop(pos.side, pos.amount, pos.stop_price,
+                                                     pos.stop_order_id)
+        except Exception as exc:
+            log.error("failed to place exchange stop: %s", exc)
+            self.notify(f"⚠️ 交易所停損單設定失敗: {exc}")
+
+    # ------------------------------------------------------------------ exits
+    def check_exits(self, low: float, high: float, now=None, open_: float | None = None,
+                    intrabar: bool = False, stop_only: bool = False) -> bool:
+        """Stop-loss / take-profit checks.
+
+        Live: call with low == high == latest price (fills at that price).
+        Backtest: ``intrabar=True`` fills at the stop/target level, or at the
+        bar's open if it gapped through it.
         """
         pos = self.position
         if pos is None:
             return False
-        if low <= pos.stop_price:
-            # If the bar gapped below the stop, we get the (worse) open price.
-            price = min(pos.stop_price, open_) if open_ is not None else low
-            kind = "trailing stop" if pos.stop_price > pos.entry_price else "stop loss"
+        s = _sign(pos.side)
+        adverse, favourable = (low, high) if s > 0 else (high, low)
+
+        if (adverse - pos.stop_price) * s <= 0:
+            if intrabar:
+                price = pos.stop_price
+                if open_ is not None and (open_ - pos.stop_price) * s < 0:
+                    price = open_
+            else:
+                price = adverse
+            kind = "trailing stop" if (pos.stop_price - pos.entry_price) * s > 0 else "stop loss"
             self._close(price, now, kind)
             return True
-        if pos.take_profit is not None and high >= pos.take_profit:
-            price = max(pos.take_profit, open_) if open_ is not None else high
+        if not stop_only and pos.take_profit is not None and (favourable - pos.take_profit) * s >= 0:
+            if intrabar:
+                price = pos.take_profit
+                if open_ is not None and (open_ - pos.take_profit) * s > 0:
+                    price = open_
+            else:
+                price = favourable
             self._close(price, now, "take profit")
             return True
-        if high > pos.highest:
-            pos.highest = high
+        if (favourable - pos.best) * s > 0:
+            pos.best = favourable
         return False
+
+    def reconcile(self, price: float, now=None) -> None:
+        """Live: detect a position closed on the exchange (protective stop, liquidation, manual)."""
+        if not self.broker.live or self.position is None:
+            return
+        if abs(self.broker.position_amount()) <= 0:
+            self._close(price, now, "closed on exchange (stop order / liquidation / manual)")
 
     # -------------------------------------------------------------- on candle
     def on_candle(self, candles: pd.DataFrame, now=None) -> str:
         """Run the strategy on closed candles. Returns the action taken."""
-        analyzed = self.strategy.analyze(candles)
-        return self.on_analyzed(analyzed, now)
+        return self.on_analyzed(self.strategy.analyze(candles), now)
 
     def on_analyzed(self, analyzed: pd.DataFrame, now=None) -> str:
-        row = analyzed.iloc[-1]
-        price = float(row["close"])
-        self.last_price = price
-        self.last_atr = float(row["atr"]) if pd.notna(row["atr"]) else self.last_atr
         now = now if now is not None else analyzed.index[-1]
-        self.risk.update(self.equity(price), pd.Timestamp(now).to_pydatetime())
+        return self.on_bar(self.strategy.columns(analyzed), len(analyzed) - 1, now)
+
+    def on_bar(self, cols: dict, i: int, now) -> str:
+        """Bar ``i`` has closed: manage the position and look for entries."""
+        price = float(cols["close"][i])
+        atr = float(cols["atr"][i])
+        self.last_atr = atr if atr == atr else self.last_atr  # NaN-safe
+        self._apply_funding(now)
+        self.risk.update(self.equity(price), self._utc(now).to_pydatetime())
+        self._check_halt()
+
+        if self.pending is not None:
+            self.pending.bars_left -= 1
+            if self.pending.bars_left <= 0:
+                self._cancel_pending(now, "limit entry expired")
 
         if self.session_check(price, now):
             self._save_state()
-            return "sell"
+            return "exit"
 
-        decision = self.strategy.decide(analyzed, self.position)
+        decision = self.strategy.decide_at(cols, i, self.position)
         action = "hold"
         pos = self.position
 
         if pos is not None:
-            if decision.action == SELL:
+            if decision.action == EXIT:
                 self._close(price, now, decision.reason)
-                action = "sell"
+                action = "exit"
             else:
                 if decision.action == ADAPT:
                     pos.regime, pos.take_profit = TREND, None
@@ -224,12 +417,16 @@ class Trader:
                 elif pos.regime == RANGE and decision.take_profit is not None:
                     pos.take_profit = float(decision.take_profit)  # follow the moving middle band
                 if pos.regime == TREND and self.last_atr:
-                    trail = pos.highest - self.cfg["strategy"]["trail_atr_mult"] * self.last_atr
-                    if trail > pos.stop_price:
+                    s = _sign(pos.side)
+                    trail = pos.best - s * self.cfg["strategy"]["trail_atr_mult"] * self.last_atr
+                    if (trail - pos.stop_price) * s > 0:
                         pos.stop_price = trail
+                        self._sync_exchange_stop()
+        elif self.pending is not None:
+            pass  # waiting for the limit entry
         elif self.cooldown > 0:
             self.cooldown -= 1
-        elif decision.action == BUY:
+        elif decision.action == ENTER:
             ok, why = self.risk.can_open()
             if ok:
                 ok, why = self._entry_window(now)
@@ -237,64 +434,50 @@ class Trader:
                 log.info("entry skipped: %s", why)
             elif self._open(price, decision, now):
                 self.trades_today += 1
-                action = "buy"
+                action = "enter"
 
         self._save_state()
         return action
 
-    # --------------------------------------------------------- order helpers
-    def _open(self, price: float, decision, now) -> bool:
-        cash, _ = self.broker.balances(self.symbol)
-        equity = self.equity(price)
-        amount = self.risk.position_size(equity, cash, price, decision.stop_price)
-        if amount <= 0:
-            return False
-        fill = self.broker.market_buy(self.symbol, amount, price)
-        if fill is None or fill.amount <= 0:
-            return False
-        # Keep the stop the same distance below the actual fill.
-        stop = fill.price - (price - decision.stop_price)
-        self.position = Position(
-            amount=fill.amount,
-            entry_price=fill.price,
-            stop_price=stop,
-            take_profit=decision.take_profit,
-            regime=decision.regime,
-            highest=fill.price,
-            opened_at=self._ts(now),
-            cost=fill.amount * fill.price + fill.fee,
-        )
-        log.info("BUY %.6f %s @ %.2f [%s] stop=%.2f tp=%s | %s", fill.amount, self.symbol,
-                 fill.price, decision.regime, stop, decision.take_profit, decision.reason)
-        self._save_state()
-        return True
+    def _check_halt(self) -> None:
+        ok, why = self.risk.can_open()
+        if not ok and not self._halted:
+            self.notify(f"⛔ 暫停開新倉: {why}")
+        self._halted = not ok
 
+    # --------------------------------------------------------- close helper
     def _close(self, price: float, now, reason: str) -> None:
         pos = self.position
-        fill = self.broker.market_sell(self.symbol, pos.amount, price)
+        try:
+            fill = self.broker.market_close(pos.side, pos.amount, price)
+        except Exception as exc:
+            log.error("close order failed: %s (will retry)", exc)
+            self.notify(f"⚠️ 平倉失敗，將重試: {exc}")
+            return
         if fill is None:
             log.error("could not close position (order rejected); will retry")
             return
-        proceeds = fill.amount * fill.price - fill.fee
-        frac = fill.amount / pos.amount
-        pnl = proceeds - pos.cost * frac
-        fees = (pos.cost - pos.amount * pos.entry_price) * frac + fill.fee
+        self.broker.cancel_stop(pos.stop_order_id)
+        amount = fill.amount if fill.amount > 0 else pos.amount
+        exit_price = fill.price
+        frac = min(1.0, amount / pos.amount)
+        gross = _sign(pos.side) * (exit_price - pos.entry_price) * amount
+        fees = pos.entry_fee * frac + fill.fee
+        pnl = gross - fees - pos.funding * frac
+        notional = pos.entry_price * amount
         trade = Trade(
-            opened_at=pos.opened_at,
-            closed_at=self._ts(now),
-            regime=pos.regime,
-            entry_price=pos.entry_price,
-            exit_price=fill.price,
-            amount=fill.amount,
-            pnl=pnl,
-            pnl_pct=pnl / pos.cost * 100 if pos.cost else 0.0,
-            fees=fees,
-            reason=reason,
+            side=pos.side, opened_at=pos.opened_at, closed_at=self._ts(now), regime=pos.regime,
+            entry_price=pos.entry_price, exit_price=exit_price, amount=amount, pnl=pnl,
+            pnl_pct=pnl / notional * 100 if notional else 0.0, fees=fees,
+            funding=pos.funding * frac, reason=reason,
         )
         self.trades.append(trade)
         self._journal(trade)
-        log.info("SELL %.6f %s @ %.2f pnl=%.2f (%.2f%%) | %s", fill.amount, self.symbol,
-                 fill.price, pnl, trade.pnl_pct, reason)
+        icon = "✅" if pnl > 0 else "🔴"
+        msg = (f"{icon} 平倉 {pos.side.upper()} {amount:.4f} {self.symbol} @ {exit_price:.2f}\n"
+               f"損益 {pnl:+.2f} ({trade.pnl_pct:+.2f}%) | {reason}")
+        log.info(msg.replace("\n", " | "))
+        self.notify(msg)
         self.position = None
         self.cooldown = int(self.cfg["risk"].get("cooldown_bars", 0))
         self._save_state()

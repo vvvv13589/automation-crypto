@@ -16,13 +16,16 @@ def make_exchange(cfg: dict, api_key: str | None = None, secret: str | None = No
 
     ex_cfg = cfg["exchange"]
     klass = getattr(ccxt, ex_cfg["id"])
-    params = {"enableRateLimit": True, "options": {"defaultType": "spot"}}
+    default_type = "swap" if cfg.get("market") == "future" else "spot"
+    params = {"enableRateLimit": True, "options": {"defaultType": default_type}}
     if api_key:
         params.update(apiKey=api_key, secret=secret)
         if password:
             params["password"] = password
     exchange = klass(params)
-    if ex_cfg.get("sandbox"):
+    if ex_cfg.get("demo"):
+        exchange.enable_demo_trading(True)  # Binance demo trading (replaces futures testnet)
+    elif ex_cfg.get("sandbox"):
         exchange.set_sandbox_mode(True)
     exchange.load_markets()
     return exchange

@@ -10,23 +10,37 @@ import yaml
 
 DEFAULTS: dict = {
     "mode": "paper",
-    "exchange": {"id": "binance", "sandbox": False},
-    "symbol": "BTC/USDT",
-    "timeframe": "1h",
+    "market": "future",  # future = USDT perpetual (long/short, leverage) | spot (long only)
+    "exchange": {"id": "binance", "sandbox": False, "demo": False},
+    "symbol": "ETH/USDT:USDT",  # perpetual; use "ETH/USDT" for spot
+    "timeframe": "15m",
     "history_bars": 500,
-    "poll_seconds": 10,
+    "poll_seconds": 5,
     "state_dir": "state",
     "log_dir": "logs",
+    "futures": {
+        "leverage": 5,
+        "margin_mode": "isolated",
+        "exchange_stop": True,  # protective stop order resting on the exchange
+        "funding_rate": 0.0001,  # backtest/paper estimate per 8h, charged either side
+    },
+    "orders": {
+        "entry_type": "limit",  # limit (post-only, maker fee) | market
+        "limit_offset_bps": 0,  # place limit this many 0.01% better than the signal close
+        "limit_ttl_bars": 1,  # cancel an unfilled entry after this many candles
+    },
+    "paper": {"starting_cash": 300.0, "maker_fee": 0.0002, "taker_fee": 0.0005, "slippage": 0.0003},
     "daytrade": {
-        "enabled": False,
+        "enabled": True,
         "timezone": "Asia/Taipei",
-        "session_start": "00:00",
-        "no_new_entries_after": "23:00",
-        "session_end": "23:45",
+        "session_end": "07:45",  # everything flat at this time; next trading day starts
+        "no_entry_minutes_before_end": 60,
         "max_trades_per_day": 6,
     },
-    "paper": {"starting_cash": 10000.0, "fee_rate": 0.001, "slippage": 0.0005},
+    "notify": {"telegram": True},  # needs TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in .env
     "strategy": {
+        "allow_long": True,
+        "allow_short": True,
         "ema_fast": 12,
         "ema_slow": 26,
         "ema_trend": 200,
@@ -39,20 +53,20 @@ DEFAULTS: dict = {
         "adx_period": 14,
         "adx_trend": 25,
         "adx_range": 20,
-        "stop_atr_mult": 3.0,
-        "trail_atr_mult": 4.0,
+        "stop_atr_mult": 2.5,
+        "trail_atr_mult": 3.5,
         "adx_rising": True,
         "adx_rising_bars": 3,
         "trend_exit_on_di": False,
-        "range_requires_uptrend": True,
+        "range_trend_filter": True,
     },
     "risk": {
-        "risk_per_trade": 0.01,
-        "max_position_pct": 0.5,
+        "risk_per_trade": 0.02,
+        "max_exposure": 5.0,  # max position notional as a multiple of equity
         "max_drawdown": 0.20,
-        "daily_loss_limit": 0.05,
-        "min_notional": 10.0,
-        "cooldown_bars": 3,
+        "daily_loss_limit": 0.06,
+        "min_notional": 20.0,
+        "cooldown_bars": 2,
     },
 }
 
@@ -75,7 +89,10 @@ def load_config(path: str | os.PathLike | None = None) -> dict:
     if path is not None:
         with open(path, encoding="utf-8") as fh:
             user = yaml.safe_load(fh) or {}
-    return _merge(DEFAULTS, user)
+    cfg = _merge(DEFAULTS, user)
+    if cfg["market"] == "spot":
+        cfg["strategy"]["allow_short"] = False
+    return cfg
 
 
 def load_dotenv(path: str = ".env") -> None:

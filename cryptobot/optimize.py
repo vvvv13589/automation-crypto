@@ -18,8 +18,8 @@ from .backtest import run_backtest
 from .strategy import AdaptiveStrategy
 
 DEFAULT_GRID: dict[str, list] = {
-    "strategy.stop_atr_mult": [2.0, 3.0, 4.0],
-    "strategy.trail_atr_mult": [3.0, 4.0, 6.0],
+    "strategy.stop_atr_mult": [1.5, 2.5, 3.5],
+    "strategy.trail_atr_mult": [2.5, 3.5, 5.0],
     "strategy.adx_trend": [20, 25, 30],
     "strategy.trend_exit_on_di": [False, True],
 }

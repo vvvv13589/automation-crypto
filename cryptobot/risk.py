@@ -48,14 +48,19 @@ class RiskManager:
             return False, "daily loss limit reached - paused until tomorrow"
         return True, ""
 
-    def position_size(self, equity: float, cash: float, price: float, stop_price: float) -> float:
-        """Base-asset amount so a stop-out loses ~risk_per_trade of equity."""
-        if price <= 0 or stop_price is None or stop_price >= price:
+    def position_size(self, equity: float, free_margin: float, price: float, stop_price: float,
+                      leverage: float = 1.0) -> float:
+        """Base amount so that a stop-out loses ~risk_per_trade of equity.
+
+        Exposure is capped at ``max_exposure`` x equity and by the free margin.
+        """
+        dist = abs(price - stop_price) if stop_price is not None else 0.0
+        if price <= 0 or dist <= 0:
             return 0.0
-        risk_amount = equity * self.p["risk_per_trade"]
-        amount = risk_amount / (price - stop_price)
-        cap_value = min(equity * self.p["max_position_pct"], cash * 0.995)
-        amount = min(amount, cap_value / price)
+        amount = equity * self.p["risk_per_trade"] / dist
+        cap_notional = min(equity * min(self.p["max_exposure"], leverage),
+                           free_margin * leverage * 0.95)
+        amount = min(amount, cap_notional / price)
         if amount * price < self.p["min_notional"]:
             return 0.0
         return amount
