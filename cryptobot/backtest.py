@@ -62,10 +62,10 @@ def _bars_per_year(index: pd.DatetimeIndex) -> float:
 def run_backtest(cfg: dict, candles: pd.DataFrame) -> BacktestResult:
     trader = Trader(cfg, make_paper_broker(cfg))
     analyzed = trader.strategy.analyze(candles)  # indicators are causal, so precompute once
-    warmup = trader.strategy.warmup
     equity_points = []
     # Decisions happen when a bar closes, i.e. at open time + bar length.
     step = analyzed.index.to_series().diff().median() if len(analyzed) > 1 else pd.Timedelta(0)
+    warmup = trader.strategy.history_warmup(step)
 
     cols = trader.strategy.columns(analyzed)
     opens, highs, lows = (analyzed[c].to_numpy() for c in ("open", "high", "low"))

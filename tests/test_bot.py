@@ -176,19 +176,23 @@ def test_state_persists(market_cfg, tmp_path):
 
 
 # ------------------------------------------------------------ strategy / e2e
-def test_no_lookahead(cfg):
+@pytest.mark.parametrize("name", ["pullback", "adaptive"])
+def test_no_lookahead(cfg, name):
     """Decisions on bar i must not change when future bars are appended."""
-    candles = synthetic(bars=800, seed=3)
+    cfg["strategy"]["name"] = name
+    candles = synthetic(bars=1500, timeframe="15m", seed=3)
     t = _trader(cfg)
     full = t.strategy.analyze(candles)
-    for i in range(400, 800, 37):
+    for i in range(900, 1500, 29):
         a = t.strategy.decide(t.strategy.analyze(candles.iloc[: i + 1]))
         b = t.strategy.decide(full.iloc[: i + 1])
         assert (a.action, a.regime, a.side) == (b.action, b.regime, b.side)
 
 
-def test_backtest_trades_both_sides(cfg):
-    res = run_backtest(cfg, synthetic(bars=4000, timeframe="15m", seed=1))
+@pytest.mark.parametrize("name", ["pullback", "adaptive"])
+def test_backtest_trades_both_sides(cfg, name):
+    cfg["strategy"]["name"] = name
+    res = run_backtest(cfg, synthetic(bars=8000, timeframe="15m", seed=1))
     s = res.summary()
     sides = {t.side for t in res.trades}
     assert s["trades"] > 0 and sides == {LONG, SHORT}
@@ -199,10 +203,39 @@ def test_backtest_trades_both_sides(cfg):
         assert tr._session_of(t.opened_at) == tr._session_of(pd.Timestamp(t.closed_at) - pd.Timedelta(seconds=1))
 
 
+def test_htf_trend_uses_only_closed_htf_candles():
+    from cryptobot.strategy import htf_trend
+    df = synthetic(bars=2000, timeframe="15m", seed=4)
+    full = htf_trend(df, "4h", 5, 10)
+    # truncating mid-way through a 4h candle must not change any earlier value
+    for cut in (1203, 1210, 1215, 1599):
+        assert (htf_trend(df.iloc[:cut], "4h", 5, 10) == full[:cut]).all()
+    # a 4h candle opening at 00:00 is first visible to the 15m candle closing at 04:00
+    t0 = df.index[0]
+    assert df.index[15] == t0 + pd.Timedelta("3h45min")
+
+
+def test_breakeven_stop(market_cfg):
+    market_cfg["strategy"].update(name="pullback", breakeven_r=1.0, take_profit_r=3.0)
+    t = _trader(market_cfg)
+    t._open(100.0, _enter(LONG, 98.0, 106.0), None)  # 1R = 2
+    t.check_exits(100, 101.5, intrabar=True)
+    t._move_stop(t.position)
+    assert t.position.stop_price == pytest.approx(98.0)  # +0.75R: not yet
+    t.check_exits(100, 102.2, intrabar=True)
+    t._move_stop(t.position)
+    assert 100.0 < t.position.stop_price < 100.5  # break-even plus fee buffer
+    t2 = _trader(market_cfg)
+    t2._open(100.0, _enter(SHORT, 102.0, 94.0), None)
+    t2.check_exits(97.5, 100, intrabar=True)
+    t2._move_stop(t2.position)
+    assert 99.5 < t2.position.stop_price < 100.0
+
+
 def test_spot_mode_never_shorts(cfg):
     cfg["market"] = "spot"
     cfg["symbol"] = "ETH/USDT"
-    res = run_backtest(cfg, synthetic(bars=3000, timeframe="15m", seed=1))
+    res = run_backtest(cfg, synthetic(bars=8000, timeframe="15m", seed=1))
     assert res.trades and all(t.side == LONG for t in res.trades)
 
 

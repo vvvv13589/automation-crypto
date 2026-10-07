@@ -54,9 +54,9 @@ def cmd_optimize(cfg: dict, args) -> int:
     tf_arg = args.timeframes or ("5m,15m" if cfg["daytrade"].get("enabled") else "1h,4h")
     timeframes = [t.strip() for t in tf_arg.split(",") if t.strip()]
     candles = {tf: _load_candles(cfg, args, tf) for tf in timeframes}
+    from .optimize import DEFAULT_GRID, GRIDS
     n = 1
-    from .optimize import DEFAULT_GRID
-    for v in DEFAULT_GRID.values():
+    for v in GRIDS.get(cfg["strategy"].get("name"), DEFAULT_GRID).values():
         n *= len(v)
     print(f"testing {n * len(timeframes)} combinations "
           f"(first {int(args.split * 100)}% = in-sample, rest = out-of-sample) ...")
@@ -92,7 +92,7 @@ def cmd_backtest(cfg: dict, args) -> int:
         source = f"{cfg['exchange']['id']} {cfg['symbol']} {cfg['timeframe']} last {args.days}d"
 
     result = run_backtest(cfg, candles)
-    print(f"\nBacktest: {source}")
+    print(f"\nBacktest: {source}  strategy={cfg['strategy'].get('name')}")
     print(json.dumps(result.summary(), indent=2, ensure_ascii=False))
     if args.trades:
         for t in result.trades:
@@ -126,6 +126,7 @@ def main(argv=None) -> int:
     parser.add_argument("--daytrade", action="store_true", help="force day-trade mode on")
     parser.add_argument("--no-daytrade", action="store_true", help="force day-trade mode off")
     parser.add_argument("--spot", action="store_true", help="spot long-only instead of futures")
+    parser.add_argument("--strategy", choices=["pullback", "adaptive"], help="override strategy.name")
     sub = parser.add_subparsers(dest="command", required=True)
 
     bt = sub.add_parser("backtest", help="test the strategy on historical data")
@@ -165,6 +166,8 @@ def main(argv=None) -> int:
         cfg["timeframe"] = args.timeframe
     if args.daytrade:
         cfg["daytrade"]["enabled"] = True
+    if args.strategy:
+        cfg["strategy"]["name"] = args.strategy
     if args.no_daytrade:
         cfg["daytrade"]["enabled"] = False
     if args.spot:

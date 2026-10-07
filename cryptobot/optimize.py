@@ -15,8 +15,16 @@ from concurrent.futures import ProcessPoolExecutor
 import pandas as pd
 
 from .backtest import run_backtest
-from .strategy import AdaptiveStrategy
+from .strategy import make_strategy
 
+GRIDS: dict[str, dict[str, list]] = {
+    "pullback": {
+        "strategy.htf_timeframe": ["1h", "4h"],
+        "strategy.pullback_rsi": [35, 40, 45],
+        "strategy.take_profit_r": [1.5, 2.5, 0],  # 0 = no target, trail with ATR
+        "strategy.breakeven_r": [0, 1.0],
+    },
+}
 DEFAULT_GRID: dict[str, list] = {
     "strategy.stop_atr_mult": [1.5, 2.5, 3.5],
     "strategy.trail_atr_mult": [2.5, 3.5, 5.0],
@@ -38,7 +46,8 @@ def apply_overrides(cfg: dict, overrides: dict) -> dict:
 
 def split(candles: pd.DataFrame, cfg: dict, ratio: float) -> tuple[pd.DataFrame, pd.DataFrame]:
     """In-sample / out-of-sample split; OOS keeps a warmup prefix for indicators."""
-    warmup = AdaptiveStrategy(cfg["strategy"]).warmup
+    step = candles.index.to_series().diff().median() if len(candles) > 1 else pd.Timedelta(0)
+    warmup = make_strategy(cfg["strategy"]).history_warmup(step)
     cut = int(len(candles) * ratio)
     return candles.iloc[:cut], candles.iloc[max(0, cut - warmup):]
 
@@ -76,7 +85,7 @@ def _evaluate(job):
 
 def optimize(cfg: dict, candles_by_tf: dict[str, pd.DataFrame], grid: dict | None = None,
              ratio: float = 0.7, workers: int | None = None) -> list[dict]:
-    grid = grid or DEFAULT_GRID
+    grid = grid or GRIDS.get(cfg["strategy"].get("name"), DEFAULT_GRID)
     keys = list(grid)
     jobs = []
     for tf, candles in candles_by_tf.items():
@@ -92,7 +101,9 @@ def optimize(cfg: dict, candles_by_tf: dict[str, pd.DataFrame], grid: dict | Non
 def format_report(results: list[dict], top: int = 10) -> str:
     def short(params: dict) -> str:
         names = {"strategy.stop_atr_mult": "stop", "strategy.trail_atr_mult": "trail",
-                 "strategy.adx_trend": "adx", "strategy.trend_exit_on_di": "di_exit"}
+                 "strategy.adx_trend": "adx", "strategy.trend_exit_on_di": "di_exit",
+                 "strategy.htf_timeframe": "htf", "strategy.pullback_rsi": "rsi",
+                 "strategy.take_profit_r": "tpR", "strategy.breakeven_r": "beR"}
         return " ".join(f"{names.get(k, k.split('.')[-1])}={v}" for k, v in params.items())
 
     lines = [

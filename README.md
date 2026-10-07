@@ -14,15 +14,23 @@
 每根 K 線收盤 ──► 計算指標 ──► 判斷市場狀態 ──► 做多 / 做空 / 出場
 ```
 
+### 預設策略 `pullback`：大週期順勢 + 回檔進場
+
+1. **4 小時線定方向**：EMA20 > EMA50 且收盤在 EMA50 之上 → 只做多；相反 → 只做空；不明確 → 不交易
+2. **15 分鐘線等回檔**：做多時，等 RSI 先跌破 40(回檔)，再重新站上 50、收盤在 EMA20 之上(回檔結束)才進場；做空相反
+3. **停損**在回檔低點外(1～3 倍 ATR，回檔太深就不做)；**停利** 2 倍風險；賺到 1 倍風險時停損移到**成本價**
+4. 4 小時趨勢反轉時提早出場
+
+### 對照組 `adaptive`：盤勢切換(用 `--strategy adaptive`)
+
 | 市場狀態 | 判斷 | 做多 | 做空 |
 |---|---|---|---|
 | **趨勢盤** | ADX ≥ 25 且上升中 | EMA12 > EMA26、價格在 EMA200 上、+DI > -DI | 完全相反 |
-| **盤整盤** | ADX ≤ 20 | 跌破布林下軌 + RSI < 30 (順 EMA200 方向) | 突破布林上軌 + RSI > 70 |
-| **不明確** | 介於兩者 | 不開新倉，只管理持倉 | |
+| **盤整盤** | ADX ≤ 20 | 跌破布林下軌 + RSI < 30 | 突破布林上軌 + RSI > 70 |
 
-- 趨勢單：用 ATR 移動停損抱住行情，EMA 反向交叉時出場
-- 盤整單：回到布林中軌停利；若行情變成同方向趨勢 → 升級為趨勢單繼續抱
-- **當沖**：每天台灣時間 06:45 後不開新倉，07:45 強制全部平倉，不留倉過夜
+> 在 2026/7～10 的真實 ETH 資料上，`adaptive` 15 分鐘當沖扣成本前就虧損(勝率 26%)，不建議使用。
+
+**當沖**：每天台灣時間 06:45 後不開新倉，07:45 強制全部平倉，不留倉過夜。
 
 ### 下單與風控
 - **進場**掛 post-only 限價單(maker 0.02%)，一根 K 線沒成交就取消；**出場**一律市價，確保出得去
@@ -50,8 +58,11 @@ cp .env.example .env        # 填入 Telegram / API key
 # 1. 回測(會下載 Binance 合約歷史資料，快取在 data/)
 python -m cryptobot backtest --days 90 --trades
 
-# 2. 參數最佳化：前 70% 資料找參數、後 30% 驗證(避免過度擬合)，當沖預設測 5m、15m
+# 2. 參數最佳化：前 70% 資料找參數、後 30% 驗證，兩段都賺錢才會推薦；當沖預設測 5m、15m
 python -m cryptobot optimize --days 120
+
+# 和舊策略比較
+python -m cryptobot --strategy adaptive backtest --days 90
 
 # 3. 測試 Telegram 通知
 python -m cryptobot notify-test
@@ -83,7 +94,7 @@ source .venv/bin/activate && python -m cryptobot paper
 
 ```
 cryptobot/
-  strategy.py    市場狀態判斷 + 多空自適應進出場
+  strategy.py    pullback(大週期順勢+回檔) 與 adaptive(盤勢切換) 兩種策略
   trader.py      交易核心(回測/模擬/實盤共用)：限價進場、停損、移動停損、當沖時段、資金費率
   broker.py      PaperBroker(模擬保證金帳戶) / FuturesLiveBroker(Binance 合約) / SpotLiveBroker
   risk.py        部位大小、每日虧損 / 最大回撤熔斷

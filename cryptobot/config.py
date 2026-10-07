@@ -39,6 +39,7 @@ DEFAULTS: dict = {
     },
     "notify": {"telegram": True},  # needs TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in .env
     "strategy": {
+        "name": "pullback",  # pullback (HTF trend + pullback entry) | adaptive (regime switching)
         "allow_long": True,
         "allow_short": True,
         "ema_fast": 12,
@@ -59,6 +60,17 @@ DEFAULTS: dict = {
         "adx_rising_bars": 3,
         "trend_exit_on_di": False,
         "range_trend_filter": True,
+        # --- pullback strategy ---
+        "htf_timeframe": "4h",
+        "htf_ema_fast": 20,
+        "htf_ema_slow": 50,
+        "pullback_ema": 20,
+        "pullback_rsi": 40,
+        "pullback_lookback": 8,
+        "min_stop_atr": 1.0,
+        "max_stop_atr": 3.0,
+        "take_profit_r": 2.0,
+        "breakeven_r": 1.0,
     },
     "risk": {
         "risk_per_trade": 0.02,

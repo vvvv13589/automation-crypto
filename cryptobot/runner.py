@@ -79,7 +79,10 @@ class Runner:
         last = candles.index[-1]
         if last != self._last_candle:
             self._last_candle = last
-            action = t.on_candle(candles, now=now)
+            htf = None
+            if t.strategy.htf_timeframe:  # higher-timeframe candles straight from the exchange
+                htf = fetch_recent(self.exchange, self.symbol, t.strategy.htf_timeframe, 300)
+            action = t.on_candle(candles, now=now, htf=htf)
             pos = t.position
             log.info(
                 "candle %s close=%.2f equity=%.2f action=%s position=%s",

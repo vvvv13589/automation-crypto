@@ -15,7 +15,7 @@ from typing import Callable, Optional
 import pandas as pd
 
 from .risk import RiskManager
-from .strategy import ADAPT, ENTER, EXIT, LONG, RANGE, TREND, AdaptiveStrategy
+from .strategy import ADAPT, ENTER, EXIT, LONG, RANGE, TREND, make_strategy
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +40,7 @@ class Position:
     funding: float = 0.0
     last_funding_check: Optional[str] = None
     stop_order_id: Optional[str] = None
+    risk_dist: float = 0.0  # initial entry-to-stop distance (1R)
 
 
 @dataclass
@@ -86,7 +87,7 @@ class Trader:
         params = dict(cfg["strategy"])
         if not self.futures:
             params["allow_short"] = False
-        self.strategy = AdaptiveStrategy(params)
+        self.strategy = make_strategy(params)
         self.risk = RiskManager(cfg["risk"])
         self.broker = broker
         self.notify = notify or (lambda text: None)
@@ -309,7 +310,7 @@ class Trader:
         self.position = Position(
             side=side, amount=amount, entry_price=price, stop_price=stop,
             take_profit=take_profit, regime=regime, best=price, opened_at=self._ts(now),
-            entry_fee=fee, last_funding_check=self._ts(now),
+            entry_fee=fee, last_funding_check=self._ts(now), risk_dist=stop_dist,
         )
         self._sync_exchange_stop()
         msg = (f"🟢 開倉 {side.upper()} {amount:.4f} {self.symbol} @ {price:.2f}\n"
@@ -352,7 +353,7 @@ class Trader:
                     price = open_
             else:
                 price = adverse
-            kind = "trailing stop" if (pos.stop_price - pos.entry_price) * s > 0 else "stop loss"
+            kind = "trailing / break-even stop" if (pos.stop_price - pos.entry_price) * s > 0 else "stop loss"
             self._close(price, now, kind)
             return True
         if not stop_only and pos.take_profit is not None and (favourable - pos.take_profit) * s >= 0:
@@ -376,9 +377,9 @@ class Trader:
             self._close(price, now, "closed on exchange (stop order / liquidation / manual)")
 
     # -------------------------------------------------------------- on candle
-    def on_candle(self, candles: pd.DataFrame, now=None) -> str:
+    def on_candle(self, candles: pd.DataFrame, now=None, htf: pd.DataFrame | None = None) -> str:
         """Run the strategy on closed candles. Returns the action taken."""
-        return self.on_analyzed(self.strategy.analyze(candles), now)
+        return self.on_analyzed(self.strategy.analyze(candles, htf), now)
 
     def on_analyzed(self, analyzed: pd.DataFrame, now=None) -> str:
         now = now if now is not None else analyzed.index[-1]
@@ -417,12 +418,7 @@ class Trader:
                     action = "adapt"
                 elif pos.regime == RANGE and decision.take_profit is not None:
                     pos.take_profit = float(decision.take_profit)  # follow the moving middle band
-                if pos.regime == TREND and self.last_atr:
-                    s = _sign(pos.side)
-                    trail = pos.best - s * self.cfg["strategy"]["trail_atr_mult"] * self.last_atr
-                    if (trail - pos.stop_price) * s > 0:
-                        pos.stop_price = trail
-                        self._sync_exchange_stop()
+                self._move_stop(pos)
         elif self.pending is not None:
             pass  # waiting for the limit entry
         elif self.cooldown > 0:
@@ -439,6 +435,21 @@ class Trader:
 
         self._save_state()
         return action
+
+    def _move_stop(self, pos: Position) -> None:
+        """Ratchet the stop (never loosen it): break-even at N x R, ATR trail without a target."""
+        s = _sign(pos.side)
+        candidates = []
+        be_r = float(self.cfg["strategy"].get("breakeven_r", 0) or 0)
+        if be_r > 0 and pos.risk_dist > 0 and (pos.best - pos.entry_price) * s >= be_r * pos.risk_dist:
+            fee_buffer = pos.entry_price * 2 * self.cfg["paper"]["taker_fee"]
+            candidates.append(pos.entry_price + s * fee_buffer)
+        if pos.take_profit is None and self.last_atr:  # riding a trend: trail it
+            candidates.append(pos.best - s * self.cfg["strategy"]["trail_atr_mult"] * self.last_atr)
+        best = max(candidates, key=lambda c: c * s, default=None)
+        if best is not None and (best - pos.stop_price) * s > 0:
+            pos.stop_price = best
+            self._sync_exchange_stop()
 
     def _check_halt(self, now=None) -> None:
         ok, why = self.risk.can_open()
