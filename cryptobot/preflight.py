@@ -82,19 +82,24 @@ def run_checks(exchange, cfg: dict) -> list[tuple[str, str]]:
         add(FAIL, "合約帳戶是「聯合保證金(多資產)模式」，逐倉無法使用。請到合約設定改成「單幣種保證金」")
     else:
         add(OK, "單幣種保證金模式(逐倉可用)")
+    positions, perr = _try(lambda: [p for p in exchange.fetch_positions() if float(p.get("contracts") or 0)])
+    positions = positions or []
+    names = ", ".join(p["symbol"].split("/")[0] for p in positions[:8])
     dual, err = _try(lambda: exchange.fapiPrivateGetPositionSideDual())
     if err:
         add(WARN, f"無法讀取持倉模式: {err}")
     elif str(dual.get("dualSidePosition")).lower() == "true":
-        add(WARN, "目前是「雙向持倉」，機器人啟動時會改成「單向持倉」(帳戶有持倉或掛單時會失敗)")
+        if positions:
+            add(FAIL, f"目前是「雙向持倉」，且帳戶有持倉({names})，機器人無法切換成「單向持倉」，下單會被拒絕。\n"
+                      f"   請先平倉({names})並取消所有掛單，再到 Binance 合約 →「偏好設定」→「持倉模式」改成「單向持倉」")
+        else:
+            add(WARN, "目前是「雙向持倉」，機器人啟動時會自動改成「單向持倉」(請確認沒有掛單)")
     else:
         add(OK, "單向持倉模式")
 
-    # 4. positions or orders the bot did not open
-    positions, err = _try(lambda: [p for p in exchange.fetch_positions() if float(p.get("contracts") or 0)])
-    if not err and positions:
-        names = ", ".join(p["symbol"].split("/")[0] for p in positions[:8])
-        add(WARN, f"帳戶已有 {len(positions)} 個持倉({names})：機器人不會管理它們，但它們會占用保證金")
+    # 4. positions the bot did not open
+    if positions:
+        add(WARN, f"帳戶已有 {len(positions)} 個持倉({names})：機器人不會交易這些幣，但它們會占用保證金")
 
     # 5. market data and the coin universe
     sample = None

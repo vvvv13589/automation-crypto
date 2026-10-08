@@ -343,6 +343,7 @@ def test_shared_paper_wallet_sums_all_positions():
 
 
 def _scan_cfg(cfg, **scanner):
+    cfg["scanner"]["coins"] = "all"  # synthetic test coins are not in the tested list
     cfg["scanner"].update(scanner)
     cfg["risk"].update(max_drawdown=1.0, daily_loss_limit=1.0)
     return cfg
@@ -446,6 +447,7 @@ def test_scan_runner_paper_end_to_end(cfg, tmp_path, monkeypatch):
 
 def test_preflight_flags_dangerous_settings(cfg):
     from cryptobot.preflight import FAIL, OK, WARN, report, run_checks
+    cfg["scanner"]["coins"] = "all"
     data = {f"C{i}/USDT:USDT": synthetic(bars=600, timeframe="4h", seed=30 + i) for i in range(3)}
 
     class Acct(FakeMarketExchange):
@@ -531,3 +533,74 @@ def test_check_explains_invalid_api_key(monkeypatch, capsys):
     assert main(["check"]) == 1
     out = capsys.readouterr().out
     assert "白名單" in out and "HMAC" in out
+
+
+
+def test_universe_is_tested_crypto_only(cfg):
+    from cryptobot.scanner import pick_universe
+    data = {s: synthetic(bars=50, timeframe="4h", seed=1) for s in
+            ("BTC/USDT:USDT", "ETH/USDT:USDT", "XAU/USDT:USDT", "SNDK/USDT:USDT", "C0/USDT:USDT")}
+    ex = FakeMarketExchange(data, 40)
+    ex.markets["XAU/USDT:USDT"]["info"] = {"underlyingType": "COMMODITY"}
+    uni = pick_universe(ex, cfg)
+    assert set(uni) == {"BTC/USDT:USDT", "ETH/USDT:USDT"}      # default: only backtested coins
+    cfg["scanner"]["coins"] = "all"
+    uni = pick_universe(ex, cfg, extra_exclude={"ETH"})
+    assert "XAU/USDT:USDT" not in uni and "ETH/USDT:USDT" not in uni and "C0/USDT:USDT" in uni
+
+
+def test_preflight_fails_hedge_mode_with_open_position(cfg):
+    from cryptobot.preflight import FAIL, run_checks
+    data = {"BTC/USDT:USDT": synthetic(bars=600, timeframe="4h", seed=3)}
+
+    class Acct(FakeMarketExchange):
+        def fetch_balance(self):
+            return {"info": {"totalMarginBalance": "316", "availableBalance": "300"}}
+
+        def sapiGetAccountApiRestrictions(self):
+            return {"enableWithdrawals": False, "enableFutures": True, "ipRestrict": True}
+
+        def fapiPrivateGetMultiAssetsMargin(self):
+            return {"multiAssetsMargin": False}
+
+        def fapiPrivateGetPositionSideDual(self):
+            return {"dualSidePosition": True}
+
+        def fetch_positions(self, symbols=None):
+            return [{"symbol": "ETH/USDT:USDT", "contracts": 0.1}]
+
+    res = run_checks(Acct(data, 599), cfg)
+    assert any(s == FAIL and "雙向持倉" in m and "ETH" in m for s, m in res)
+
+
+def test_live_scan_runner_skips_coins_with_manual_positions(cfg, tmp_path, monkeypatch):
+    from cryptobot import runner
+    data = {s: synthetic(bars=600, timeframe="4h", seed=5) for s in ("BTC/USDT:USDT", "ETH/USDT:USDT")}
+
+    class Live(FakeMarketExchange):
+        def fapiPrivateGetPositionSideDual(self):
+            return {"dualSidePosition": False}
+
+        def fetch_positions(self, symbols=None):
+            return [{"symbol": "ETH/USDT:USDT", "contracts": 0.1}]
+
+    fake = Live(data, 500)
+    monkeypatch.setattr(runner, "make_exchange", lambda *a, **k: fake)
+    monkeypatch.setenv("EXCHANGE_API_KEY", "k")
+    monkeypatch.setenv("EXCHANGE_API_SECRET", "s")
+    cfg.update(state_dir=str(tmp_path / "state"), log_dir=str(tmp_path / "logs"))
+    r = runner.ScanRunner(cfg, live=True)
+    assert r.external == {"ETH"}
+    r.refresh_universe()
+    assert r.universe == ["BTC/USDT:USDT"]
+
+    class Hedged(Live):
+        def fapiPrivateGetPositionSideDual(self):
+            return {"dualSidePosition": True}
+
+        def set_position_mode(self, hedged, symbol=None):
+            raise Exception("-4068 position side cannot be changed if there exists position")
+
+    monkeypatch.setattr(runner, "make_exchange", lambda *a, **k: Hedged(data, 500))
+    with pytest.raises(SystemExit):
+        runner.ScanRunner(cfg, live=True)

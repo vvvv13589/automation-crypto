@@ -270,17 +270,39 @@ def run_scan_backtest(cfg: dict, data: dict[str, pd.DataFrame]) -> dict:
 
 
 # ------------------------------------------------------------------ universe
-def pick_universe(exchange, cfg: dict) -> list[str]:
-    """Top USDT-margined perpetuals by 24h quote volume, stablecoins excluded."""
+def allowed_bases(cfg: dict) -> set[str] | None:
+    """Coins the scanner may trade: the tested crypto list by default, a custom list, or None (= any)."""
+    coins = cfg["scanner"].get("coins", "tested")
+    if coins == "tested":
+        return set(DEFAULT_UNIVERSE)
+    if coins in ("all", None):
+        return None
+    return {c.upper() for c in coins}
+
+
+def is_crypto_market(m: dict) -> bool:
+    """Binance also lists stock / commodity perpetuals (gold, oil, equities); keep crypto only."""
+    info = m.get("info") or {}
+    utype = info.get("underlyingType")
+    if utype and str(utype).upper() != "COIN":
+        return False
+    sub = " ".join(map(str, info.get("underlyingSubType") or [])).lower()
+    return not any(word in sub for word in ("tradfi", "stock", "equity", "commodity", "metal", "index"))
+
+
+def pick_universe(exchange, cfg: dict, extra_exclude: set[str] | None = None) -> list[str]:
+    """Top USDT perpetuals by 24h quote volume: crypto only, stablecoins and exclusions removed."""
     sc = cfg["scanner"]
-    exclude = set(sc.get("exclude", [])) | STABLE_BASES
+    exclude = set(sc.get("exclude", [])) | STABLE_BASES | set(extra_exclude or ())
+    allowed = allowed_bases(cfg)
     tickers = exchange.fetch_tickers()
     rows = []
     for sym, tk in tickers.items():
         m = exchange.markets.get(sym)
         if not m or not m.get("swap") or not m.get("linear") or m.get("settle") != "USDT" or not m.get("active", True):
             continue
-        if m.get("base") in exclude:
+        base = m.get("base")
+        if base in exclude or (allowed is not None and base not in allowed) or not is_crypto_market(m):
             continue
         qv = tk.get("quoteVolume") or 0
         if qv >= sc["min_quote_volume"]:

@@ -159,6 +159,36 @@ class ScanRunner:
         self._universe_at = 0.0
         self._last_bar = None
         self._stop = False
+        self.external: set[str] = set()  # coins with positions the bot did not open
+        if live:
+            self._prepare_live_account()
+
+    def _prepare_live_account(self) -> None:
+        """One-way position mode is required; never touch positions the bot did not open."""
+        ex = self.exchange
+        try:
+            dual = str(ex.fapiPrivateGetPositionSideDual().get("dualSidePosition")).lower() == "true"
+            if dual:
+                try:
+                    ex.set_position_mode(False)
+                except Exception as exc:
+                    log.warning("could not switch to one-way mode: %s", exc)
+                dual = str(ex.fapiPrivateGetPositionSideDual().get("dualSidePosition")).lower() == "true"
+            if dual:
+                raise SystemExit("帳戶是「雙向持倉」且無法自動切換(帳戶有持倉或掛單)。請先平倉並取消所有掛單，"
+                                 "或到 Binance 合約設定手動改成「單向持倉」，再重新啟動。")
+        except SystemExit:
+            raise
+        except Exception as exc:  # non-Binance exchanges: rely on per-symbol setup
+            log.info("position mode check skipped: %s", exc)
+        mine = set(self.scanner.open_symbols())
+        for p in ex.fetch_positions():
+            if float(p.get("contracts") or 0) and p.get("symbol") not in mine:
+                self.external.add(p["symbol"].split("/")[0])
+        if self.external:
+            msg = f"帳戶已有非機器人開的持倉：{', '.join(sorted(self.external))}，機器人不會交易這些幣"
+            log.warning(msg)
+            self._say(f"⚠️ {msg}")
 
     def stop(self, *_):
         log.info("stopping after current iteration...")
@@ -173,7 +203,7 @@ class ScanRunner:
 
         if self.universe and time.time() - self._universe_at < self.sc["refresh_hours"] * 3600:
             return
-        self.universe = pick_universe(self.exchange, self.cfg)
+        self.universe = pick_universe(self.exchange, self.cfg, extra_exclude=self.external)
         self._universe_at = time.time()
         log.info("universe: %d coins: %s", len(self.universe), summarize_universe(self.universe))
 

@@ -40,7 +40,8 @@ DEFAULTS: dict = {
     "notify": {"telegram": True},
     "scanner": {
         "enabled": True,  # scan the whole market (paper/live); --symbol trades one coin instead
-        "top_n": 50,  # universe = top N USDT perpetuals by 24h quote volume
+        "coins": "tested",  # tested = only the 55 backtested crypto coins | "all" | ["BTC", "ETH", ...]
+        "top_n": 50,  # universe = top N of those by 24h quote volume
         "min_quote_volume": 20_000_000,  # skip thin markets (24h volume in USDT)
         "refresh_hours": 24,  # re-pick the universe this often
         "max_positions": 4,  # open positions at the same time, one per coin

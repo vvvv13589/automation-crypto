@@ -44,7 +44,8 @@ notify:
 
 scanner:                 # 全市場掃描(paper / live)；指令加 --symbol XXX 則只交易單一幣
   enabled: true
-  top_n: 50              # 每天挑 24h 成交量前 50 大的 USDT 永續合約(自動排除穩定幣)
+  coins: tested          # tested = 只交易回測過的 55 種加密貨幣(排除黃金、原油、股票等合約) | all | [BTC, ETH, ...]
+  top_n: 50              # 從中每天挑 24h 成交量前 50 大(自動排除穩定幣)
   min_quote_volume: 20000000   # 24h 成交量低於 2000 萬 USDT 的不碰(太冷門)
   refresh_hours: 24      # 幾小時重新挑一次名單
   max_positions: 4       # 同時最多幾個持倉(每種幣最多 1 個)
