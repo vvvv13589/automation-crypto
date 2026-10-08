@@ -37,6 +37,9 @@ def _load_candles(cfg: dict, args, timeframe: str):
     cache = Path("data") / f"{ex_id}_{sym}_{timeframe}_{args.days}d.csv"
     if cache.exists() and not args.refresh:
         return data.load_csv(str(cache))
+    if getattr(args, "source", "api") == "vision":
+        print(f"downloading {cfg['symbol']} {timeframe} ({args.days} days) from data.binance.vision ...")
+        return data.fetch_binance_vision(cfg["symbol"], timeframe, args.days)
     ex = data.make_exchange(cfg)
     since = ex.milliseconds() - args.days * 86400 * 1000
     print(f"downloading {cfg['symbol']} {timeframe} ({args.days} days) from {ex_id} ...")
@@ -133,6 +136,8 @@ def main(argv=None) -> int:
     bt.add_argument("--days", type=int, default=90, help="days of exchange history to download")
     bt.add_argument("--csv", help="use candles from CSV (timestamp,open,high,low,close,volume)")
     bt.add_argument("--refresh", action="store_true", help="re-download instead of using data/ cache")
+    bt.add_argument("--source", choices=["api", "vision"], default="api",
+                    help="api = exchange API (default), vision = Binance public archive (futures only)")
     bt.add_argument("--synthetic", action="store_true", help="offline synthetic market data")
     bt.add_argument("--bars", type=int, default=5000)
     bt.add_argument("--seed", type=int, default=42)
@@ -146,6 +151,8 @@ def main(argv=None) -> int:
     op.add_argument("--top", type=int, default=10)
     op.add_argument("--workers", type=int, default=None, help="parallel processes (default: all CPUs)")
     op.add_argument("--refresh", action="store_true", help="re-download instead of using data/ cache")
+    op.add_argument("--source", choices=["api", "vision"], default="api",
+                    help="api = exchange API (default), vision = Binance public archive (futures only)")
     op.add_argument("--csv", help=argparse.SUPPRESS)
     op.add_argument("--synthetic", action="store_true", help="offline synthetic data (for testing)")
     op.add_argument("--bars", type=int, default=4000)

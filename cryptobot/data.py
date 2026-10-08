@@ -108,3 +108,69 @@ def synthetic(bars: int = 3000, timeframe: str = "15m", start_price: float = 300
          "volume": rng.uniform(10, 100, bars)},
         index=idx,
     )
+
+
+VISION_URL = "https://data.binance.vision/data/futures/um"
+
+
+def _vision_symbol(symbol: str) -> str:
+    """'ETH/USDT:USDT' -> 'ETHUSDT'."""
+    return symbol.split(":")[0].replace("/", "")
+
+
+def _read_vision_zip(blob: bytes) -> pd.DataFrame:
+    import io
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+        with zf.open(zf.namelist()[0]) as fh:
+            raw = pd.read_csv(fh, header=None, usecols=range(6))
+    raw = raw[pd.to_numeric(raw[0], errors="coerce").notna()]  # drop header row if present
+    raw.columns = COLUMNS
+    return to_frame(raw.astype(float).astype({"timestamp": "int64"}).values.tolist())
+
+
+def fetch_binance_vision(symbol: str, timeframe: str, days: int, cache_dir: str = "data/vision") -> pd.DataFrame:
+    """USDT-M futures candles from Binance's public archive (data.binance.vision).
+
+    Monthly files for complete months, daily files for the current month.
+    Works where the trading API is geo-blocked; downloads are cached.
+    """
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+
+    sym = _vision_symbol(symbol)
+    end = pd.Timestamp.now(tz="UTC").normalize()
+    start = end - pd.Timedelta(days=days)
+    cache = Path(cache_dir) / sym / timeframe
+    cache.mkdir(parents=True, exist_ok=True)
+
+    names = []
+    month, this_month = start.tz_localize(None).to_period("M"), end.tz_localize(None).to_period("M")
+    while month < this_month:
+        names.append(("monthly", f"{sym}-{timeframe}-{month}"))
+        month += 1
+    day = max(start, this_month.start_time.tz_localize("UTC"))
+    while day < end:
+        names.append(("daily", f"{sym}-{timeframe}-{day:%Y-%m-%d}"))
+        day += pd.Timedelta(days=1)
+
+    frames = []
+    for kind, name in names:
+        path = cache / f"{name}.zip"
+        if not path.exists():
+            url = f"{VISION_URL}/{kind}/klines/{sym}/{timeframe}/{name}.zip"
+            try:
+                with urllib.request.urlopen(url, timeout=60) as resp:
+                    path.write_bytes(resp.read())
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:  # not published yet
+                    continue
+                raise
+        frames.append(_read_vision_zip(path.read_bytes()))
+    if not frames:
+        raise RuntimeError(f"no archive data for {sym} {timeframe}")
+    df = pd.concat(frames).sort_index()
+    df = df[~df.index.duplicated()]
+    return df[df.index >= start]
