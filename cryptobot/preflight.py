@@ -19,6 +19,25 @@ def _try(fn):
         return None, str(exc)[:160]
 
 
+def explain_error(exc) -> str:
+    """Plain-language hints for common exchange errors."""
+    msg = str(exc)
+    if "-2015" in msg or "Invalid API-key" in msg:
+        return ("可能原因(依常見程度)：\n"
+                "  1. .env 裡的 API Key / Secret 貼錯、多了空格，或 Key 和 Secret 對調\n"
+                "  2. API 有設「限制 IP」，但伺服器 IP 不在白名單(用 curl ifconfig.me 查伺服器 IP)\n"
+                "  3. 建立 API 時選了「自行生成(Ed25519/RSA)」，請改用「系統生成(HMAC)」\n"
+                "  4. API 權限沒勾「允許讀取」或「允許合約」，或帳戶還沒開通合約\n"
+                "  5. 剛建立的 key 要等 1～2 分鐘才生效")
+    if "-1021" in msg or "Timestamp" in msg:
+        return "伺服器時間不準，請執行：sudo timedatectl set-ntp true"
+    if "-1022" in msg or "Signature" in msg:
+        return "簽章錯誤：Secret Key 貼錯，或建立 API 時選了自行生成(Ed25519/RSA)，請改用系統生成(HMAC)"
+    if "451" in msg or "restricted location" in msg.lower():
+        return "Binance 拒絕這個地區的連線(伺服器所在地不提供服務)"
+    return "請把上面的錯誤訊息貼給 Claude 協助判斷"
+
+
 def run_checks(exchange, cfg: dict) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     add = lambda status, msg: out.append((status, msg))  # noqa: E731
@@ -26,7 +45,7 @@ def run_checks(exchange, cfg: dict) -> list[tuple[str, str]]:
     # 1. API key works and the futures wallet has money
     bal, err = _try(exchange.fetch_balance)
     if err:
-        add(FAIL, f"無法讀取合約帳戶餘額(API key 錯誤、沒開合約權限或 IP 不在白名單): {err}")
+        add(FAIL, f"無法讀取合約帳戶餘額: {err}\n{explain_error(err)}")
         return out
     info = bal.get("info") or {}
     equity = float(info.get("totalMarginBalance") or (bal.get("total") or {}).get("USDT") or 0)

@@ -518,3 +518,16 @@ def test_reset_risk_clears_drawdown_halt(cfg, tmp_path, monkeypatch):
     assert main(["reset-risk"]) == 0
     data = _json.loads(p.read_text())
     assert data["risk"] == {} and data["cash"] == 312
+
+
+def test_check_explains_invalid_api_key(monkeypatch, capsys):
+    import cryptobot.data as data
+    monkeypatch.setenv("EXCHANGE_API_KEY", "x")
+    monkeypatch.setenv("EXCHANGE_API_SECRET", "y")
+
+    def boom(*a, **k):
+        raise Exception('binance {"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}')
+    monkeypatch.setattr(data, "make_exchange", boom)
+    assert main(["check"]) == 1
+    out = capsys.readouterr().out
+    assert "白名單" in out and "HMAC" in out

@@ -17,7 +17,9 @@ def make_exchange(cfg: dict, api_key: str | None = None, secret: str | None = No
     ex_cfg = cfg["exchange"]
     klass = getattr(ccxt, ex_cfg["id"])
     default_type = "swap" if cfg.get("market") == "future" else "spot"
-    params = {"enableRateLimit": True, "options": {"defaultType": default_type}}
+    # fetchCurrencies hits the spot wallet API (sapi), which futures-only keys may not allow
+    params = {"enableRateLimit": True,
+              "options": {"defaultType": default_type, "fetchCurrencies": False}}
     if api_key:
         params.update(apiKey=api_key, secret=secret)
         if password:

@@ -269,7 +269,13 @@ def main(argv=None) -> int:
         if not key or not secret:
             print("❌ .env 裡沒有 EXCHANGE_API_KEY / EXCHANGE_API_SECRET")
             return 1
-        ex = make_exchange(cfg, key, secret, os.getenv("EXCHANGE_API_PASSWORD"))
+        try:
+            ex = make_exchange(cfg, key, secret, os.getenv("EXCHANGE_API_PASSWORD"))
+        except Exception as exc:
+            from .preflight import explain_error
+            print(f"❌ 無法連上交易所: {str(exc)[:200]}")
+            print(explain_error(exc))
+            return 1
         return report(run_checks(ex, cfg))
     if args.command == "notify-test":
         from .notify import make_notifier
