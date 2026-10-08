@@ -442,3 +442,36 @@ def test_scan_runner_paper_end_to_end(cfg, tmp_path, monkeypatch):
     assert "USDC/USDT:USDT" not in r.universe and len(r.universe) == 3
     trades = [t for tr in r.scanner.traders.values() for t in tr.trades]
     assert trades and any((tmp_path / "logs").iterdir())
+
+
+def test_preflight_flags_dangerous_settings(cfg):
+    from cryptobot.preflight import FAIL, OK, WARN, report, run_checks
+    data = {f"C{i}/USDT:USDT": synthetic(bars=600, timeframe="4h", seed=30 + i) for i in range(3)}
+
+    class Acct(FakeMarketExchange):
+        withdraw, multi = True, "true"
+
+        def fetch_balance(self):
+            return {"info": {"totalMarginBalance": "310", "availableBalance": "300"}}
+
+        def sapiGetAccountApiRestrictions(self):
+            return {"enableWithdrawals": self.withdraw, "enableFutures": True, "ipRestrict": False}
+
+        def fapiPrivateGetMultiAssetsMargin(self):
+            return {"multiAssetsMargin": self.multi}
+
+        def fapiPrivateGetPositionSideDual(self):
+            return {"dualSidePosition": False}
+
+        def fetch_positions(self, symbols=None):
+            return []
+
+    ex = Acct(data, 599)
+    res = dict((m, s) for s, m in run_checks(ex, cfg))
+    assert any("提現" in m and s == FAIL for m, s in res.items())
+    assert any("聯合保證金" in m and s == FAIL for m, s in res.items())
+    assert report(run_checks(ex, cfg)) == 1
+    ex.withdraw, ex.multi = False, "false"
+    statuses = [s for s, _ in run_checks(ex, cfg)]
+    assert FAIL not in statuses and OK in statuses and WARN in statuses  # IP whitelist warning
+    assert report(run_checks(ex, cfg)) == 0

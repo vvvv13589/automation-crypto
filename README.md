@@ -99,7 +99,10 @@ python -m cryptobot notify-test
 python -m cryptobot paper                           # 全市場掃描
 python -m cryptobot --symbol ETH/USDT:USDT paper    # 只交易一種幣
 
-# 5. 小額實盤(真實資金！)
+# 5. 實盤前檢查(只讀取、不下單)：API 權限、保證金模式、餘額、行情資料
+python -m cryptobot check
+
+# 6. 小額實盤(真實資金！)
 python -m cryptobot live --confirm-live
 ```
 

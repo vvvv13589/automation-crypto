@@ -208,6 +208,7 @@ def main(argv=None) -> int:
 
     sub.add_parser("paper", help="real-time simulated trading with live market data")
     sub.add_parser("notify-test", help="send a Telegram test message")
+    sub.add_parser("check", help="read-only pre-flight checks of the live account (places no orders)")
     live = sub.add_parser("live", help="REAL trading with real funds")
     live.add_argument("--confirm-live", action="store_true", help="required: I accept the risk")
 
@@ -242,6 +243,17 @@ def main(argv=None) -> int:
         return cmd_optimize(cfg, args)
     if args.command == "scan-backtest":
         return cmd_scan_backtest(cfg, args)
+    if args.command == "check":
+        import os
+
+        from .data import make_exchange
+        from .preflight import report, run_checks
+        key, secret = os.getenv("EXCHANGE_API_KEY"), os.getenv("EXCHANGE_API_SECRET")
+        if not key or not secret:
+            print("❌ .env 裡沒有 EXCHANGE_API_KEY / EXCHANGE_API_SECRET")
+            return 1
+        ex = make_exchange(cfg, key, secret, os.getenv("EXCHANGE_API_PASSWORD"))
+        return report(run_checks(ex, cfg))
     if args.command == "notify-test":
         from .notify import make_notifier
         n = make_notifier(cfg, "live")
