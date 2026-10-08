@@ -475,3 +475,46 @@ def test_preflight_flags_dangerous_settings(cfg):
     statuses = [s for s, _ in run_checks(ex, cfg)]
     assert FAIL not in statuses and OK in statuses and WARN in statuses  # IP whitelist warning
     assert report(run_checks(ex, cfg)) == 0
+
+
+def test_goal_alerts_fire_once_and_target_stops_entries(cfg, tmp_path):
+    from cryptobot.broker import PaperWallet
+    from cryptobot.scanner import Scanner
+    _scan_cfg(cfg, max_positions=4)
+    cfg["goals"].update(base_capital=100, target=500)
+    sent = []
+    w = PaperWallet(100)
+    sc = Scanner(cfg, lambda s: PaperBroker(100, 0, 0, 0, 5, wallet=w), state_dir=str(tmp_path),
+                 notify=sent.append, mode="paper", wallet=w)
+    now = pd.Timestamp("2024-03-01T04:00Z")
+    w.cash = 150
+    sc.finish_candle(now)
+    assert sent == []
+    w.cash = 210
+    sc.finish_candle(now)
+    sc.finish_candle(now)
+    assert len(sent) == 1 and "翻倍" in sent[0]          # doubled: alert once only
+    w.cash = 520
+    sc.begin_candle()
+    t = sc.trader("AAA/USDT:USDT")
+    t.entry_gate(t, _enter(LONG, 95.0), {"close": np.array([100.0]), "vol_ratio": np.array([3.0])}, 0)
+    assert sc.finish_candle(now) == [] and sc.open_count() == 0   # target reached: no new entries
+    assert len(sent) == 2 and "目標" in sent[1]
+    # flags survive a restart
+    w2 = PaperWallet(520)
+    sc2 = Scanner(cfg, lambda s: PaperBroker(520, 0, 0, 0, 5, wallet=w2), state_dir=str(tmp_path),
+                  notify=sent.append, mode="paper", wallet=w2)
+    sc2.finish_candle(now)
+    assert sc2.target_reached and len(sent) == 2
+
+
+def test_reset_risk_clears_drawdown_halt(cfg, tmp_path, monkeypatch):
+    import json as _json
+    monkeypatch.chdir(tmp_path)
+    state = tmp_path / "state"
+    state.mkdir()
+    p = state / "binance_scan_paper_portfolio.json"
+    p.write_text(_json.dumps({"risk": {"peak_equity": 624, "drawdown_halt": True}, "cash": 312}))
+    assert main(["reset-risk"]) == 0
+    data = _json.loads(p.read_text())
+    assert data["risk"] == {} and data["cash"] == 312

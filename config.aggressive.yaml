@@ -1,0 +1,24 @@
+# 激進版：cp config.aggressive.yaml config.yaml
+# 只列出跟預設(保守版)不同的設定，其他沿用預設值
+#
+# 回測(2024-01～2026-10，312 U 起跳)：34 個月後約 1,577 U(約 5 倍)
+#   2024 +125% / 2025 +27% / 2026 +78%，但中途最慘從高點跌 -60%，最差單月 -41%
+#   保守版同期約 1.5 倍、最慘 -19%
+# ⚠️ 只用「全部虧光也能接受」的錢
+
+scanner:
+  max_positions: 4       # 同時最多 4 個持倉
+  risk_per_trade: 0.03   # 每個持倉停損最多虧總資金 3%(保守版 0.75%)
+
+risk:
+  max_drawdown: 0.70     # 從高點回撤 70% 才停機(保守版 20%，激進版正常波動就會超過 20%)
+  daily_loss_limit: 0.30 # 單日虧 30% 當天停止開新倉
+
+goals:
+  base_capital: 312      # 你的本金(USDT)，請改成實際投入的金額
+  double_alert: true     # 帳戶翻倍時 Telegram 提醒你提出本金
+  target: 3000           # 帳戶到 3000 U 自動停止開新倉，並通知你提領
+  stop_at_target: true
+
+paper:
+  starting_cash: 312     # 回測/模擬的起始資金

@@ -209,6 +209,8 @@ def main(argv=None) -> int:
     sub.add_parser("paper", help="real-time simulated trading with live market data")
     sub.add_parser("notify-test", help="send a Telegram test message")
     sub.add_parser("check", help="read-only pre-flight checks of the live account (places no orders)")
+    rr = sub.add_parser("reset-risk", help="after a withdrawal: restart drawdown tracking from the current balance")
+    rr.add_argument("--live", action="store_true", help="reset the live scanner (default: paper)")
     live = sub.add_parser("live", help="REAL trading with real funds")
     live.add_argument("--confirm-live", action="store_true", help="required: I accept the risk")
 
@@ -243,6 +245,21 @@ def main(argv=None) -> int:
         return cmd_optimize(cfg, args)
     if args.command == "scan-backtest":
         return cmd_scan_backtest(cfg, args)
+    if args.command == "reset-risk":
+        import json
+        from pathlib import Path
+
+        from .scanner import tag_for
+        mode = "live" if args.live else "paper"
+        path = Path(cfg["state_dir"]) / f"{tag_for(cfg, mode)}_portfolio.json"
+        if not path.exists():
+            print(f"沒有找到 {path}，不需要重置")
+            return 0
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["risk"] = {}  # peak, daily start and the drawdown halt are re-learned on the next candle
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        print(f"✅ 已重置 {mode} 的回撤紀錄，下次啟動會從目前餘額重新計算(請在機器人停止時執行)")
+        return 0
     if args.command == "check":
         import os
 

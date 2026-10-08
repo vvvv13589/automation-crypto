@@ -36,6 +36,22 @@
 
 **資金建議**：每倉風險 0.75%，300 USDT 時每倉約 2.25 USDT 風險。部分幣(如 BTC 最低下單 100 USDT)可能因金額太小被跳過，**建議 500 USDT 以上**。
 
+## 激進版(`config.aggressive.yaml`)
+
+`cp config.aggressive.yaml config.yaml` 即可使用：每個持倉風險 3%、停機線 70%、翻倍提醒、3000 U 自動停止開新倉。
+
+| 312 U 起跳(2024-01～2026-10) | 保守版 | 激進版 |
+|---|---|---|
+| 34 個月後 | 約 480 U | 約 1,577 U |
+| 中途最慘 | -19% | **-60%** |
+| 最差單月 | -12% | **-41%** |
+
+**提出本金的流程**(收到「帳戶翻倍」通知後)：
+1. 在 tmux 視窗按 Ctrl+C 停止機器人
+2. 在 Binance 把本金從 U 本位合約劃轉出來
+3. `python -m cryptobot --live reset-risk`(讓回撤從目前餘額重新計算，否則提領會被當成虧損)
+4. 重新啟動 `python -m cryptobot live --confirm-live`
+
 ## 其他策略(研究對照用，`--strategy pullback|adaptive`)
 
 ### `pullback`：大週期順勢 + 回檔進場

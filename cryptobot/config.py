@@ -48,6 +48,12 @@ DEFAULTS: dict = {
         "settle_seconds": 20,  # wait after a candle closes before fetching it
         "exclude": [],  # base assets to never trade, e.g. ["PEPE"]
     },  # needs TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in .env
+    "goals": {
+        "base_capital": 0,  # your stake in USDT; 0 = no milestone alerts
+        "double_alert": True,  # Telegram when the account doubles: take the stake out
+        "target": 0,  # stop opening new positions once the account reaches this (0 = off)
+        "stop_at_target": True,
+    },
     "strategy": {
         "name": "breakout",  # breakout (4h Donchian) | pullback | adaptive
         "allow_long": True,

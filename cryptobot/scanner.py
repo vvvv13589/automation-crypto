@@ -70,6 +70,9 @@ class Scanner:
         self.wallet = wallet
         self.max_positions = int(cfg["scanner"]["max_positions"])
         self.risk = RiskManager(self.cfg["risk"])
+        self.goals = cfg.get("goals") or {}
+        self.milestones_sent: set[str] = set()
+        self.target_reached = False
         self.traders: dict[str, Trader] = {}
         self._candidates: list[tuple[float, Trader, object, float]] = []
         self._load_portfolio()
@@ -87,6 +90,8 @@ class Scanner:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         self.risk.load(data.get("risk", {}))
+        self.milestones_sent = set(data.get("milestones_sent", []))
+        self.target_reached = bool(data.get("target_reached", False))
         if self.wallet is not None and "cash" in data:
             self.wallet.cash = data["cash"]
         # bring back every symbol that still has a position or a working order
@@ -105,7 +110,8 @@ class Scanner:
         if not path:
             return
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        data = {"risk": self.risk.to_dict()}
+        data = {"risk": self.risk.to_dict(), "milestones_sent": sorted(self.milestones_sent),
+                "target_reached": self.target_reached}
         if self.wallet is not None:
             data["cash"] = self.wallet.cash
         tmp = path + ".tmp"
@@ -142,9 +148,42 @@ class Scanner:
     def begin_candle(self) -> None:
         self._candidates = []
 
+    def account_equity(self) -> float | None:
+        if self.wallet is not None:
+            return self.wallet.equity()
+        for t in self.traders.values():  # live: any broker reports the whole futures account
+            return t.broker.equity(0.0)
+        return None
+
+    def _notify(self, text: str) -> None:
+        log.info(text.replace("\n", " | "))
+        if self.notify:
+            self.notify(text)
+
+    def check_goals(self, equity: float | None) -> None:
+        """Telegram milestones: doubled (take the stake out) and target reached (stop entering)."""
+        base, target = float(self.goals.get("base_capital") or 0), float(self.goals.get("target") or 0)
+        if equity is None or base <= 0:
+            return
+        if self.goals.get("double_alert", True) and equity >= 2 * base and "double" not in self.milestones_sent:
+            self.milestones_sent.add("double")
+            self._notify(f"🎉 帳戶翻倍了：{equity:.0f} U(本金 {base:.0f} U)\n"
+                         f"建議現在提出本金 {base:.0f} U，之後只用獲利繼續跑。\n"
+                         f"提領步驟：Ctrl+C 停止機器人 → 在 Binance 把 {base:.0f} U 劃轉出合約帳戶 → "
+                         f"執行 python -m cryptobot --live reset-risk → 重新啟動")
+        if target > 0 and equity >= target and not self.target_reached:
+            self.target_reached = True
+            self._notify(f"🏁 達到目標 {target:.0f} U！目前 {equity:.0f} U\n"
+                         f"已停止開新倉，現有持倉會照停損自動出場。全部平倉後請提領並停止機器人。")
+
     def finish_candle(self, now) -> list[str]:
         """Enter the strongest collected signals while slots are free."""
         entered = []
+        self.check_goals(self.account_equity())
+        if self.target_reached and self.goals.get("stop_at_target", True):
+            self._candidates = []
+            self.save()
+            return entered
         free = self.max_positions - self.open_count()
         for strength, trader, decision, price in sorted(self._candidates, key=lambda c: -c[0]):
             if free <= 0:
