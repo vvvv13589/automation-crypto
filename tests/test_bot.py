@@ -625,8 +625,9 @@ def test_daily_report_content_and_schedule(cfg, tmp_path, monkeypatch):
     pos = sc.traders["C0/USDT:USDT"].position
     gain = (pos.entry_price - 95.0) * pos.amount
     assert sent and "本金 300" in text and "C0 空 @ 99.97 → 95" in text and f"{gain:+.2f} U" in text
+    assert f"機器人：{gain:+.2f} U" in text and "手動／其他" in text
     assert "停損 104.97" in text
-    assert f"餘額 {sc.account_equity():.2f}" in text and sc.account_equity() > 300  # unrealised gain included
+    assert f"帳戶總額 {sc.account_equity():.2f}" in text and sc.account_equity() > 300  # unrealised gain included
     assert "機器人運作中" in text
 
     rep = DailyReporter({"notify": {"daily_report": "09:00", "timezone": "Asia/Taipei"}})
@@ -659,3 +660,67 @@ def test_entry_message_explains_market(cfg):
     sc.finish_candle(pd.Timestamp("2024-03-01T04:00Z"))
     opened = [m for m in sent if "開倉" in m]
     assert opened and "2 個幣跌破、0 個突破 → 市場偏弱" in opened[0] and "BTC：24 小時" in opened[0]
+
+
+def test_manual_position_opened_while_running_is_skipped(cfg, tmp_path, monkeypatch):
+    from cryptobot import runner
+    data = {s: synthetic(bars=600, timeframe="4h", seed=6) for s in ("BTC/USDT:USDT", "ETH/USDT:USDT")}
+
+    class Live(FakeMarketExchange):
+        manual = []
+
+        def fapiPrivateGetPositionSideDual(self):
+            return {"dualSidePosition": False}
+
+        def fetch_positions(self, symbols=None):
+            return [{"symbol": s, "contracts": 1.0} for s in self.manual]
+
+    fake = Live(data, 500)
+    monkeypatch.setattr(runner, "make_exchange", lambda *a, **k: fake)
+    monkeypatch.setenv("EXCHANGE_API_KEY", "k")
+    monkeypatch.setenv("EXCHANGE_API_SECRET", "s")
+    cfg.update(state_dir=str(tmp_path / "state"), log_dir=str(tmp_path / "logs"))
+    sent = []
+    r = runner.ScanRunner(cfg, live=True)
+    r.notify = sent.append
+    assert r.external == set()
+    Live.manual = ["ETH/USDT:USDT"]          # user opens ETH by hand while the bot runs
+    r.refresh_external()
+    assert r.external == {"ETH"} and any("ETH" in m for m in sent)
+    Live.manual = []                          # closed again -> ETH is tradable again
+    r.refresh_external()
+    assert r.external == set()
+
+
+
+def test_report_splits_bot_and_manual_pnl(cfg, tmp_path):
+    from cryptobot.broker import PaperWallet
+    from cryptobot.report import build_report
+    from cryptobot.scanner import Scanner
+    _scan_cfg(cfg)
+    cfg.update(log_dir=str(tmp_path))
+    cfg["goals"]["base_capital"] = 312
+    (tmp_path / "binance_scan_live_trades.csv").write_text(
+        "closed_at,pnl\n2024-03-01T00:00:00+00:00,5.0\n2024-03-02T00:00:00+00:00,-2.0\n")
+
+    class Broker:
+        live = True
+
+        def equity(self, price):
+            return 400.0
+
+    class Ex:
+        def fetch_tickers(self, symbols=None):
+            return {}
+
+        def fetch_positions(self, symbols=None):
+            return [{"symbol": "ETH/USDT:USDT", "contracts": 0.5, "side": "long",
+                     "entryPrice": 2500, "unrealizedPnl": 12.5}]
+
+    sc = Scanner(cfg, lambda s: Broker(), mode="live")
+    sc.trader("BTC/USDT:USDT")
+    text = build_report(sc, Ex(), cfg, "live", pd.Timestamp("2024-03-03T01:00Z"))
+    assert "帳戶總額 400.00 U（本金 312 U" in text
+    assert "機器人：+3.00 U（已實現 +3.00、未實現 +0.00）" in text
+    assert "手動／其他：+85.00 U" in text
+    assert "手動持倉" in text and "ETH 多 @ 2500  +12.50 U" in text

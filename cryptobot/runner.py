@@ -197,12 +197,20 @@ class ScanRunner:
             raise
         except Exception as exc:  # non-Binance exchanges: rely on per-symbol setup
             log.info("position mode check skipped: %s", exc)
+        self.refresh_external()
+
+    def refresh_external(self) -> None:
+        """Coins holding a position the bot did not open (manual trades): never trade them."""
+        if not self.live:
+            return
         mine = set(self.scanner.open_symbols())
-        for p in ex.fetch_positions():
-            if float(p.get("contracts") or 0) and p.get("symbol") not in mine:
-                self.external.add(p["symbol"].split("/")[0])
-        if self.external:
-            msg = f"帳戶已有非機器人開的持倉：{', '.join(sorted(self.external))}，機器人不會交易這些幣"
+        found = {p["symbol"].split("/")[0] for p in self.exchange.fetch_positions()
+                 if float(p.get("contracts") or 0) and p.get("symbol") not in mine}
+        new = found - self.external
+        self.external = found
+        if new:
+            msg = (f"帳戶有非機器人開的持倉：{', '.join(sorted(new))}，機器人不會交易這些幣"
+                   f"（平倉後會自動恢復）")
             log.warning(msg)
             self._say(f"⚠️ {msg}")
 
@@ -245,7 +253,12 @@ class ScanRunner:
     def scan(self, now) -> list[str]:
         """A candle just closed: evaluate every coin, then enter the strongest signals."""
         self.refresh_universe()
-        symbols = list(dict.fromkeys(self.scanner.open_symbols() + self.universe))
+        try:
+            self.refresh_external()
+        except Exception as exc:
+            log.warning("could not check for manual positions: %s", exc)
+        fresh = [s for s in self.universe if s.split("/")[0] not in self.external]
+        symbols = list(dict.fromkeys(self.scanner.open_symbols() + fresh))
         self.scanner.begin_candle()
         self.scanner.market_note = ""
         for sym in symbols:

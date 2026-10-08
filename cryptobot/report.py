@@ -54,41 +54,65 @@ def build_report(scanner, exchange, cfg: dict, mode: str, now: datetime | None =
             if px and not broker.live:
                 broker.mark = px
 
+    # bot positions first: their unrealised PnL is needed for the bot / manual split
+    bot_lines, bot_unreal = [], 0.0
+    for sym in open_syms:
+        t = scanner.traders[sym]
+        pos = t.position
+        name = sym.split("/")[0]
+        if pos is None:
+            bot_lines.append(f"  • {name} 限價單等待成交")
+            continue
+        px = prices.get(sym) or 0
+        s = 1 if pos.side == "long" else -1
+        pnl = s * (px - pos.entry_price) * pos.amount if px else 0.0
+        bot_unreal += pnl
+        bot_lines.append(f"  • {name} {'多' if s > 0 else '空'} @ {pos.entry_price:.6g} → {px:.6g}"
+                         f"  {pnl:+.2f} U  停損 {pos.stop_price:.6g}")
+
     equity = scanner.account_equity()
     base = float((cfg.get("goals") or {}).get("base_capital") or 0)
     if equity is not None:
-        line = f"💰 餘額 {equity:.2f} U"
+        line = f"💰 帳戶總額 {equity:.2f} U"
         if base > 0:
             line += f"（本金 {base:.0f} U，{(equity / base - 1) * 100:+.1f}%）"
         lines.append(line)
+        bot_real = sum(float(r["pnl"]) for r in recent_trades(cfg, mode, datetime(1970, 1, 1, tzinfo=timezone.utc)))
+        bot_total = bot_real + bot_unreal
+        lines.append(f"  🤖 機器人：{bot_total:+.2f} U（已實現 {bot_real:+.2f}、未實現 {bot_unreal:+.2f}）")
+        if base > 0:
+            lines.append(f"  ✋ 手動／其他：{equity - base - bot_total:+.2f} U（手動交易、轉入轉出）")
         peak = scanner.risk.peak_equity
         if peak:
             lines.append(f"📉 距離最高點 {(equity / peak - 1) * 100:+.1f}%（停機線 -{cfg['risk']['max_drawdown'] * 100:.0f}%）")
 
-    if open_syms:
-        lines.append(f"📌 持倉 {len(open_syms)}/{scanner.max_positions}：")
-        for sym in open_syms:
-            t = scanner.traders[sym]
-            pos = t.position
-            name = sym.split("/")[0]
-            if pos is None:
-                lines.append(f"  • {name} 限價單等待成交")
-                continue
-            px = prices.get(sym) or 0
-            s = 1 if pos.side == "long" else -1
-            pnl = s * (px - pos.entry_price) * pos.amount if px else 0.0
-            lines.append(f"  • {name} {'多' if s > 0 else '空'} @ {pos.entry_price:.6g} → {px:.6g}"
-                         f"  {pnl:+.2f} U  停損 {pos.stop_price:.6g}")
+    if bot_lines:
+        lines.append(f"📌 機器人持倉 {len(open_syms)}/{scanner.max_positions}：")
+        lines.extend(bot_lines)
     else:
-        lines.append("📌 目前沒有持倉，等待突破訊號")
+        lines.append("📌 機器人目前沒有持倉，等待突破訊號")
+
+    manual = []
+    if mode == "live":
+        try:
+            manual = [p for p in exchange.fetch_positions()
+                      if float(p.get("contracts") or 0) and p.get("symbol") not in open_syms]
+        except Exception:
+            manual = []
+    if manual:
+        lines.append("✋ 手動持倉（機器人不會碰）：")
+        for p in manual:
+            side = "多" if p.get("side") == "long" else "空"
+            upnl = float(p.get("unrealizedPnl") or 0)
+            lines.append(f"  • {p['symbol'].split('/')[0]} {side} @ {float(p.get('entryPrice') or 0):.6g}  {upnl:+.2f} U")
 
     trades = recent_trades(cfg, mode, now - timedelta(hours=24))
     if trades:
         total = sum(float(r["pnl"]) for r in trades)
         wins = sum(1 for r in trades if float(r["pnl"]) > 0)
-        lines.append(f"🧾 過去 24 小時平倉 {len(trades)} 筆（賺 {wins} 筆）合計 {total:+.2f} U")
+        lines.append(f"🧾 機器人過去 24 小時平倉 {len(trades)} 筆（賺 {wins} 筆）合計 {total:+.2f} U")
     else:
-        lines.append("🧾 過去 24 小時沒有平倉")
+        lines.append("🧾 機器人過去 24 小時沒有平倉")
 
     if scanner.risk.drawdown_halt:
         lines.append("⛔ 已觸發最大回撤停機，不會開新倉")
