@@ -15,6 +15,7 @@ parameter settings.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import glob
 import json
 import logging
@@ -75,6 +76,7 @@ class Scanner:
         self.target_reached = False
         self.traders: dict[str, Trader] = {}
         self._candidates: list[tuple[float, Trader, object, float]] = []
+        self.market_note = ""  # extra context line for entry messages (set by the live runner)
         self._load_portfolio()
 
     # ------------------------------------------------------------ persistence
@@ -176,6 +178,16 @@ class Scanner:
             self._notify(f"🏁 達到目標 {target:.0f} U！目前 {equity:.0f} U\n"
                          f"已停止開新倉，現有持倉會照停損自動出場。全部平倉後請提領並停止機器人。")
 
+    def _market_context(self) -> str:
+        """Breadth of this scan plus an optional note (e.g. BTC) set by the live runner."""
+        ups = sum(1 for _, _, d, _ in self._candidates if d.side == "long")
+        downs = len(self._candidates) - ups
+        mood = "市場偏強" if ups > downs else ("市場偏弱" if downs > ups else "多空分歧")
+        lines = [f"• 這次掃描：{downs} 個幣跌破、{ups} 個突破 → {mood}"] if self._candidates else []
+        if self.market_note:
+            lines.append(self.market_note)
+        return "\n".join(lines)
+
     def finish_candle(self, now) -> list[str]:
         """Enter the strongest collected signals while slots are free."""
         entered = []
@@ -185,9 +197,12 @@ class Scanner:
             self.save()
             return entered
         free = self.max_positions - self.open_count()
+        context = self._market_context()
         for strength, trader, decision, price in sorted(self._candidates, key=lambda c: -c[0]):
             if free <= 0:
                 break
+            if context:
+                decision = dataclasses.replace(decision, reason=f"{decision.reason}\n{context}")
             if trader.try_enter(decision, price, now):
                 entered.append(trader.symbol)
                 free -= 1

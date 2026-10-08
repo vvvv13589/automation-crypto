@@ -123,6 +123,19 @@ class Runner:
         self._say("⏹ 機器人已停止" + ("（仍有持倉，交易所停損單有效）" if self.trader.position else ""))
 
 
+def btc_note(candles) -> str:
+    """One line on Bitcoin, the market's bellwether (4h candles)."""
+    from .indicators import ema
+
+    c = candles["close"]
+    if len(c) < 43:
+        return ""
+    d1, d7 = c.iloc[-1] / c.iloc[-7] - 1, c.iloc[-1] / c.iloc[-43] - 1
+    above = c.iloc[-1] > ema(c, 200).iloc[-1]
+    return (f"• BTC：24 小時 {d1 * 100:+.1f}%，7 天 {d7 * 100:+.1f}%，"
+            f"在長期均線{'上方' if above else '下方'}")
+
+
 class ScanRunner:
     """Real-time market-wide scanning (paper or live) with one account."""
 
@@ -234,9 +247,12 @@ class ScanRunner:
         self.refresh_universe()
         symbols = list(dict.fromkeys(self.scanner.open_symbols() + self.universe))
         self.scanner.begin_candle()
+        self.scanner.market_note = ""
         for sym in symbols:
             try:
                 candles = fetch_recent(self.exchange, sym, self.timeframe, self.cfg["history_bars"])
+                if sym.startswith("BTC/"):
+                    self.scanner.market_note = btc_note(candles)
                 if len(candles) > 1:
                     self.scanner.trader(sym).on_candle(candles, now=now)
             except Exception as exc:  # one bad market must not stop the scan

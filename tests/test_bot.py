@@ -635,3 +635,27 @@ def test_daily_report_content_and_schedule(cfg, tmp_path, monkeypatch):
     assert not rep.due(pd.Timestamp("2024-03-01T05:00Z"))   # already sent today
     assert rep.due(pd.Timestamp("2024-03-02T01:00Z"))       # next day
     assert not DailyReporter({"notify": {"daily_report": ""}}).due(pd.Timestamp("2024-03-02T01:00Z"))
+
+
+def test_entry_message_explains_market(cfg):
+    from cryptobot.broker import PaperWallet
+    from cryptobot.runner import btc_note
+    from cryptobot.scanner import Scanner
+    from cryptobot.strategy import BreakoutStrategy
+    st = BreakoutStrategy(cfg["strategy"])
+    cols = st.columns(st.analyze(synthetic(bars=1500, timeframe="4h", seed=3)))
+    d = next(st.decide_at(cols, i) for i in range(300, 1500) if st.decide_at(cols, i).action == ENTER)
+    assert "行情" in d.reason and "成交量" in d.reason and "近 30 天" in d.reason and "波動" in d.reason
+
+    _scan_cfg(cfg)
+    sent = []
+    w = PaperWallet(300)
+    sc = Scanner(cfg, lambda s: PaperBroker(300, 0, 0, 0, 5, wallet=w), notify=sent.append, wallet=w)
+    sc.begin_candle()
+    sc.market_note = btc_note(synthetic(bars=300, timeframe="4h", seed=1))
+    for sym in ("AAA/USDT:USDT", "BBB/USDT:USDT"):
+        t = sc.trader(sym)
+        t.entry_gate(t, _enter(SHORT, 105.0), {"close": np.array([100.0]), "vol_ratio": np.array([2.0])}, 0)
+    sc.finish_candle(pd.Timestamp("2024-03-01T04:00Z"))
+    opened = [m for m in sent if "開倉" in m]
+    assert opened and "2 個幣跌破、0 個突破 → 市場偏弱" in opened[0] and "BTC：24 小時" in opened[0]

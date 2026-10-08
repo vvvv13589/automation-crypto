@@ -292,7 +292,7 @@ class BreakoutStrategy:
     of 45 parameter combinations on BTC/ETH/SOL. Modest returns, ~20% drawdowns.
     """
 
-    COLUMNS = ("close", "atr", "dc_hi", "dc_lo", "vol_ratio")
+    COLUMNS = ("close", "atr", "dc_hi", "dc_lo", "vol_ratio", "ema_long", "ret_30d", "atr_ratio")
     htf_timeframe = None
 
     def __init__(self, params: dict):
@@ -319,7 +319,45 @@ class BreakoutStrategy:
         # breakout candle volume vs the average of the previous `bo_volume_lookback` candles
         lb = self.p.get("bo_volume_lookback", 180)
         out["vol_ratio"] = out["volume"] / out["volume"].rolling(lb, min_periods=lb // 2).mean().shift(1)
+        # context for the entry explanation only (not used for the decision)
+        out["ema_long"] = ind.ema(out["close"], self.p.get("ema_trend", 200))
+        out["ret_30d"] = out["close"] / out["close"].shift(lb) - 1
+        atr_pct = out["atr"] / out["close"]
+        out["atr_ratio"] = atr_pct / atr_pct.rolling(lb, min_periods=lb // 2).median()
         return out
+
+    def describe(self, cols: dict, i: int, side: str) -> str:
+        """Plain-language market context for the Telegram entry message (facts, not forecasts)."""
+        def num(key):
+            v = cols[key][i]
+            return v if v == v else None  # NaN -> None
+
+        long = side == LONG
+        close = num("close")
+        level = num("dc_hi" if long else "dc_lo")
+        days = round(self.p.get("bo_n", 40) * 4 / 24)
+        lines = []
+        if level:
+            gap = abs(close / level - 1) * 100
+            lines.append(f"• {'突破' if long else '跌破'}近 {days} 天{'最高' if long else '最低'}點 {level:.6g}"
+                         f"（收盤{'高' if long else '低'} {gap:.2f}%）")
+        vr = num("vol_ratio")
+        if vr is not None:
+            tag = "放量" if vr >= 2 else ("量縮" if vr < 1 else "正常")
+            lines.append(f"• 成交量是平常的 {vr:.1f} 倍（{tag}）")
+        r30, ema = num("ret_30d"), num("ema_long")
+        if r30 is not None and ema:
+            above = close > ema
+            with_trend = above == long
+            lines.append(f"• 近 30 天 {r30 * 100:+.1f}%，價格在長期均線{'上方' if above else '下方'} → "
+                         + ("順著原本的趨勢" if with_trend else "逆著長期趨勢（反轉型，風險較高）"))
+        ar = num("atr_ratio")
+        if ar is not None:
+            if abs(ar - 1) < 0.1:
+                lines.append("• 波動跟平常差不多")
+            else:
+                lines.append(f"• 波動比平常{'高' if ar >= 1 else '低'} {abs(ar - 1) * 100:.0f}%")
+        return "\n".join(lines)
 
     def decide(self, analyzed: pd.DataFrame, position=None) -> Decision:
         return self.decide_at(self.columns(analyzed), len(analyzed) - 1, position)
@@ -337,10 +375,10 @@ class BreakoutStrategy:
         if min_vr and not cols["vol_ratio"][i] >= min_vr:  # also rejects NaN
             return Decision(HOLD, TREND, "no volume confirmation")
         if close > cols["dc_hi"][i] and self.p.get("allow_long", True):
-            return Decision(ENTER, TREND, f"breakout above {self.p.get('bo_n', 40)}-bar high",
+            return Decision(ENTER, TREND, "📝 行情：\n" + self.describe(cols, i, LONG),
                             side=LONG, stop_price=close - dist)
         if close < cols["dc_lo"][i] and self.p.get("allow_short", True):
-            return Decision(ENTER, TREND, f"breakdown below {self.p.get('bo_n', 40)}-bar low",
+            return Decision(ENTER, TREND, "📝 行情：\n" + self.describe(cols, i, SHORT),
                             side=SHORT, stop_price=close + dist)
         return Decision(HOLD, TREND, "inside channel")
 

@@ -324,7 +324,7 @@ class Trader:
         self._sync_exchange_stop()
         msg = (f"🟢 開倉 {side.upper()} {amount:.4f} {self.symbol} @ {price:.2f}\n"
                f"停損 {stop:.2f}" + (f" 停利 {take_profit:.2f}" if take_profit else "") +
-               f"\n[{regime}] {reason}")
+               f"\n{reason}")
         log.info(msg.replace("\n", " | "))
         self.notify(msg)
         self._save_state()
