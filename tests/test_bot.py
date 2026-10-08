@@ -724,3 +724,28 @@ def test_report_splits_bot_and_manual_pnl(cfg, tmp_path):
     assert "機器人：+3.00 U（已實現 +3.00、未實現 +0.00）" in text
     assert "手動／其他：+85.00 U" in text
     assert "手動持倉" in text and "ETH 多 @ 2500  +12.50 U" in text
+
+
+def test_live_fill_reads_fee_from_trades():
+    from cryptobot.broker import FuturesLiveBroker
+
+    class Ex:
+        def market(self, s):
+            return {"settle": "USDT"}
+
+        def fetch_order(self, oid, s):
+            return {"id": oid, "filled": 2.0, "average": 100.0, "fee": None}
+
+        def fetch_order_trades(self, oid, s):
+            return [{"fee": {"cost": 0.06, "currency": "USDT"}, "cost": 120.0},
+                    {"fee": {"cost": 0.0001, "currency": "BNB"}, "cost": 80.0}]
+
+    b = FuturesLiveBroker(Ex(), "SOL/USDT:USDT", 5)
+    fill = b._fill("short", {"id": "1", "filled": 2.0, "average": 100.0}, 100.0)
+    assert fill.fee == pytest.approx(0.06 + 80.0 * 0.0005)
+
+    class NoTrades(Ex):
+        def fetch_order_trades(self, oid, s):
+            raise Exception("not supported")
+    fill = FuturesLiveBroker(NoTrades(), "SOL/USDT:USDT", 5)._fill("long", {"id": "1", "filled": 2.0, "average": 100.0}, 100.0)
+    assert fill.fee == pytest.approx(200.0 * 0.0005)

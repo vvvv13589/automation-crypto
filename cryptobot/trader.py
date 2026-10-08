@@ -132,7 +132,8 @@ class Trader:
         self.trades_today = int(data.get("trades_today", 0))
         if data.get("broker") and hasattr(self.broker, "load"):
             self.broker.load(data["broker"])
-        log.info("restored state: position=%s pending=%s", self.position, self.pending)
+        if self.position or self.pending:
+            log.info("%s restored: position=%s pending=%s", self.symbol, self.position, self.pending)
 
     def _save_state(self) -> None:
         if not self.state_path:

@@ -287,13 +287,35 @@ class FuturesLiveBroker:
             return float(fee["cost"])
         return sum(float(f.get("cost") or 0) for f in order.get("fees") or [])
 
+    TAKER_FEE_ESTIMATE = 0.0005
+
+    def _order_fee(self, order: dict, filled: float, avg: float) -> float:
+        """Binance futures order responses carry no commission: read it from the fills."""
+        fee = self._fee(order, avg)
+        if fee > 0 or not order.get("id") or filled <= 0:
+            return fee
+        try:
+            trades = self.ex.fetch_order_trades(order["id"], self.symbol)
+            total = 0.0
+            for t in trades:
+                f = t.get("fee") or {}
+                cost = float(f.get("cost") or 0)
+                if f.get("currency") not in (None, self._quote()):  # e.g. paid in BNB
+                    cost = float(t.get("cost") or 0) * self.TAKER_FEE_ESTIMATE
+                total += cost
+            if total > 0:
+                return total
+        except Exception as exc:
+            log.debug("fetch_order_trades failed: %s", exc)
+        return filled * avg * self.TAKER_FEE_ESTIMATE  # best estimate
+
     def _fill(self, side: str, order: dict, price: float) -> Fill:
         if not order.get("filled") or order.get("average") is None:
             order = self._refresh(order)
         filled = float(order.get("filled") or 0.0)
         avg = float(order.get("average") or order.get("price") or price)
         self._bal_cache = None
-        return Fill(side, filled, avg, self._fee(order, avg))
+        return Fill(side, filled, avg, self._order_fee(order, filled, avg))
 
     # -- market orders ---------------------------------------------------------
     def market_open(self, side: str, amount: float, price: float) -> Fill | None:

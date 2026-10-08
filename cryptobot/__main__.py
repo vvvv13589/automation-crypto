@@ -146,8 +146,13 @@ def cmd_run(cfg: dict, args, live: bool) -> int:
             return 2
         if cfg.get("market") == "future":
             f = cfg["futures"]
-            print(f"LIVE futures: {cfg['symbol']} {f['leverage']}x {f['margin_mode']}, "
-                  f"risk {cfg['risk']['risk_per_trade']*100:.1f}%/trade")
+            if cfg.get("scanner", {}).get("enabled"):
+                sc = cfg["scanner"]
+                print(f"LIVE futures: market scan, {f['leverage']}x {f['margin_mode']}, "
+                      f"max {sc['max_positions']} positions, risk {sc['risk_per_trade']*100:.2f}%/position")
+            else:
+                print(f"LIVE futures: {cfg['symbol']} {f['leverage']}x {f['margin_mode']}, "
+                      f"risk {cfg['risk']['risk_per_trade']*100:.1f}%/trade")
         cfg["mode"] = "live"
     if cfg.get("scanner", {}).get("enabled"):
         from .runner import ScanRunner
