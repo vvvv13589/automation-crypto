@@ -41,6 +41,8 @@ daytrade:                # 當沖：不留倉過夜(breakout 波段策略請保�
 
 notify:
   telegram: true         # 需在 .env 設定 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID
+  daily_report: "09:00"  # 每天這個時間傳 Telegram 狀態報告(沒收到 = 機器人可能停了)；"" = 關閉
+  timezone: Asia/Taipei
 
 scanner:                 # 全市場掃描(paper / live)；指令加 --symbol XXX 則只交易單一幣
   enabled: true

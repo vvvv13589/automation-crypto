@@ -37,7 +37,11 @@ DEFAULTS: dict = {
         "no_entry_minutes_before_end": 60,
         "max_trades_per_day": 6,
     },
-    "notify": {"telegram": True},
+    "notify": {
+        "telegram": True,
+        "daily_report": "09:00",  # daily Telegram status (local time); "" = off
+        "timezone": "Asia/Taipei",
+    },
     "scanner": {
         "enabled": True,  # scan the whole market (paper/live); --symbol trades one coin instead
         "coins": "tested",  # tested = only the 55 backtested crypto coins | "all" | ["BTC", "ETH", ...]

@@ -604,3 +604,34 @@ def test_live_scan_runner_skips_coins_with_manual_positions(cfg, tmp_path, monke
     monkeypatch.setattr(runner, "make_exchange", lambda *a, **k: Hedged(data, 500))
     with pytest.raises(SystemExit):
         runner.ScanRunner(cfg, live=True)
+
+
+def test_daily_report_content_and_schedule(cfg, tmp_path, monkeypatch):
+    from cryptobot import runner
+    from cryptobot.report import DailyReporter
+    data = {f"C{i}/USDT:USDT": synthetic(bars=600, timeframe="4h", seed=40 + i) for i in range(2)}
+    fake = FakeMarketExchange(data, 500)
+    monkeypatch.setattr(runner, "make_exchange", lambda *a, **k: fake)
+    cfg.update(state_dir=str(tmp_path / "state"), log_dir=str(tmp_path / "logs"))
+    _scan_cfg(cfg)
+    cfg["goals"]["base_capital"] = 300
+    sent = []
+    r = runner.ScanRunner(cfg, live=False)
+    r.notify = sent.append
+    sc = r.scanner
+    assert sc.trader("C0/USDT:USDT").try_enter(_enter(SHORT, 105.0), 100.0, pd.Timestamp("2024-03-01T04:00Z"))
+    fake.fetch_tickers = lambda symbols=None: {"C0/USDT:USDT": {"last": 95.0}}
+    text = r.send_report(pd.Timestamp("2024-03-01T01:00Z"))
+    pos = sc.traders["C0/USDT:USDT"].position
+    gain = (pos.entry_price - 95.0) * pos.amount
+    assert sent and "本金 300" in text and "C0 空 @ 99.97 → 95" in text and f"{gain:+.2f} U" in text
+    assert "停損 104.97" in text
+    assert f"餘額 {sc.account_equity():.2f}" in text and sc.account_equity() > 300  # unrealised gain included
+    assert "機器人運作中" in text
+
+    rep = DailyReporter({"notify": {"daily_report": "09:00", "timezone": "Asia/Taipei"}})
+    assert not rep.due(pd.Timestamp("2024-03-01T00:30Z"))   # 08:30 Taipei
+    assert rep.due(pd.Timestamp("2024-03-01T01:05Z"))       # 09:05 Taipei
+    assert not rep.due(pd.Timestamp("2024-03-01T05:00Z"))   # already sent today
+    assert rep.due(pd.Timestamp("2024-03-02T01:00Z"))       # next day
+    assert not DailyReporter({"notify": {"daily_report": ""}}).due(pd.Timestamp("2024-03-02T01:00Z"))

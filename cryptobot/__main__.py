@@ -209,6 +209,9 @@ def main(argv=None) -> int:
     sub.add_parser("paper", help="real-time simulated trading with live market data")
     sub.add_parser("notify-test", help="send a Telegram test message")
     sub.add_parser("check", help="read-only pre-flight checks of the live account (places no orders)")
+    st = sub.add_parser("status", help="print the status report (balance, positions, last 24h)")
+    st.add_argument("--live", action="store_true", help="live account (default: paper)")
+    st.add_argument("--send", action="store_true", help="also send it to Telegram")
     rr = sub.add_parser("reset-risk", help="after a withdrawal: restart drawdown tracking from the current balance")
     rr.add_argument("--live", action="store_true", help="reset the live scanner (default: paper)")
     live = sub.add_parser("live", help="REAL trading with real funds")
@@ -245,6 +248,37 @@ def main(argv=None) -> int:
         return cmd_optimize(cfg, args)
     if args.command == "scan-backtest":
         return cmd_scan_backtest(cfg, args)
+    if args.command == "status":
+        import os
+
+        from .broker import FuturesLiveBroker, PaperBroker, PaperWallet
+        from .data import make_exchange
+        from .notify import make_notifier
+        from .report import build_report
+        from .scanner import Scanner
+        mode = "live" if args.live else "paper"
+        if args.live:
+            ex = make_exchange(cfg, os.getenv("EXCHANGE_API_KEY"), os.getenv("EXCHANGE_API_SECRET"),
+                               os.getenv("EXCHANGE_API_PASSWORD"))
+            f = cfg["futures"]
+            sc = Scanner(cfg, lambda s: FuturesLiveBroker(ex, s, int(f["leverage"]), f["margin_mode"]),
+                         state_dir=cfg["state_dir"], log_dir=cfg["log_dir"], mode=mode)
+            if not sc.traders:  # no open positions: still report the account balance
+                sc.trader(cfg["symbol"])
+        else:
+            ex = make_exchange(cfg)
+            p = cfg["paper"]
+            w = PaperWallet(p["starting_cash"])
+            sc = Scanner(cfg, lambda s: PaperBroker(p["starting_cash"], p["maker_fee"], p["taker_fee"], p["slippage"],
+                                                    float(cfg["futures"]["leverage"]), wallet=w),
+                         state_dir=cfg["state_dir"], log_dir=cfg["log_dir"], mode=mode, wallet=w)
+        text = build_report(sc, ex, cfg, mode).replace("📊 每日報告", "📊 狀態")
+        print(text)
+        if args.send:
+            n = make_notifier(cfg, mode, label="[掃描]")
+            if n:
+                n(text)
+        return 0
     if args.command == "reset-risk":
         import json
         from pathlib import Path

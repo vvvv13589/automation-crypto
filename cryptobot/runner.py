@@ -160,6 +160,9 @@ class ScanRunner:
         self._last_bar = None
         self._stop = False
         self.external: set[str] = set()  # coins with positions the bot did not open
+        self.mode = mode
+        from .report import DailyReporter
+        self.reporter = DailyReporter(cfg)
         if live:
             self._prepare_live_account()
 
@@ -253,6 +256,16 @@ class ScanRunner:
         if bar != self._last_bar:
             self.scan(now)
             self._last_bar = bar
+        if self.reporter.due(now):
+            self.send_report(now)
+
+    def send_report(self, now) -> str:
+        from .report import build_report
+
+        text = build_report(self.scanner, self.exchange, self.cfg, self.mode, now)
+        log.info(text.replace("\n", " | "))
+        self._say(text)
+        return text
 
     def run(self) -> None:
         signal.signal(signal.SIGINT, self.stop)
