@@ -48,15 +48,35 @@ class LimitStatus:
     done: bool  # no longer working on the exchange (filled, cancelled or expired)
 
 
+class PaperWallet:
+    """Cash shared by every PaperBroker of one simulated account (multi-coin scanning)."""
+
+    def __init__(self, cash: float):
+        self.cash = float(cash)
+        self.members: list["PaperBroker"] = []
+
+    def equity(self) -> float:
+        return self.cash + sum(b.unrealized(b.mark) for b in self.members)
+
+    def used_margin(self) -> float:
+        return sum(b.pos_amount * b.pos_entry / b.leverage for b in self.members if b.pos_side)
+
+
 class PaperBroker:
-    """Simulated margin account (leverage=1 + long-only behaves like spot)."""
+    """Simulated margin account (leverage=1 + long-only behaves like spot).
+
+    One broker trades one symbol. Pass a shared ``wallet`` to let several
+    brokers (symbols) draw on the same cash, like one real futures account.
+    """
 
     supports_limit = True
     live = False
 
     def __init__(self, starting_cash: float, maker_fee: float = 0.0002, taker_fee: float = 0.0005,
-                 slippage: float = 0.0003, leverage: float = 1.0):
-        self.wallet = float(starting_cash)
+                 slippage: float = 0.0003, leverage: float = 1.0, wallet: PaperWallet | None = None):
+        self.shared = wallet is not None
+        self.account = wallet or PaperWallet(starting_cash)
+        self.account.members.append(self)
         self.maker_fee = maker_fee
         self.taker_fee = taker_fee
         self.slippage = slippage
@@ -64,19 +84,33 @@ class PaperBroker:
         self.pos_side: str | None = None
         self.pos_amount = 0.0
         self.pos_entry = 0.0
+        self.mark = 0.0  # last price seen for this symbol
         self._orders: dict[str, dict] = {}
         self._ids = itertools.count(1)
 
+    @property
+    def wallet(self) -> float:
+        return self.account.cash
+
+    @wallet.setter
+    def wallet(self, value: float) -> None:
+        self.account.cash = value
+
     # -- persistence (paper accounts survive restarts) --------------------
     def to_dict(self) -> dict:
-        return {"wallet": self.wallet, "pos_side": self.pos_side,
-                "pos_amount": self.pos_amount, "pos_entry": self.pos_entry}
+        data = {"pos_side": self.pos_side, "pos_amount": self.pos_amount,
+                "pos_entry": self.pos_entry, "mark": self.mark}
+        if not self.shared:  # a shared wallet is saved once, by its owner
+            data["wallet"] = self.wallet
+        return data
 
     def load(self, data: dict) -> None:
-        self.wallet = data.get("wallet", self.wallet)
+        if not self.shared and "wallet" in data:
+            self.wallet = data["wallet"]
         self.pos_side = data.get("pos_side")
         self.pos_amount = data.get("pos_amount", 0.0)
         self.pos_entry = data.get("pos_entry", 0.0)
+        self.mark = data.get("mark", self.pos_entry)
 
     # -- account ------------------------------------------------------------
     def unrealized(self, price: float) -> float:
@@ -85,11 +119,12 @@ class PaperBroker:
         return _sign(self.pos_side) * (price - self.pos_entry) * self.pos_amount
 
     def equity(self, price: float) -> float:
-        return self.wallet + self.unrealized(price)
+        self.mark = price
+        return self.account.equity()
 
     def free_margin(self, price: float) -> float:
-        used = self.pos_amount * self.pos_entry / self.leverage if self.pos_side else 0.0
-        return max(0.0, self.equity(price) - used)
+        self.mark = price
+        return max(0.0, self.account.equity() - self.account.used_margin())
 
     def charge(self, amount: float) -> None:
         """Funding payments and other cash adjustments."""
@@ -167,6 +202,22 @@ class FuturesLiveBroker:
         self.leverage = leverage
         self.margin_mode = margin_mode
         self._bal_cache: tuple[float, dict] | None = None
+        self._ready = False
+
+    def _ensure_setup(self) -> None:
+        if not self._ready:
+            self.setup()
+            self._ready = True
+
+    def _meets_minimum(self, amount: float, price: float) -> bool:
+        limits = self.ex.market(self.symbol).get("limits") or {}
+        min_amount = (limits.get("amount") or {}).get("min") or 0
+        min_cost = (limits.get("cost") or {}).get("min") or 0
+        if amount < min_amount or amount * price < min_cost:
+            log.warning("%s order too small for the exchange (amount %s, value %.2f, min value %s) - skipped",
+                        self.symbol, amount, amount * price, min_cost)
+            return False
+        return True
 
     def setup(self) -> None:
         """One-way mode, margin mode and leverage. 'Already set' errors are fine."""
@@ -247,8 +298,9 @@ class FuturesLiveBroker:
     # -- market orders ---------------------------------------------------------
     def market_open(self, side: str, amount: float, price: float) -> Fill | None:
         amount = self._amount(amount)
-        if amount <= 0:
+        if amount <= 0 or not self._meets_minimum(amount, price):
             return None
+        self._ensure_setup()
         order = self.ex.create_order(self.symbol, "market", self._order_side(side, True), amount)
         return self._fill(side, order, price)
 
@@ -265,8 +317,9 @@ class FuturesLiveBroker:
     def place_limit(self, side: str, amount: float, price: float) -> str | None:
         amount = self._amount(amount)
         price = float(self.ex.price_to_precision(self.symbol, price))
-        if amount <= 0:
+        if amount <= 0 or not self._meets_minimum(amount, price):
             return None
+        self._ensure_setup()
         order = self.ex.create_order(self.symbol, "limit", self._order_side(side, True), amount,
                                      price, {"postOnly": True})
         return order["id"]

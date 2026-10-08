@@ -1,12 +1,13 @@
 # 複製成 config.yaml 後修改：cp config.example.yaml config.yaml
-# 預設：Binance ETH 永續合約、5 倍逐倉、多空雙向、4 小時突破波段(不當沖)、每筆風險 2%
-# 依據：2024-01～2026-10 真實資料研究，當沖策略扣除手續費後全部虧損，4h 突破在 ETH/BTC/SOL 上都穩定為正
+# 預設：掃描 Binance 成交量前 50 大 USDT 永續合約、4 小時突破波段、5 倍逐倉、多空雙向
+#       同時最多 4 個持倉、每個持倉風險 0.75%
+# 依據：2024-01～2026-10 真實資料，55 種幣組合回測 +95%(每年皆正)，最大回撤 -16.5%
 
 market: future           # future = USDT 永續合約(可做空、槓桿) | spot = 現貨(只做多)
 exchange:
   id: binance
   demo: false            # true = Binance 模擬交易(Demo Trading)帳戶，需另外申請 demo API key
-symbol: ETH/USDT:USDT    # 永續合約寫法；現貨請改成 ETH/USDT
+symbol: ETH/USDT:USDT    # 單一幣模式(--symbol 或 scanner.enabled: false)用；現貨請改成 ETH/USDT
 timeframe: 4h            # 訊號 K 線週期(breakout 用 4h；當沖策略才用 5m/15m)
 history_bars: 500        # 計算指標所需的 K 線數量
 poll_seconds: 5          # 每幾秒檢查一次即時價格(停損/停利/限價單成交)
@@ -41,6 +42,17 @@ daytrade:                # 當沖：不留倉過夜(breakout 波段策略請保�
 notify:
   telegram: true         # 需在 .env 設定 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID
 
+scanner:                 # 全市場掃描(paper / live)；指令加 --symbol XXX 則只交易單一幣
+  enabled: true
+  top_n: 50              # 每天挑 24h 成交量前 50 大的 USDT 永續合約(自動排除穩定幣)
+  min_quote_volume: 20000000   # 24h 成交量低於 2000 萬 USDT 的不碰(太冷門)
+  refresh_hours: 24      # 幾小時重新挑一次名單
+  max_positions: 4       # 同時最多幾個持倉(每種幣最多 1 個)
+  risk_per_trade: 0.0075 # 每個持倉停損最多虧總資金 0.75%(4 倉同時虧 = 3%)
+  settle_seconds: 20     # K 線收盤後等幾秒再抓資料
+  exclude: []            # 永遠不交易的幣，例如 ["PEPE", "SHIB"]
+# 同時有多個幣訊號時，優先進場「突破時成交量放大最多」的幣
+
 strategy:
   name: breakout         # breakout = 4h 突破波段(預設) | pullback = 大週期順勢+回檔 | adaptive = 盤勢切換
   allow_long: true
@@ -48,6 +60,8 @@ strategy:
 
   # --- breakout 策略 ---
   bo_n: 40               # 收盤突破前 40 根 K 線最高點 => 做多；跌破最低點 => 做空
+  bo_min_volume_ratio: 0 # >0 時，突破 K 線成交量需達平均的 N 倍才進場(0 = 不限制，只用來排序)
+  bo_volume_lookback: 180  # 成交量平均用前幾根 K 線(180 根 4h = 30 天)
   # 停損 = stop_atr_mult x ATR，之後以 trail_atr_mult x ATR 移動停損，不設停利，讓趨勢跑
 
   # --- pullback 策略 ---
@@ -83,7 +97,7 @@ strategy:
   range_trend_filter: true       # 盤整單只順著 EMA200 方向做(不逆勢接刀)
 
 risk:
-  risk_per_trade: 0.02   # 每筆停損最多虧總資金 2%(槓桿只影響保證金，不影響這個風險)
+  risk_per_trade: 0.015  # 單一幣模式：每筆停損最多虧總資金 1.5%(掃描模式改用 scanner.risk_per_trade)
   max_exposure: 5.0      # 部位名目價值最多 = 5 倍總資金
   max_drawdown: 0.20     # 從高點回撤 20% => 停止開新倉(刪除 state 檔才恢復)
   daily_loss_limit: 0.06 # 當日虧損 6% => 當天停止開新倉

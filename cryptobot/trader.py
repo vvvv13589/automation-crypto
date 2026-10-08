@@ -70,6 +70,7 @@ class Trade:
     fees: float
     funding: float
     reason: str
+    r_multiple: float = 0.0  # pnl in units of the initial risk (1R = entry-to-stop loss)
 
 
 def _from_dict(cls, data: dict):
@@ -79,7 +80,8 @@ def _from_dict(cls, data: dict):
 
 class Trader:
     def __init__(self, cfg: dict, broker, state_path: str | None = None,
-                 journal_path: str | None = None, notify: Callable[[str], None] | None = None):
+                 journal_path: str | None = None, notify: Callable[[str], None] | None = None,
+                 risk: RiskManager | None = None):
         self.cfg = cfg
         self.symbol = cfg["symbol"]
         self.futures = cfg.get("market", "spot") == "future"
@@ -88,7 +90,12 @@ class Trader:
         if not self.futures:
             params["allow_short"] = False
         self.strategy = make_strategy(params)
-        self.risk = RiskManager(cfg["risk"])
+        # A scanner passes one RiskManager shared by every symbol (account-level breakers).
+        self.shared_risk = risk is not None
+        self.risk = risk or RiskManager(cfg["risk"])
+        # Optional hook: entry_gate(trader, decision, cols, i) -> bool. A scanner uses it
+        # to collect same-candle signals across symbols and rank them before entering.
+        self.entry_gate: Callable | None = None
         self.broker = broker
         self.notify = notify or (lambda text: None)
         self.position: Optional[Position] = None
@@ -117,7 +124,8 @@ class Trader:
             self.position = _from_dict(Position, pos)
         if data.get("pending"):
             self.pending = _from_dict(PendingEntry, data["pending"])
-        self.risk.load(data.get("risk", {}))
+        if not self.shared_risk:
+            self.risk.load(data.get("risk", {}))
         self.last_atr = data.get("last_atr")
         self.cooldown = int(data.get("cooldown", 0))
         self.session_key = data.get("session_key")
@@ -134,6 +142,7 @@ class Trader:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(
                 {
+                    "symbol": self.symbol,
                     "position": asdict(self.position) if self.position else None,
                     "pending": asdict(self.pending) if self.pending else None,
                     "risk": self.risk.to_dict(),
@@ -424,17 +433,28 @@ class Trader:
         elif self.cooldown > 0:
             self.cooldown -= 1
         elif decision.action == ENTER:
-            ok, why = self.risk.can_open()
-            if ok:
-                ok, why = self._entry_window(now)
-            if not ok:
-                log.info("entry skipped: %s", why)
-            elif self._open(price, decision, now):
-                self.trades_today += 1
-                action = "enter"
+            if self.entry_gate is None or self.entry_gate(self, decision, cols, i):
+                if self.try_enter(decision, price, now):
+                    action = "enter"
 
         self._save_state()
         return action
+
+    def try_enter(self, decision, price: float, now) -> bool:
+        """Open a position for an ENTER decision if the account-level rules allow it."""
+        if self.position is not None or self.pending is not None:
+            return False
+        ok, why = self.risk.can_open()
+        if ok:
+            ok, why = self._entry_window(now)
+        if not ok:
+            log.info("%s entry skipped: %s", self.symbol, why)
+            return False
+        if self._open(price, decision, now):
+            self.trades_today += 1
+            self._save_state()
+            return True
+        return False
 
     def _move_stop(self, pos: Position) -> None:
         """Ratchet the stop (never loosen it): break-even at N x R, ATR trail without a target."""
@@ -484,6 +504,7 @@ class Trader:
             entry_price=pos.entry_price, exit_price=exit_price, amount=amount, pnl=pnl,
             pnl_pct=pnl / notional * 100 if notional else 0.0, fees=fees,
             funding=pos.funding * frac, reason=reason,
+            r_multiple=pnl / (pos.risk_dist * amount) if pos.risk_dist > 0 else 0.0,
         )
         self.trades.append(trade)
         self._journal(trade)

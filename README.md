@@ -1,26 +1,40 @@
-# automation-crypto — 自適應合約交易機器人
+# automation-crypto — 全市場掃描合約交易機器人
 
-預設設定：**Binance ETH/USDT 永續合約・5 倍逐倉・多空雙向・4 小時突破波段・每筆風險 2%・交易所端停損・Telegram 通知**
+預設：**每 4 小時掃描 Binance 成交量前 50 大 USDT 永續合約，找出正在突破的幣，順勢做多或做空**
+5 倍逐倉・同時最多 4 個持倉・每個持倉風險 0.75%・交易所端停損・Telegram 通知
 
 > ⚠️ **風險警告**：槓桿交易可能在短時間內虧光保證金。任何策略都可能虧損，回測績效不代表未來。
-> 只投入「全部虧光也能接受」的金額，並先用回測與模擬交易驗證。本專案不構成投資建議。
+> 只投入「全部虧光也能接受」的金額，並先用模擬交易驗證。本專案不構成投資建議。
 
 ## 研究結論(Binance 合約 2024-01～2026-10 真實資料，已計入手續費、滑價、資金費率)
 
-| 策略 | 結果 |
+| 做法 | 結果 |
 |---|---|
-| 15m / 5m 當沖(adaptive、pullback、突破、美股開盤區間突破) | **全部虧損**。扣成本前約打平，手續費吃掉約 80% 本金 |
-| 美股開盤區間突破 | ETH 單一參數 +117%，但換參數或換 BTC/SOL 就虧 → 運氣，不是優勢 |
-| **4h Donchian 突破波段(預設)** | **ETH/BTC/SOL 各 45 組參數，98%/100%/91% 獲利**；回撤約 -17%～-24% |
+| 15m / 5m 當沖(4 種策略) | **全部虧損**，手續費吃掉約 80% 本金 |
+| 預測漲跌方向(價格安靜、最近漲跌、追強勢幣) | **跟丟硬幣一樣**，沒有預測力 |
+| 成交量暴增 | 之後 7 天大動(±15%)的機率從 27% 升到 45%，**但方向仍是一半一半** |
+| 4h 突破，單一幣 | 12 種幣中 9 種賺錢；ETH +52%、BTC +14%、LTC -30% |
+| **4h 突破，掃描 55 種幣(預設)** | **+95%，2024 +31% / 2025 +20% / 2026 +24%，最大回撤 -16.5%** |
 
-用預設參數(40 根突破、3 ATR 停損、4 ATR 移動停損)：ETH +52%、SOL +10%、BTC +3%(2.7 年)。
-報酬溫和、會連虧好幾筆再靠少數大趨勢賺回來(勝率約 35%)；強烈單邊牛市會明顯落後買入持有。
+另外發現：**突破時成交量越大，那筆交易平均賺越多**，所以多個幣同時出現訊號時，機器人優先進場成交量放大最多的。
 
-## 預設策略 `breakout`：4 小時突破波段
+> 注意：測試的 55 種幣是「現在還存在的主流幣」，已下市的幣不在裡面，實際表現可能比回測差一些。
+
+## 策略 `breakout`：4 小時突破波段
 
 - 收盤**突破前 40 根 4h K 線最高點 → 做多**；**跌破最低點 → 做空**
 - 初始停損 3 倍 ATR；之後停損跟著最有利價格移動(4 倍 ATR)，**不設停利**，讓趨勢自己跑
-- 持倉時間通常數天到數週；每月約 3 筆交易，手續費很低
+- 勝率約 35%：常連續小賠幾筆，再靠少數大行情賺回來；持倉通常數天到數週
+
+## 全市場掃描怎麼運作
+
+1. 每天挑一次名單：24h 成交量前 50 大的 USDT 永續合約(排除穩定幣、成交量 < 2000 萬 USDT 的冷門幣)
+2. 每根 4h K 線收盤(台灣時間 00/04/08/12/16/20 點)掃描名單上所有幣
+3. 有突破訊號的幣依「成交量放大倍數」排序，空位有幾個就進場幾個(最多 4 倉、每種幣 1 倉)
+4. 持倉期間每 5 秒檢查價格；交易所端也掛著停損單，伺服器斷線也有保護
+5. 整個帳戶共用熔斷：從高點回撤 20% 停止開新倉；當日虧 6% 當天停止開新倉
+
+**資金建議**：每倉風險 0.75%，300 USDT 時每倉約 2.25 USDT 風險。部分幣(如 BTC 最低下單 100 USDT)可能因金額太小被跳過，**建議 500 USDT 以上**。
 
 ## 其他策略(研究對照用，`--strategy pullback|adaptive`)
 
@@ -65,9 +79,12 @@ cp .env.example .env        # 填入 Telegram / API key
 ## 使用流程
 
 ```bash
-# 1. 回測(預設 1000 天；--source vision 用 Binance 公開歷史資料庫，API 被封鎖的地區也能用)
-python -m cryptobot backtest --trades
-python -m cryptobot --symbol BTC/USDT:USDT backtest --source vision
+# 1. 全市場掃描回測(55 種幣、1000 天，資料來自 Binance 公開歷史資料庫)
+python -m cryptobot scan-backtest
+python -m cryptobot scan-backtest --coins BTC,ETH,SOL,DOGE --trades
+
+#    單一幣回測
+python -m cryptobot --symbol ETH/USDT:USDT backtest --source vision
 
 # 2. 參數最佳化：前 70% 資料找參數、後 30% 驗證，兩段都賺錢才會推薦
 python -m cryptobot optimize
@@ -79,7 +96,8 @@ python -m cryptobot --strategy pullback --daytrade --timeframe 15m backtest
 python -m cryptobot notify-test
 
 # 4. 模擬交易：真實即時行情，假的錢(會發 Telegram 通知，標示 [模擬])
-python -m cryptobot paper
+python -m cryptobot paper                           # 全市場掃描
+python -m cryptobot --symbol ETH/USDT:USDT paper    # 只交易一種幣
 
 # 5. 小額實盤(真實資金！)
 python -m cryptobot live --confirm-live
@@ -106,6 +124,7 @@ source .venv/bin/activate && python -m cryptobot paper
 ```
 cryptobot/
   strategy.py    breakout(4h 突破，預設)、pullback(大週期順勢+回檔)、adaptive(盤勢切換)
+  scanner.py     全市場掃描：挑幣、訊號排序、持倉上限、共用帳戶與熔斷、組合回測
   trader.py      交易核心(回測/模擬/實盤共用)：限價進場、停損、移動停損、當沖時段、資金費率
   broker.py      PaperBroker(模擬保證金帳戶) / FuturesLiveBroker(Binance 合約) / SpotLiveBroker
   risk.py        部位大小、每日虧損 / 最大回撤熔斷

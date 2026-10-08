@@ -37,7 +37,17 @@ DEFAULTS: dict = {
         "no_entry_minutes_before_end": 60,
         "max_trades_per_day": 6,
     },
-    "notify": {"telegram": True},  # needs TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in .env
+    "notify": {"telegram": True},
+    "scanner": {
+        "enabled": True,  # scan the whole market (paper/live); --symbol trades one coin instead
+        "top_n": 50,  # universe = top N USDT perpetuals by 24h quote volume
+        "min_quote_volume": 20_000_000,  # skip thin markets (24h volume in USDT)
+        "refresh_hours": 24,  # re-pick the universe this often
+        "max_positions": 4,  # open positions at the same time, one per coin
+        "risk_per_trade": 0.0075,  # per position; 4 x 0.75%: worst 2024-26 drop 16.5% (< 20% breaker)
+        "settle_seconds": 20,  # wait after a candle closes before fetching it
+        "exclude": [],  # base assets to never trade, e.g. ["PEPE"]
+    },  # needs TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in .env
     "strategy": {
         "name": "breakout",  # breakout (4h Donchian) | pullback | adaptive
         "allow_long": True,
@@ -62,6 +72,8 @@ DEFAULTS: dict = {
         "range_trend_filter": True,
         # --- breakout strategy ---
         "bo_n": 40,
+        "bo_min_volume_ratio": 0,  # >0: require breakout volume >= N x average (0 = rank only)
+        "bo_volume_lookback": 180,
         # --- pullback strategy ---
         "htf_timeframe": "4h",
         "htf_ema_fast": 20,
@@ -75,7 +87,7 @@ DEFAULTS: dict = {
         "breakeven_r": 1.0,
     },
     "risk": {
-        "risk_per_trade": 0.02,
+        "risk_per_trade": 0.015,
         "max_exposure": 5.0,  # max position notional as a multiple of equity
         "max_drawdown": 0.20,
         "daily_loss_limit": 0.06,

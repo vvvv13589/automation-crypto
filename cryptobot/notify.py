@@ -29,7 +29,7 @@ class Telegram:
     __call__ = send
 
 
-def make_notifier(cfg: dict, mode: str):
+def make_notifier(cfg: dict, mode: str, label: str | None = None):
     if not cfg.get("notify", {}).get("telegram"):
         return None
     token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
@@ -37,4 +37,4 @@ def make_notifier(cfg: dict, mode: str):
         log.warning("telegram enabled but TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set")
         return None
     tag = "" if mode == "live" else "[模擬] "
-    return Telegram(token, chat, prefix=f"{tag}{cfg['symbol']} ")
+    return Telegram(token, chat, prefix=f"{tag}{label or cfg['symbol']} ")

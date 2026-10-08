@@ -292,7 +292,7 @@ class BreakoutStrategy:
     of 45 parameter combinations on BTC/ETH/SOL. Modest returns, ~20% drawdowns.
     """
 
-    COLUMNS = ("close", "atr", "dc_hi", "dc_lo")
+    COLUMNS = ("close", "atr", "dc_hi", "dc_lo", "vol_ratio")
     htf_timeframe = None
 
     def __init__(self, params: dict):
@@ -300,7 +300,8 @@ class BreakoutStrategy:
 
     @property
     def warmup(self) -> int:
-        return self.p.get("bo_n", 40) + self.p["atr_period"] + 5
+        vol_lb = self.p.get("bo_volume_lookback", 180) if self.p.get("bo_min_volume_ratio", 0) else 0
+        return max(self.p.get("bo_n", 40) + self.p["atr_period"], vol_lb) + 5
 
     def history_warmup(self, base_step: pd.Timedelta) -> int:
         return self.warmup
@@ -315,6 +316,9 @@ class BreakoutStrategy:
         out["atr"] = ind.atr(out, self.p["atr_period"])
         out["dc_hi"] = out["high"].rolling(n).max().shift(1)  # channel of the *previous* n candles
         out["dc_lo"] = out["low"].rolling(n).min().shift(1)
+        # breakout candle volume vs the average of the previous `bo_volume_lookback` candles
+        lb = self.p.get("bo_volume_lookback", 180)
+        out["vol_ratio"] = out["volume"] / out["volume"].rolling(lb, min_periods=lb // 2).mean().shift(1)
         return out
 
     def decide(self, analyzed: pd.DataFrame, position=None) -> Decision:
@@ -329,6 +333,9 @@ class BreakoutStrategy:
         if not atr == atr or atr <= 0:
             return Decision(HOLD, NEUTRAL, "no ATR")
         dist = self.p["stop_atr_mult"] * atr
+        min_vr = self.p.get("bo_min_volume_ratio", 0) or 0
+        if min_vr and not cols["vol_ratio"][i] >= min_vr:  # also rejects NaN
+            return Decision(HOLD, TREND, "no volume confirmation")
         if close > cols["dc_hi"][i] and self.p.get("allow_long", True):
             return Decision(ENTER, TREND, f"breakout above {self.p.get('bo_n', 40)}-bar high",
                             side=LONG, stop_price=close - dist)

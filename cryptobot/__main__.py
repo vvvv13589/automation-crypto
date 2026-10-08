@@ -2,7 +2,9 @@
 
     python -m cryptobot backtest --synthetic
     python -m cryptobot backtest --days 90
-    python -m cryptobot paper
+    python -m cryptobot scan-backtest --source vision
+    python -m cryptobot paper                  # scans the whole market (scanner.enabled)
+    python -m cryptobot --symbol ETH/USDT:USDT paper   # one coin only
     python -m cryptobot live --confirm-live
 """
 
@@ -81,6 +83,36 @@ def cmd_optimize(cfg: dict, args) -> int:
     return 0
 
 
+def cmd_scan_backtest(cfg: dict, args) -> int:
+    import copy
+
+    from . import data
+    from .scanner import DEFAULT_UNIVERSE, run_scan_backtest
+
+    coins = [c.strip().upper() for c in args.coins.split(",")] if args.coins else DEFAULT_UNIVERSE
+    candles = {}
+    for i, coin in enumerate(coins):
+        sym = f"{coin}/USDT:USDT"
+        if args.synthetic:
+            candles[sym] = data.synthetic(bars=args.bars, timeframe=cfg["timeframe"], seed=args.seed + i)
+            continue
+        c = copy.deepcopy(cfg)
+        c["symbol"] = sym
+        try:
+            candles[sym] = _load_candles(c, args, cfg["timeframe"])
+        except Exception as exc:  # delisted / renamed / no data
+            print(f"skip {coin}: {str(exc)[:80]}")
+    print(f"scanning {len(candles)} coins, max {cfg['scanner']['max_positions']} positions, "
+          f"{cfg['scanner']['risk_per_trade']*100:.2f}% risk each ...")
+    res = run_scan_backtest(cfg, candles)
+    print(json.dumps(res["summary"], indent=2, ensure_ascii=False))
+    if args.trades:
+        for t in res["trades"]:
+            print(f"{t.opened_at[:16]} -> {t.closed_at[:16]} {t.side:5} {t.entry_price:>12.6g} -> "
+                  f"{t.exit_price:<12.6g} R={t.r_multiple:+.2f} pnl={t.pnl:+.2f} {t.reason}")
+    return 0
+
+
 def cmd_backtest(cfg: dict, args) -> int:
     from . import data
     from .backtest import run_backtest
@@ -117,7 +149,11 @@ def cmd_run(cfg: dict, args, live: bool) -> int:
             print(f"LIVE futures: {cfg['symbol']} {f['leverage']}x {f['margin_mode']}, "
                   f"risk {cfg['risk']['risk_per_trade']*100:.1f}%/trade")
         cfg["mode"] = "live"
-    Runner(cfg, live=live).run()
+    if cfg.get("scanner", {}).get("enabled"):
+        from .runner import ScanRunner
+        ScanRunner(cfg, live=live).run()
+    else:
+        Runner(cfg, live=live).run()
     return 0
 
 
@@ -159,6 +195,17 @@ def main(argv=None) -> int:
     op.add_argument("--bars", type=int, default=4000)
     op.add_argument("--seed", type=int, default=42)
 
+    sb = sub.add_parser("scan-backtest", help="portfolio backtest that scans many coins with one account")
+    sb.add_argument("--coins", help="comma separated base assets, e.g. BTC,ETH,SOL (default: 55 liquid coins)")
+    sb.add_argument("--days", type=int, default=None, help="history length (default 1000)")
+    sb.add_argument("--refresh", action="store_true", help="re-download instead of using data/ cache")
+    sb.add_argument("--source", choices=["api", "vision"], default="vision",
+                    help="vision = Binance public archive (default), api = exchange API")
+    sb.add_argument("--synthetic", action="store_true", help="offline synthetic data (for testing)")
+    sb.add_argument("--bars", type=int, default=3000)
+    sb.add_argument("--seed", type=int, default=42)
+    sb.add_argument("--trades", action="store_true", help="print every trade")
+
     sub.add_parser("paper", help="real-time simulated trading with live market data")
     sub.add_parser("notify-test", help="send a Telegram test message")
     live = sub.add_parser("live", help="REAL trading with real funds")
@@ -170,6 +217,7 @@ def main(argv=None) -> int:
     cfg = load_config(args.config)
     if args.symbol:
         cfg["symbol"] = args.symbol
+        cfg["scanner"]["enabled"] = False  # an explicit coin means single-coin mode
     if args.timeframe:
         cfg["timeframe"] = args.timeframe
     if args.daytrade:
@@ -186,12 +234,14 @@ def main(argv=None) -> int:
     if getattr(args, "days", 0) is None:
         args.days = 120 if cfg["daytrade"].get("enabled") else 1000
 
-    if args.command in ("backtest", "optimize") and not args.verbose:
+    if args.command in ("backtest", "optimize", "scan-backtest") and not args.verbose:
         logging.getLogger("cryptobot").setLevel(logging.WARNING)  # hide per-trade log lines
     if args.command == "backtest":
         return cmd_backtest(cfg, args)
     if args.command == "optimize":
         return cmd_optimize(cfg, args)
+    if args.command == "scan-backtest":
+        return cmd_scan_backtest(cfg, args)
     if args.command == "notify-test":
         from .notify import make_notifier
         n = make_notifier(cfg, "live")

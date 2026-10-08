@@ -33,9 +33,10 @@ class Runner:
             if futures:
                 f = cfg["futures"]
                 broker = FuturesLiveBroker(self.exchange, self.symbol, int(f["leverage"]), f["margin_mode"])
+                broker._ensure_setup()
             else:
                 broker = SpotLiveBroker(self.exchange, self.symbol)
-            broker.setup()
+                broker.setup()
         else:
             self.exchange = make_exchange(cfg)  # public market data only
             broker = make_paper_broker(cfg)
@@ -120,3 +121,135 @@ class Runner:
                     break
                 time.sleep(1)
         self._say("⏹ 機器人已停止" + ("（仍有持倉，交易所停損單有效）" if self.trader.position else ""))
+
+
+class ScanRunner:
+    """Real-time market-wide scanning (paper or live) with one account."""
+
+    def __init__(self, cfg: dict, live: bool = False):
+        from .broker import PaperBroker, PaperWallet
+        from .scanner import Scanner
+
+        self.cfg = cfg
+        self.live = live
+        self.timeframe = cfg["timeframe"]
+        self.sc = cfg["scanner"]
+        mode = "live" if live else "paper"
+        if live:
+            key, secret = os.getenv("EXCHANGE_API_KEY"), os.getenv("EXCHANGE_API_SECRET")
+            if not key or not secret:
+                raise SystemExit("live mode needs EXCHANGE_API_KEY / EXCHANGE_API_SECRET (see .env.example)")
+            if cfg.get("market") != "future":
+                raise SystemExit("market scanning trades USDT perpetuals: set market: future")
+            self.exchange = make_exchange(cfg, key, secret, os.getenv("EXCHANGE_API_PASSWORD"))
+            f = cfg["futures"]
+            factory = lambda sym: FuturesLiveBroker(self.exchange, sym, int(f["leverage"]), f["margin_mode"])  # noqa: E731
+            wallet = None
+        else:
+            self.exchange = make_exchange(cfg)
+            p = cfg["paper"]
+            wallet = PaperWallet(p["starting_cash"])
+            lev = float(cfg["futures"]["leverage"])
+            factory = lambda sym: PaperBroker(p["starting_cash"], p["maker_fee"], p["taker_fee"],  # noqa: E731
+                                              p["slippage"], lev, wallet=wallet)
+        self.notify = make_notifier(cfg, mode, label="[掃描]")
+        self.scanner = Scanner(cfg, factory, state_dir=cfg["state_dir"], log_dir=cfg["log_dir"],
+                               notify=self.notify, mode=mode, wallet=wallet)
+        self.universe: list[str] = []
+        self._universe_at = 0.0
+        self._last_bar = None
+        self._stop = False
+
+    def stop(self, *_):
+        log.info("stopping after current iteration...")
+        self._stop = True
+
+    def _say(self, text: str) -> None:
+        if self.notify:
+            self.notify(text)
+
+    def refresh_universe(self) -> None:
+        from .scanner import pick_universe, summarize_universe
+
+        if self.universe and time.time() - self._universe_at < self.sc["refresh_hours"] * 3600:
+            return
+        self.universe = pick_universe(self.exchange, self.cfg)
+        self._universe_at = time.time()
+        log.info("universe: %d coins: %s", len(self.universe), summarize_universe(self.universe))
+
+    def protect(self, now) -> None:
+        """Between candles: stops, targets, limit fills and exchange-side closes."""
+        open_syms = self.scanner.open_symbols()
+        if not open_syms:
+            return
+        tickers = self.exchange.fetch_tickers(open_syms)
+        for sym in open_syms:
+            tk = tickers.get(sym) or {}
+            price = tk.get("last") or tk.get("close")
+            if not price:
+                continue
+            t = self.scanner.trader(sym)
+            if not self.live:
+                t.broker.mark = float(price)  # keep paper account equity current
+            t.reconcile(float(price), now)
+            t.check_pending(float(price), float(price), now)
+            t.check_exits(float(price), float(price), now=now)
+            t.session_check(float(price), now)
+
+    def scan(self, now) -> list[str]:
+        """A candle just closed: evaluate every coin, then enter the strongest signals."""
+        self.refresh_universe()
+        symbols = list(dict.fromkeys(self.scanner.open_symbols() + self.universe))
+        self.scanner.begin_candle()
+        for sym in symbols:
+            try:
+                candles = fetch_recent(self.exchange, sym, self.timeframe, self.cfg["history_bars"])
+                if len(candles) > 1:
+                    self.scanner.trader(sym).on_candle(candles, now=now)
+            except Exception as exc:  # one bad market must not stop the scan
+                log.warning("%s skipped: %s", sym, str(exc)[:120])
+        entered = self.scanner.finish_candle(now)
+        open_syms = self.scanner.open_symbols()
+        log.info("scan done: %d coins, entered %s, open %d/%d %s", len(symbols), entered or "-",
+                 len(open_syms), self.scanner.max_positions, open_syms)
+        return entered
+
+    def step(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.protect(now)
+        import pandas as pd
+
+        bar = (pd.Timestamp(now) - pd.Timedelta(seconds=self.sc["settle_seconds"])).floor(self.timeframe.replace("m", "min"))
+        if bar != self._last_bar:
+            self.scan(now)
+            self._last_bar = bar
+
+    def run(self) -> None:
+        signal.signal(signal.SIGINT, self.stop)
+        signal.signal(signal.SIGTERM, self.stop)
+        f = self.cfg["futures"]
+        desc = (f"{'實盤' if self.live else '模擬'} 全市場掃描 前{self.sc['top_n']}大 {self.timeframe} "
+                f"{f['leverage']}x {f['margin_mode']} 最多{self.sc['max_positions']}倉 每倉風險{self.sc['risk_per_trade']*100:.2f}%")
+        log.info("starting %s", desc)
+        self._say(f"▶️ 機器人啟動: {desc}")
+        errors = 0
+        while not self._stop:
+            try:
+                self.step()
+                errors = 0
+            except Exception as exc:
+                errors += 1
+                log.exception("iteration failed (%d in a row): %s", errors, exc)
+                if errors in (3, 10):
+                    self._say(f"⚠️ 連續 {errors} 次錯誤: {str(exc)[:200]}")
+                if errors >= 20:
+                    self._say("🛑 錯誤太多，機器人已停止。交易所停損單仍有效，請檢查伺服器。")
+                    break
+                time.sleep(min(60, 2 ** errors))
+                continue
+            for _ in range(int(self.cfg["poll_seconds"])):
+                if self._stop:
+                    break
+                time.sleep(1)
+        n = self.scanner.open_count()
+        self._say("⏹ 機器人已停止" + (f"（仍有 {n} 個持倉，交易所停損單有效）" if n else ""))

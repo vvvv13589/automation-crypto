@@ -326,3 +326,119 @@ def test_optimizer_only_recommends_robust_results():
     assert not robust(res(-6.7, 13.0))  # lucky out-of-sample only (seen on real ETH data)
     assert not robust(res(5, -1))
     assert not robust(res(5, 3, n_in=4))  # too few trades to trust
+
+
+# ------------------------------------------------------------------ scanner
+def test_shared_paper_wallet_sums_all_positions():
+    from cryptobot.broker import PaperWallet
+    w = PaperWallet(1000)
+    a = PaperBroker(0, maker_fee=0, taker_fee=0, slippage=0, leverage=5, wallet=w)
+    b = PaperBroker(0, maker_fee=0, taker_fee=0, slippage=0, leverage=5, wallet=w)
+    a.market_open(LONG, 10, 100)   # +1/unit
+    b.market_open(SHORT, 5, 50)    # +1/unit when price falls
+    b.mark = 40
+    assert a.equity(110) == pytest.approx(1000 + 100 + 50)
+    assert a.free_margin(110) == pytest.approx(1150 - (10 * 100 + 5 * 50) / 5)
+    assert "wallet" not in a.to_dict()  # shared cash is saved by the scanner, not per coin
+
+
+def _scan_cfg(cfg, **scanner):
+    cfg["scanner"].update(scanner)
+    cfg["risk"].update(max_drawdown=1.0, daily_loss_limit=1.0)
+    return cfg
+
+
+def test_scan_backtest_respects_slots_and_one_position_per_coin(cfg):
+    from cryptobot.scanner import run_scan_backtest
+    _scan_cfg(cfg, max_positions=2)
+    data = {f"C{i}/USDT:USDT": synthetic(bars=1500, timeframe="4h", seed=10 + i) for i in range(5)}
+    res = run_scan_backtest(cfg, data)
+    s = res["summary"]
+    assert s["trades"] > 0 and s["max_open_positions"] <= 2
+    # never two open positions on the same coin, never more than 2 overall
+    events = []
+    for t in res["trades"]:
+        events += [(pd.Timestamp(t.opened_at), 1), (pd.Timestamp(t.closed_at), -1)]
+    open_now = 0
+    for _, d in sorted(events, key=lambda e: (e[0], e[1])):
+        open_now += d
+        assert open_now <= 2
+
+
+def test_scanner_prefers_higher_volume_breakouts(cfg):
+    from cryptobot.broker import PaperWallet
+    from cryptobot.scanner import Scanner
+    _scan_cfg(cfg, max_positions=1)
+    wallet = PaperWallet(300)
+    sc = Scanner(cfg, lambda s: PaperBroker(300, 0, 0, 0, 5, wallet=wallet), wallet=wallet)
+    sc.begin_candle()
+    for sym, vr in (("AAA/USDT:USDT", 1.2), ("BBB/USDT:USDT", 4.0), ("CCC/USDT:USDT", 2.0)):
+        t = sc.trader(sym)
+        cols = {"close": np.array([100.0]), "vol_ratio": np.array([vr])}
+        assert t.entry_gate(t, _enter(LONG, 95.0), cols, 0) is False  # collected, not entered
+    entered = sc.finish_candle(pd.Timestamp("2024-03-01T04:00Z"))
+    assert entered == ["BBB/USDT:USDT"] and sc.open_count() == 1
+
+
+def test_scanner_restores_open_positions(cfg, tmp_path):
+    from cryptobot.broker import PaperWallet
+    from cryptobot.scanner import Scanner
+    _scan_cfg(cfg)
+    cfg.update(state_dir=str(tmp_path))
+    w1 = PaperWallet(300)
+    sc = Scanner(cfg, lambda s: PaperBroker(300, 0, 0, 0, 5, wallet=w1), state_dir=str(tmp_path), mode="paper", wallet=w1)
+    sc.trader("SOL/USDT:USDT").try_enter(_enter(SHORT, 105.0), 100.0, pd.Timestamp("2024-03-01T04:00Z"))
+    sc.save()
+    w2 = PaperWallet(300)
+    sc2 = Scanner(cfg, lambda s: PaperBroker(300, 0, 0, 0, 5, wallet=w2), state_dir=str(tmp_path), mode="paper", wallet=w2)
+    assert sc2.open_symbols() == ["SOL/USDT:USDT"]
+    assert sc2.traders["SOL/USDT:USDT"].position.side == SHORT
+    assert w2.cash == pytest.approx(w1.cash)
+
+
+class FakeMarketExchange:
+    """Several perpetuals replayed from synthetic candles."""
+
+    rateLimit = 0
+
+    def __init__(self, data, i):
+        self.data, self.i = data, i
+        self.markets = {s: {"swap": True, "linear": True, "settle": "USDT", "active": True, "base": s.split("/")[0]}
+                        for s in data}
+        self.markets["USDC/USDT:USDT"] = {"swap": True, "linear": True, "settle": "USDT", "active": True, "base": "USDC"}
+
+    def _df(self, s):
+        return self.data[s]
+
+    def milliseconds(self):
+        return int(next(iter(self.data.values())).index[self.i].timestamp() * 1000) + 1
+
+    def fetch_tickers(self, symbols=None):
+        out = {s: {"last": float(df["close"].iloc[self.i - 1]), "quoteVolume": 1e9 / (k + 1)}
+               for k, (s, df) in enumerate(self.data.items())}
+        out["USDC/USDT:USDT"] = {"last": 1.0, "quoteVolume": 9e12}
+        return {s: v for s, v in out.items() if symbols is None or s in symbols}
+
+    def fetch_ohlcv(self, symbol, timeframe, limit=100, since=None):
+        part = self._df(symbol).iloc[max(0, self.i - limit + 1): self.i + 1]
+        return [[int(ts.timestamp() * 1000), r.open, r.high, r.low, r.close, r.volume] for ts, r in part.iterrows()]
+
+
+def test_scan_runner_paper_end_to_end(cfg, tmp_path, monkeypatch):
+    from cryptobot import runner
+    data = {f"C{i}/USDT:USDT": synthetic(bars=900, timeframe="4h", seed=20 + i) for i in range(4)}
+    fake = FakeMarketExchange(data, 300)
+    monkeypatch.setattr(runner, "make_exchange", lambda *a, **k: fake)
+    cfg.update(state_dir=str(tmp_path / "state"), log_dir=str(tmp_path / "logs"))
+    _scan_cfg(cfg, max_positions=2, top_n=3)
+    r = runner.ScanRunner(cfg, live=False)
+    idx = next(iter(data.values())).index
+    for i in range(300, 900):
+        fake.i = i
+        now = idx[i] + pd.Timedelta(seconds=30)
+        r.protect(now)
+        r.scan(now)
+        assert r.scanner.open_count() <= 2
+    assert "USDC/USDT:USDT" not in r.universe and len(r.universe) == 3
+    trades = [t for tr in r.scanner.traders.values() for t in tr.trades]
+    assert trades and any((tmp_path / "logs").iterdir())
