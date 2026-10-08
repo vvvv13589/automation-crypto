@@ -13,7 +13,7 @@ DEFAULTS: dict = {
     "market": "future",  # future = USDT perpetual (long/short, leverage) | spot (long only)
     "exchange": {"id": "binance", "sandbox": False, "demo": False},
     "symbol": "ETH/USDT:USDT",  # perpetual; use "ETH/USDT" for spot
-    "timeframe": "15m",
+    "timeframe": "4h",
     "history_bars": 500,
     "poll_seconds": 5,
     "state_dir": "state",
@@ -25,13 +25,13 @@ DEFAULTS: dict = {
         "funding_rate": 0.0001,  # backtest/paper estimate per 8h, charged either side
     },
     "orders": {
-        "entry_type": "limit",  # limit (post-only, maker fee) | market
+        "entry_type": "market",  # market | limit (post-only, maker fee; breakouts often run away)
         "limit_offset_bps": 0,  # place limit this many 0.01% better than the signal close
         "limit_ttl_bars": 1,  # cancel an unfilled entry after this many candles
     },
     "paper": {"starting_cash": 300.0, "maker_fee": 0.0002, "taker_fee": 0.0005, "slippage": 0.0003},
     "daytrade": {
-        "enabled": True,
+        "enabled": False,
         "timezone": "Asia/Taipei",
         "session_end": "07:45",  # everything flat at this time; next trading day starts
         "no_entry_minutes_before_end": 60,
@@ -39,7 +39,7 @@ DEFAULTS: dict = {
     },
     "notify": {"telegram": True},  # needs TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in .env
     "strategy": {
-        "name": "pullback",  # pullback (HTF trend + pullback entry) | adaptive (regime switching)
+        "name": "breakout",  # breakout (4h Donchian) | pullback | adaptive
         "allow_long": True,
         "allow_short": True,
         "ema_fast": 12,
@@ -54,12 +54,14 @@ DEFAULTS: dict = {
         "adx_period": 14,
         "adx_trend": 25,
         "adx_range": 20,
-        "stop_atr_mult": 2.5,
-        "trail_atr_mult": 3.5,
+        "stop_atr_mult": 3.0,
+        "trail_atr_mult": 4.0,
         "adx_rising": True,
         "adx_rising_bars": 3,
         "trend_exit_on_di": False,
         "range_trend_filter": True,
+        # --- breakout strategy ---
+        "bo_n": 40,
         # --- pullback strategy ---
         "htf_timeframe": "4h",
         "htf_ema_fast": 20,
@@ -78,7 +80,7 @@ DEFAULTS: dict = {
         "max_drawdown": 0.20,
         "daily_loss_limit": 0.06,
         "min_notional": 20.0,
-        "cooldown_bars": 2,
+        "cooldown_bars": 0,
     },
 }
 

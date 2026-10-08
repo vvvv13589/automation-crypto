@@ -54,7 +54,8 @@ def _load_candles(cfg: dict, args, timeframe: str):
 def cmd_optimize(cfg: dict, args) -> int:
     from .optimize import best_yaml, format_report, optimize
 
-    tf_arg = args.timeframes or ("5m,15m" if cfg["daytrade"].get("enabled") else "1h,4h")
+    tf_arg = args.timeframes or ("5m,15m" if cfg["daytrade"].get("enabled")
+                                 else "4h" if cfg["strategy"].get("name") == "breakout" else "1h,4h")
     timeframes = [t.strip() for t in tf_arg.split(",") if t.strip()]
     candles = {tf: _load_candles(cfg, args, tf) for tf in timeframes}
     from .optimize import DEFAULT_GRID, GRIDS
@@ -129,11 +130,11 @@ def main(argv=None) -> int:
     parser.add_argument("--daytrade", action="store_true", help="force day-trade mode on")
     parser.add_argument("--no-daytrade", action="store_true", help="force day-trade mode off")
     parser.add_argument("--spot", action="store_true", help="spot long-only instead of futures")
-    parser.add_argument("--strategy", choices=["pullback", "adaptive"], help="override strategy.name")
+    parser.add_argument("--strategy", choices=["breakout", "pullback", "adaptive"], help="override strategy.name")
     sub = parser.add_subparsers(dest="command", required=True)
 
     bt = sub.add_parser("backtest", help="test the strategy on historical data")
-    bt.add_argument("--days", type=int, default=90, help="days of exchange history to download")
+    bt.add_argument("--days", type=int, default=None, help="history length (default 1000, day-trade 120)")
     bt.add_argument("--csv", help="use candles from CSV (timestamp,open,high,low,close,volume)")
     bt.add_argument("--refresh", action="store_true", help="re-download instead of using data/ cache")
     bt.add_argument("--source", choices=["api", "vision"], default="api",
@@ -183,7 +184,7 @@ def main(argv=None) -> int:
         if cfg["symbol"].endswith(":USDT"):
             cfg["symbol"] = cfg["symbol"].split(":")[0]
     if getattr(args, "days", 0) is None:
-        args.days = 120 if cfg["daytrade"].get("enabled") else 365
+        args.days = 120 if cfg["daytrade"].get("enabled") else 1000
 
     if args.command in ("backtest", "optimize") and not args.verbose:
         logging.getLogger("cryptobot").setLevel(logging.WARNING)  # hide per-trade log lines

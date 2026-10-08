@@ -1,12 +1,13 @@
 # 複製成 config.yaml 後修改：cp config.example.yaml config.yaml
-# 以下預設值 = 你選的設定：Binance ETH 永續合約、5 倍逐倉、多空當沖、每筆風險 2%
+# 預設：Binance ETH 永續合約、5 倍逐倉、多空雙向、4 小時突破波段(不當沖)、每筆風險 2%
+# 依據：2024-01～2026-10 真實資料研究，當沖策略扣除手續費後全部虧損，4h 突破在 ETH/BTC/SOL 上都穩定為正
 
 market: future           # future = USDT 永續合約(可做空、槓桿) | spot = 現貨(只做多)
 exchange:
   id: binance
   demo: false            # true = Binance 模擬交易(Demo Trading)帳戶，需另外申請 demo API key
 symbol: ETH/USDT:USDT    # 永續合約寫法；現貨請改成 ETH/USDT
-timeframe: 15m           # 訊號 K 線週期，當沖建議 5m 或 15m
+timeframe: 4h            # 訊號 K 線週期(breakout 用 4h；當沖策略才用 5m/15m)
 history_bars: 500        # 計算指標所需的 K 線數量
 poll_seconds: 5          # 每幾秒檢查一次即時價格(停損/停利/限價單成交)
 state_dir: state         # 持倉狀態(重啟後可接續)
@@ -19,7 +20,7 @@ futures:
   funding_rate: 0.0001   # 回測/模擬用的資金費率估計(每 8 小時)，保守地多空都扣
 
 orders:
-  entry_type: limit      # limit = 進場掛 post-only 限價單(maker 0.02%) | market = 市價進場(taker 0.05%)
+  entry_type: market     # market = 市價進場(突破常常一去不回，限價單容易錯過) | limit = post-only 限價單
   limit_offset_bps: 0    # 限價比訊號價再好幾個 0.01%(越大越省但越難成交)
   limit_ttl_bars: 1      # 限價單幾根 K 線沒成交就取消
 # 出場(停損/停利/平倉)一律用市價，確保一定出得去
@@ -30,8 +31,8 @@ paper:                   # 回測與模擬交易
   taker_fee: 0.0005      # Binance 合約 taker 0.05%
   slippage: 0.0003       # 市價單滑價 0.03%
 
-daytrade:                # 當沖：不留倉過夜
-  enabled: true
+daytrade:                # 當沖：不留倉過夜(breakout 波段策略請保持關閉)
+  enabled: false
   timezone: Asia/Taipei
   session_end: "07:45"   # 每天這個時間全部平倉，07:45 之後算新的一天
   no_entry_minutes_before_end: 60   # 收盤前 60 分鐘(06:45 後)不開新倉
@@ -41,9 +42,13 @@ notify:
   telegram: true         # 需在 .env 設定 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID
 
 strategy:
-  name: pullback         # pullback = 大週期順勢 + 回檔進場(預設) | adaptive = 舊的盤勢切換策略(對照組)
+  name: breakout         # breakout = 4h 突破波段(預設) | pullback = 大週期順勢+回檔 | adaptive = 盤勢切換
   allow_long: true
   allow_short: true
+
+  # --- breakout 策略 ---
+  bo_n: 40               # 收盤突破前 40 根 K 線最高點 => 做多；跌破最低點 => 做空
+  # 停損 = stop_atr_mult x ATR，之後以 trail_atr_mult x ATR 移動停損，不設停利，讓趨勢跑
 
   # --- pullback 策略 ---
   htf_timeframe: 4h      # 大週期：決定只做多或只做空
@@ -70,8 +75,8 @@ strategy:
   adx_period: 14
   adx_trend: 25          # ADX >= 此值 => 趨勢盤(順勢做多/做空)
   adx_range: 20          # ADX <= 此值 => 盤整盤(布林通道高空低多)
-  stop_atr_mult: 2.5     # 初始停損距離 = 2.5 x ATR
-  trail_atr_mult: 3.5    # 移動停損 = 最有利價格 -/+ 3.5 x ATR(沒有停利目標的單才用)
+  stop_atr_mult: 3.0     # 初始停損距離 = 3 x ATR
+  trail_atr_mult: 4.0    # 移動停損 = 最有利價格 -/+ 4 x ATR(沒有停利目標的單才用)
   adx_rising: true       # 趨勢進場需 ADX 正在上升
   adx_rising_bars: 3
   trend_exit_on_di: false        # true = 反向 DI 轉強就出場(較敏感)
@@ -83,4 +88,4 @@ risk:
   max_drawdown: 0.20     # 從高點回撤 20% => 停止開新倉(刪除 state 檔才恢復)
   daily_loss_limit: 0.06 # 當日虧損 6% => 當天停止開新倉
   min_notional: 20       # Binance ETH 合約最小下單金額約 20 USDT
-  cooldown_bars: 2       # 平倉後等幾根 K 線才再進場
+  cooldown_bars: 0       # 平倉後等幾根 K 線才再進場

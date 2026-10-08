@@ -129,6 +129,7 @@ def test_short_trailing_stop_moves_down(market_cfg):
 # ------------------------------------------------------------- limit entries
 def test_limit_entry_fills_only_when_touched(cfg):
     cfg["daytrade"]["enabled"] = False
+    cfg["orders"]["entry_type"] = "limit"
     t = _trader(cfg)
     assert t._open(100.0, _enter(LONG, 98.0), None)
     assert t.pending is not None and t.position is None
@@ -176,7 +177,7 @@ def test_state_persists(market_cfg, tmp_path):
 
 
 # ------------------------------------------------------------ strategy / e2e
-@pytest.mark.parametrize("name", ["pullback", "adaptive"])
+@pytest.mark.parametrize("name", ["breakout", "pullback", "adaptive"])
 def test_no_lookahead(cfg, name):
     """Decisions on bar i must not change when future bars are appended."""
     cfg["strategy"]["name"] = name
@@ -190,8 +191,11 @@ def test_no_lookahead(cfg, name):
 
 
 @pytest.mark.parametrize("name", ["pullback", "adaptive"])
-def test_backtest_trades_both_sides(cfg, name):
+def test_daytrade_backtest_trades_both_sides(cfg, name):
     cfg["strategy"]["name"] = name
+    cfg["timeframe"] = "15m"
+    cfg["daytrade"]["enabled"] = True
+    cfg["orders"]["entry_type"] = "limit"
     res = run_backtest(cfg, synthetic(bars=8000, timeframe="15m", seed=1))
     s = res.summary()
     sides = {t.side for t in res.trades}
@@ -201,6 +205,29 @@ def test_backtest_trades_both_sides(cfg, name):
     tr = Trader(cfg, make_paper_broker(cfg))
     for t in res.trades:
         assert tr._session_of(t.opened_at) == tr._session_of(pd.Timestamp(t.closed_at) - pd.Timedelta(seconds=1))
+
+
+def test_breakout_swing_trades_both_sides_and_trails(cfg):
+    assert cfg["strategy"]["name"] == "breakout" and not cfg["daytrade"]["enabled"]
+    res = run_backtest(cfg, synthetic(bars=3000, timeframe="4h", seed=1))
+    sides = {t.side for t in res.trades}
+    assert sides == {LONG, SHORT}
+    # no profit target: every exit is a stop (initial or trailed) or the end of the test
+    assert {t.reason for t in res.trades} <= {"stop loss", "trailing / break-even stop", "end of backtest"}
+    held = [pd.Timestamp(t.closed_at) - pd.Timestamp(t.opened_at) for t in res.trades]
+    assert max(held) > pd.Timedelta(days=1)  # swing trades are held overnight
+
+
+def test_breakout_signal_uses_previous_channel(cfg):
+    from cryptobot.strategy import BreakoutStrategy
+    cfg["strategy"]["bo_n"] = 5
+    idx = pd.date_range("2024-01-01", periods=40, freq="4h", tz="UTC")
+    close = np.r_[np.full(39, 100.0), 103.0]  # flat, then one breakout candle
+    df = pd.DataFrame({"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1.0}, index=idx)
+    st = BreakoutStrategy(cfg["strategy"])
+    d = st.decide(st.analyze(df))
+    assert d.action == ENTER and d.side == LONG and d.stop_price < 103
+    assert st.decide(st.analyze(df.iloc[:-1])).action != ENTER
 
 
 def test_htf_trend_uses_only_closed_htf_candles():

@@ -18,6 +18,11 @@ from .backtest import run_backtest
 from .strategy import make_strategy
 
 GRIDS: dict[str, dict[str, list]] = {
+    "breakout": {
+        "strategy.bo_n": [20, 30, 40, 55],
+        "strategy.stop_atr_mult": [2.0, 3.0, 4.0],
+        "strategy.trail_atr_mult": [3.0, 4.0, 6.0],
+    },
     "pullback": {
         "strategy.htf_timeframe": ["1h", "4h"],
         "strategy.pullback_rsi": [35, 40, 45],
@@ -103,7 +108,8 @@ def format_report(results: list[dict], top: int = 10) -> str:
         names = {"strategy.stop_atr_mult": "stop", "strategy.trail_atr_mult": "trail",
                  "strategy.adx_trend": "adx", "strategy.trend_exit_on_di": "di_exit",
                  "strategy.htf_timeframe": "htf", "strategy.pullback_rsi": "rsi",
-                 "strategy.take_profit_r": "tpR", "strategy.breakeven_r": "beR"}
+                 "strategy.take_profit_r": "tpR", "strategy.breakeven_r": "beR",
+                 "strategy.bo_n": "n"}
         return " ".join(f"{names.get(k, k.split('.')[-1])}={v}" for k, v in params.items())
 
     lines = [
