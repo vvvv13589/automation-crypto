@@ -40,6 +40,8 @@ DEFAULTS: dict = {
     "notify": {
         "telegram": True,
         "daily_report": "09:00",  # daily Telegram status (local time); "" = off
+        "scan_report": True,  # short Telegram update after every 4h scan
+        # Telegram "/status" always replies with the current positions
         "timezone": "Asia/Taipei",
     },
     "scanner": {

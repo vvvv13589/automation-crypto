@@ -36,10 +36,11 @@ def recent_trades(cfg: dict, mode: str, since: datetime) -> list[dict]:
     return out
 
 
-def build_report(scanner, exchange, cfg: dict, mode: str, now: datetime | None = None) -> str:
+def build_report(scanner, exchange, cfg: dict, mode: str, now: datetime | None = None,
+                 title: str = "📊 每日報告", compact: bool = False) -> str:
     now = now or datetime.now(timezone.utc)
     tz = cfg.get("notify", {}).get("timezone", "Asia/Taipei")
-    lines = [f"📊 每日報告 {_local(now, tz):%m/%d %H:%M}（{'實盤' if mode == 'live' else '模擬'}）"]
+    lines = [f"{title} {_local(now, tz):%m/%d %H:%M}（{'實盤' if mode == 'live' else '模擬'}）"]
 
     open_syms = scanner.open_symbols()
     prices = {}
@@ -105,6 +106,9 @@ def build_report(scanner, exchange, cfg: dict, mode: str, now: datetime | None =
             side = "多" if p.get("side") == "long" else "空"
             upnl = float(p.get("unrealizedPnl") or 0)
             lines.append(f"  • {p['symbol'].split('/')[0]} {side} @ {float(p.get('entryPrice') or 0):.6g}  {upnl:+.2f} U")
+
+    if compact:
+        return "\n".join(lines)
 
     trades = recent_trades(cfg, mode, now - timedelta(hours=24))
     if trades:

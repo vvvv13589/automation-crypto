@@ -271,6 +271,11 @@ class ScanRunner:
             except Exception as exc:  # one bad market must not stop the scan
                 log.warning("%s skipped: %s", sym, str(exc)[:120])
         entered = self.scanner.finish_candle(now)
+        if self.cfg.get("notify", {}).get("scan_report"):
+            from .report import build_report
+            head = f"🆕 開倉：{', '.join(s.split('/')[0] for s in entered)}" if entered else "這次沒有新訊號"
+            self._say(build_report(self.scanner, self.exchange, self.cfg, self.mode, now,
+                                   title=f"⏰ 掃描完成（{head}）", compact=True))
         open_syms = self.scanner.open_symbols()
         log.info("scan done: %d coins, entered %s, open %d/%d %s", len(symbols), entered or "-",
                  len(open_syms), self.scanner.max_positions, open_syms)
@@ -287,6 +292,22 @@ class ScanRunner:
             self._last_bar = bar
         if self.reporter.due(now):
             self.send_report(now)
+        self.answer_commands(now)
+
+    def answer_commands(self, now) -> None:
+        """Telegram commands from your own chat: /status (or 狀態) replies with the current report."""
+        poll = getattr(self.notify, "poll_commands", None)
+        if poll is None or time.time() - getattr(self, "_last_poll", 0) < 10:
+            return
+        self._last_poll = time.time()
+        for text in poll():
+            cmd = text.split()[0].split("@")[0].lower()
+            if cmd in ("/status", "status", "狀態", "/狀態"):
+                from .report import build_report
+                self._say(build_report(self.scanner, self.exchange, self.cfg, self.mode, now,
+                                       title="📊 即時狀態", compact=True))
+            elif cmd in ("/help", "/start"):
+                self._say("可用指令：/status 查看目前持倉與餘額")
 
     def send_report(self, now) -> str:
         from .report import build_report
