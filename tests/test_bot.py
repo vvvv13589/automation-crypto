@@ -901,3 +901,109 @@ def test_exchange_side_close_records_real_fill_and_symbol(market_cfg, tmp_path):
     assert rows[0]["side"] == "short" and rows[0]["symbol"] == ""
     assert rows[1]["symbol"] == "ETH/USDT:USDT" and float(rows[1]["exit_price"]) == pytest.approx(94.8)
 
+
+# ------------------------------------------------- trend filter / pyramiding / goals
+def test_coin_trend_filter_blocks_counter_trend_breakouts(cfg):
+    from cryptobot.strategy import HOLD, BreakoutStrategy
+    n = 80
+
+    def cols(close, ema):
+        c = {k: np.full(n, np.nan) for k in BreakoutStrategy.COLUMNS}
+        c.update(close=np.full(n, close), atr=np.full(n, 2.0), dc_hi=np.full(n, 105.0),
+                 dc_lo=np.full(n, 95.0), ema_long=np.full(n, ema))
+        return c
+
+    plain = BreakoutStrategy(dict(cfg["strategy"]))
+    coin = BreakoutStrategy(dict(cfg["strategy"], trend_filter="coin"))
+    assert plain.decide_at(cols(110, 120), n - 1).side == LONG
+    assert coin.decide_at(cols(110, 120), n - 1).action == HOLD     # breakout up, coin below its EMA
+    assert coin.decide_at(cols(110, 100), n - 1).side == LONG
+    assert coin.decide_at(cols(90, 80), n - 1).action == HOLD       # breakdown, coin above its EMA
+    assert coin.decide_at(cols(90, 100), n - 1).side == SHORT
+
+
+def test_pyramid_add_keeps_worst_case_at_initial_risk(market_cfg):
+    market_cfg["strategy"].update(pyramid_adds=1, pyramid_step_r=1.0)
+    market_cfg["paper"].update(maker_fee=0.0, taker_fee=0.0)
+    t = _trader(market_cfg)
+    now = pd.Timestamp("2024-03-01T04:00Z")
+    assert t.try_enter(_enter(LONG, 95.0), 100.0, now)
+    pos = t.position
+    first, r0 = pos.amount, pos.r0
+    assert r0 == pytest.approx(first * 5.0)
+    t.check_exits(104.0, 104.0, now=now)                 # +0.8R: not yet
+    assert pos.adds == 0
+    t.check_exits(105.5, 105.5, now=now)                 # +1.1R: add the same size again
+    assert pos.adds == 1 and pos.amount == pytest.approx(2 * first)
+    assert pos.entry_price == pytest.approx((100.0 + 105.5) / 2)
+    assert (pos.entry_price - pos.stop_price) * pos.amount == pytest.approx(r0)   # worst case unchanged
+    t.check_exits(120.0, 120.0, now=now)                 # max adds reached
+    assert pos.adds == 1 and pos.amount == pytest.approx(2 * first)
+    t.check_exits(pos.stop_price - 0.01, pos.stop_price - 0.01, now=now)
+    assert t.trades[-1].pnl == pytest.approx(-r0, rel=0.01)  # stopped out: lose ~1R, not 2R
+
+
+def test_no_pyramiding_in_defensive_mode(market_cfg):
+    market_cfg["strategy"].update(pyramid_adds=2)
+    t = _trader(market_cfg)
+    t.defensive = True
+    t.try_enter(_enter(LONG, 95.0), 100.0, pd.Timestamp("2024-03-01T04:00Z"))
+    t.check_exits(111.0, 111.0, now=pd.Timestamp("2024-03-01T05:00Z"))
+    assert t.position.adds == 0
+
+
+def test_leverage_is_lowered_until_the_stop_sits_inside_liquidation(market_cfg):
+    market_cfg["futures"]["leverage"] = 10
+    t = _trader(market_cfg)
+    assert t._position_leverage(100.0, 99.0) == 10            # 1% stop: full leverage
+    assert t._position_leverage(100.0, 85.0) == 6             # 15% stop + 1.5% buffer -> 6x
+    assert t.try_enter(_enter(LONG, 85.0), 100.0, pd.Timestamp("2024-03-01T04:00Z"))
+    assert t.broker.leverage == 6
+    t2 = _trader(market_cfg)
+    assert not t2.try_enter(_enter(LONG, 1.0), 100.0, pd.Timestamp("2024-03-01T04:00Z"))  # 99% stop
+
+
+def test_equity_floor_stops_new_positions_until_reset():
+    rm = RiskManager({"risk_per_trade": 0.03, "max_exposure": 10, "max_drawdown": 0.999,
+                      "daily_loss_limit": 0.999, "min_notional": 20, "min_equity": 100})
+    rm.update(150.0, pd.Timestamp("2024-03-01").to_pydatetime())
+    assert rm.can_open()[0]
+    rm.update(99.0, pd.Timestamp("2024-03-01").to_pydatetime())
+    ok, why = rm.can_open()
+    assert not ok and "floor" in why
+    rm2 = RiskManager(rm.p)
+    rm2.load(rm.to_dict())
+    assert rm2.floor_halt                                   # survives a restart
+    rm3 = RiskManager(rm.p)
+    rm3.load({})                                            # reset-risk clears it
+    assert rm3.can_open()[0]
+
+
+def test_target_locks_in_profit_then_trades_defensively(cfg, tmp_path):
+    from cryptobot.broker import PaperWallet
+    from cryptobot.scanner import Scanner
+    _scan_cfg(cfg)
+    cfg["goals"].update(base_capital=300, target=330, on_target="defensive", defensive_risk=0.005,
+                        double_alert=False)
+    sent = []
+    w = PaperWallet(300)
+    sc = Scanner(cfg, lambda s: PaperBroker(300, 0, 0, 0, 5, wallet=w), state_dir=str(tmp_path),
+                 notify=sent.append, mode="paper", wallet=w)
+    now = pd.Timestamp("2024-03-01T04:00Z")
+    assert sc.trader("AAA/USDT:USDT").try_enter(_enter(LONG, 95.0), 100.0, now)
+    w.cash += 100                                           # account jumps past the target
+    sc.begin_candle()
+    sc.finish_candle(now)
+    assert sc.target_reached and sc.defensive and sc.open_count() == 0
+    assert sc.risk.p["risk_per_trade"] == 0.005
+    assert any("達到目標" in m and "防守模式" in m for m in sent)
+    t = sc.trader("BBB/USDT:USDT")
+    assert t.defensive
+    sc.begin_candle()
+    t.entry_gate(t, _enter(LONG, 95.0), {"close": np.array([100.0]), "vol_ratio": np.array([2.0])}, 0)
+    assert sc.finish_candle(now) == ["BBB/USDT:USDT"]      # still trading, at the lower risk
+    w2 = PaperWallet(300)
+    sc2 = Scanner(cfg, lambda s: PaperBroker(300, 0, 0, 0, 5, wallet=w2), state_dir=str(tmp_path),
+                  mode="paper", wallet=w2)
+    assert sc2.defensive and sc2.risk.p["risk_per_trade"] == 0.005
+

@@ -74,6 +74,7 @@ class Scanner:
         self.goals = cfg.get("goals") or {}
         self.milestones_sent: set[str] = set()
         self.target_reached = False
+        self.defensive = False  # after the target with on_target: defensive
         self.traders: dict[str, Trader] = {}
         self._candidates: list[tuple[float, Trader, object, float]] = []
         self.market_note = ""  # extra context line for entry messages (set by the live runner)
@@ -94,6 +95,8 @@ class Scanner:
         self.risk.load(data.get("risk", {}))
         self.milestones_sent = set(data.get("milestones_sent", []))
         self.target_reached = bool(data.get("target_reached", False))
+        if data.get("defensive"):
+            self._set_defensive()
         if self.wallet is not None and "cash" in data:
             self.wallet.cash = data["cash"]
         # bring back every symbol that still has a position or a working order
@@ -113,7 +116,7 @@ class Scanner:
             return
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         data = {"risk": self.risk.to_dict(), "milestones_sent": sorted(self.milestones_sent),
-                "target_reached": self.target_reached}
+                "target_reached": self.target_reached, "defensive": self.defensive}
         if self.wallet is not None:
             data["cash"] = self.wallet.cash
         tmp = path + ".tmp"
@@ -130,6 +133,7 @@ class Scanner:
             t = Trader(symbol_config(self.cfg, symbol), self.broker_factory(symbol), state_path=state,
                        journal_path=journal, notify=self.notify, risk=self.risk)
             t.entry_gate = self._gate
+            t.defensive = self.defensive
             self.traders[symbol] = t
         return self.traders[symbol]
 
@@ -162,8 +166,25 @@ class Scanner:
         if self.notify:
             self.notify(text)
 
-    def check_goals(self, equity: float | None) -> None:
-        """Telegram milestones: doubled (take the stake out) and target reached (stop entering)."""
+    def _set_defensive(self) -> None:
+        """Lower risk per position and stop pyramiding (after the target)."""
+        self.defensive = True
+        self.risk.p["risk_per_trade"] = float(self.goals.get("defensive_risk", 0.0075))
+        for t in self.traders.values():
+            t.defensive = True
+
+    def _lock_in(self, now) -> None:
+        """Target reached in defensive mode: close everything, then continue at low risk."""
+        self._set_defensive()
+        for t in self.traders.values():
+            if t.pending is not None:
+                t._cancel_pending(now, "target reached")
+            if t.position is not None:  # live fills at market; paper uses the last price seen
+                t._close(getattr(t.broker, "mark", 0.0) or t.position.entry_price, now, "target reached: lock in")
+
+    def check_goals(self, equity: float | None, now=None) -> None:
+        """Telegram milestones: doubled (take the stake out) and target reached (stop entering,
+        or with on_target: defensive, close everything and continue at low risk)."""
         base, target = float(self.goals.get("base_capital") or 0), float(self.goals.get("target") or 0)
         if equity is None or base <= 0:
             return
@@ -175,8 +196,16 @@ class Scanner:
                          f"執行 python -m cryptobot --live reset-risk → 重新啟動")
         if target > 0 and equity >= target and not self.target_reached:
             self.target_reached = True
-            self._notify(f"🏁 達到目標 {target:.0f} U！目前 {equity:.0f} U\n"
-                         f"已停止開新倉，現有持倉會照停損自動出場。全部平倉後請提領並停止機器人。")
+            if self.goals.get("on_target", "stop") == "defensive":
+                self._lock_in(now)
+                risk = float(self.goals.get("defensive_risk", 0.0075)) * 100
+                self._notify(f"🏁 達到目標 {target:.0f} U！目前約 {equity:.0f} U\n"
+                             f"已全部平倉鎖住獲利，之後改用防守模式(每倉風險 {risk:.2f}%、不加碼)繼續跑。\n"
+                             f"建議現在提領本金：sudo systemctl stop cryptobot → 在 Binance 劃轉 → "
+                             f"python -m cryptobot --live reset-risk → sudo systemctl start cryptobot")
+            else:
+                self._notify(f"🏁 達到目標 {target:.0f} U！目前 {equity:.0f} U\n"
+                             f"已停止開新倉，現有持倉會照停損自動出場。全部平倉後請提領並停止機器人。")
 
     def _market_context(self) -> str:
         """Breadth of this scan plus an optional note (e.g. BTC) set by the live runner."""
@@ -191,8 +220,8 @@ class Scanner:
     def finish_candle(self, now) -> list[str]:
         """Enter the strongest collected signals while slots are free."""
         entered = []
-        self.check_goals(self.account_equity())
-        if self.target_reached and self.goals.get("stop_at_target", True):
+        self.check_goals(self.account_equity(), now)
+        if self.target_reached and self.goals.get("stop_at_target", True) and not self.defensive:
             self._candidates = []
             self.save()
             return entered
@@ -275,6 +304,8 @@ def run_scan_backtest(cfg: dict, data: dict[str, pd.DataFrame]) -> dict:
     summary = result.summary()
     summary.pop("buy_hold_return_pct", None)
     summary["max_drawdown_halt"] = scanner.risk.drawdown_halt
+    summary["floor_halt"] = scanner.risk.floor_halt
+    summary["target_reached"] = scanner.target_reached
     summary["symbols"] = len(data)
     summary["max_open_positions"] = max_open
     summary["years"] = {

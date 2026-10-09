@@ -23,6 +23,9 @@ DEFAULTS: dict = {
         "margin_mode": "isolated",
         "exchange_stop": True,  # protective stop order resting on the exchange
         "funding_rate": 0.0001,  # backtest/paper estimate per 8h, charged either side
+        # per-position leverage is lowered (from `leverage`) until the isolated liquidation
+        # price lies beyond the stop by this fraction of price (maintenance margin + buffer)
+        "liq_buffer": 0.015,
     },
     "orders": {
         "entry_type": "market",  # market | limit (post-only, maker fee; breakouts often run away)
@@ -60,6 +63,10 @@ DEFAULTS: dict = {
         "double_alert": True,  # Telegram when the account doubles: take the stake out
         "target": 0,  # stop opening new positions once the account reaches this (0 = off)
         "stop_at_target": True,
+        # what reaching the target does: "stop" = no new positions | "defensive" = close every
+        # position, then keep trading at `defensive_risk` per position without pyramiding
+        "on_target": "stop",
+        "defensive_risk": 0.0075,
     },
     "strategy": {
         "name": "breakout",  # breakout (4h Donchian) | pullback | adaptive
@@ -87,6 +94,9 @@ DEFAULTS: dict = {
         "bo_n": 40,
         "bo_min_volume_ratio": 0,  # >0: require breakout volume >= N x average (0 = rank only)
         "bo_volume_lookback": 180,
+        "trend_filter": "none",  # "coin" = long only above the coin's own EMA(ema_trend), short only below
+        "pyramid_adds": 0,  # add to a winner this many times (equal size, worst case stays the initial risk)
+        "pyramid_step_r": 1.0,  # ... every time it gains this many R beyond the previous entry
         # --- pullback strategy ---
         "htf_timeframe": "4h",
         "htf_ema_fast": 20,
@@ -104,6 +114,7 @@ DEFAULTS: dict = {
         "max_exposure": 5.0,  # max position notional as a multiple of equity
         "max_drawdown": 0.20,
         "daily_loss_limit": 0.06,
+        "min_equity": 0,  # account falls to this many USDT -> no new positions until reset-risk (0 = off)
         "min_notional": 20.0,
         "cooldown_bars": 0,
     },

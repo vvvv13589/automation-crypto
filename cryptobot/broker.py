@@ -131,6 +131,10 @@ class PaperBroker:
         """Funding payments and other cash adjustments."""
         self.wallet -= amount
 
+    def use_leverage(self, leverage: float) -> None:
+        """Leverage for the next position on this symbol (sets its margin)."""
+        self.leverage = leverage
+
     def _add(self, side: str, amount: float, price: float, fee_rate: float) -> Fill:
         fee = amount * price * fee_rate
         self.wallet -= fee
@@ -232,6 +236,15 @@ class FuturesLiveBroker:
                 log.info("%s set", name)
             except Exception as exc:  # e.g. "No need to change margin type"
                 log.info("%s unchanged: %s", name, str(exc)[:120])
+
+    def use_leverage(self, leverage: float) -> None:
+        """Leverage for the next position on this symbol (Binance sets it per symbol)."""
+        leverage = int(leverage)
+        self._ensure_setup()
+        if leverage != self.leverage:
+            self.ex.set_leverage(leverage, self.symbol)
+            log.info("%s leverage set to %dx", self.symbol, leverage)
+            self.leverage = leverage
 
     # -- account ------------------------------------------------------------
     def _balance(self) -> dict:

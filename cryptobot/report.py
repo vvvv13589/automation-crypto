@@ -84,8 +84,14 @@ def build_report(scanner, exchange, cfg: dict, mode: str, now: datetime | None =
         if base > 0:
             lines.append(f"  ✋ 手動／其他：{equity - base - bot_total:+.2f} U（手動交易、轉入轉出）")
         peak = scanner.risk.peak_equity
+        floor = float(cfg["risk"].get("min_equity") or 0)
         if peak:
-            lines.append(f"📉 距離最高點 {(equity / peak - 1) * 100:+.1f}%（停機線 -{cfg['risk']['max_drawdown'] * 100:.0f}%）")
+            halt = (f"停機線 -{cfg['risk']['max_drawdown'] * 100:.0f}%" if cfg["risk"]["max_drawdown"] < 0.99
+                    else f"底線 {floor:.0f} U" if floor else "不設停機")
+            lines.append(f"📉 距離最高點 {(equity / peak - 1) * 100:+.1f}%（{halt}）")
+        target = float((cfg.get("goals") or {}).get("target") or 0)
+        if target > 0 and not scanner.target_reached:
+            lines.append(f"🎯 目標 {target:,.0f} U，目前 {equity / target * 100:.1f}%")
 
     if bot_lines:
         lines.append(f"📌 機器人持倉 {len(open_syms)}/{scanner.max_positions}：")
@@ -118,8 +124,12 @@ def build_report(scanner, exchange, cfg: dict, mode: str, now: datetime | None =
     else:
         lines.append("🧾 機器人過去 24 小時沒有平倉")
 
-    if scanner.risk.drawdown_halt:
+    if scanner.risk.floor_halt:
+        lines.append("⛔ 帳戶跌破底線，已停止開新倉(檢討後執行 reset-risk 才會恢復)")
+    elif scanner.risk.drawdown_halt:
         lines.append("⛔ 已觸發最大回撤停機，不會開新倉")
+    elif scanner.defensive:
+        lines.append("🛡 已達目標，防守模式運作中(低風險、不加碼)")
     elif scanner.target_reached:
         lines.append("🏁 已達目標，不再開新倉")
     lines.append("✅ 機器人運作中")

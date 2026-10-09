@@ -43,6 +43,9 @@ class Position:
     stop_order_id: Optional[str] = None
     risk_dist: float = 0.0  # initial entry-to-stop distance (1R)
     exchange_stop: Optional[float] = None  # stop price actually working on the exchange
+    r0: float = 0.0  # initial risk in quote currency (first entry amount x risk_dist)
+    adds: int = 0  # pyramid adds so far
+    last_add: Optional[float] = None  # price level of the latest entry (pyramid spacing)
 
 
 @dataclass
@@ -112,6 +115,7 @@ class Trader:
         self.halted_at: Optional[str] = None  # first time the circuit breaker stopped entries
         self._stop_error: Optional[str] = None  # last exchange-stop failure (notify once)
         self._stop_retry_at = 0.0
+        self.defensive = False  # set by the scanner after the target: no pyramiding
         self.state_path = state_path
         self.journal_path = journal_path
         self._load_state()
@@ -301,12 +305,31 @@ class Trader:
                                 p.take_profit, p.regime, now, p.reason + " (partial)")
         self._save_state()
 
+    def _position_leverage(self, price: float, stop: float) -> int:
+        """Highest leverage (<= futures.leverage) whose isolated liquidation price lies beyond
+        the stop: 1 / leverage must exceed the stop distance plus maintenance margin + buffer."""
+        if not self.futures:
+            return 1
+        stop_pct = abs(price - stop) / price
+        buffer = float(self.cfg["futures"].get("liq_buffer", 0.015))
+        return min(int(self.leverage), int(1.0 / (stop_pct + buffer)))
+
     def _open(self, price: float, decision, now) -> bool:
+        lev = self._position_leverage(price, decision.stop_price)
+        if lev < 1:
+            log.info("%s entry skipped: stop too far for any leverage", self.symbol)
+            return False
         equity = self.equity(price)
         free = self.broker.free_margin(price)
-        amount = self.risk.position_size(equity, free, price, decision.stop_price, self.leverage)
+        amount = self.risk.position_size(equity, free, price, decision.stop_price, lev)
         if amount <= 0:
             return False
+        if self.futures and hasattr(self.broker, "use_leverage"):
+            try:
+                self.broker.use_leverage(lev)
+            except Exception as exc:
+                log.error("%s: could not set %dx leverage: %s", self.symbol, lev, exc)
+                return False
         stop_dist = abs(price - decision.stop_price)
         orders = self.cfg.get("orders", {})
         use_limit = orders.get("entry_type", "market") == "limit" and self.broker.supports_limit
@@ -336,6 +359,7 @@ class Trader:
             side=side, amount=amount, entry_price=price, stop_price=stop,
             take_profit=take_profit, regime=regime, best=price, opened_at=self._ts(now),
             entry_fee=fee, last_funding_check=self._ts(now), risk_dist=stop_dist,
+            r0=amount * stop_dist, last_add=price,
         )
         msg = (f"🟢 開倉 {side.upper()} {amount:.4f} {self.symbol} @ {price:.2f}\n"
                f"停損 {stop:.2f}" + (f" 停利 {take_profit:.2f}" if take_profit else "") +
@@ -411,6 +435,11 @@ class Trader:
             return True
         if (favourable - pos.best) * s > 0:
             pos.best = favourable
+        if not stop_only:
+            self._maybe_add(favourable, now, open_ if intrabar else None, intrabar)
+            pos = self.position
+            if pos is None:
+                return True
         if (self.broker.live and self._wants_exchange_stop() and pos.exchange_stop != pos.stop_price
                 and time_module.monotonic() >= self._stop_retry_at):
             self._sync_exchange_stop(now)  # an earlier stop update failed: retry
@@ -510,6 +539,54 @@ class Trader:
             pos.stop_price = best
             self._sync_exchange_stop()
 
+    def _maybe_add(self, favourable: float, now, open_: float | None, intrabar: bool) -> None:
+        """Pyramid into a winner: every ``pyramid_step_r`` R beyond the previous entry, add the
+        initial size again and raise the stop so the worst case is still the initial risk."""
+        pos = self.position
+        max_adds = int(self.cfg["strategy"].get("pyramid_adds", 0) or 0)
+        if (pos is None or self.defensive or pos.adds >= max_adds or pos.r0 <= 0
+                or pos.risk_dist <= 0 or pos.take_profit is not None):
+            return
+        s = _sign(pos.side)
+        level = (pos.last_add or pos.entry_price) + s * float(self.cfg["strategy"].get("pyramid_step_r", 1.0)) * pos.risk_dist
+        if (favourable - level) * s < 0:
+            return
+        price = favourable
+        if intrabar:
+            price = open_ if open_ is not None and (open_ - level) * s > 0 else level
+        amount = pos.r0 / pos.risk_dist  # same size as the first entry
+        free = self.broker.free_margin(price)
+        lev = float(getattr(self.broker, "leverage", self.leverage) or 1)
+        if amount * price < self.cfg["risk"]["min_notional"] or amount * price / lev > free * 0.95:
+            log.info("%s pyramid add skipped: not enough free margin", self.symbol)
+            pos.adds = max_adds  # do not retry every tick
+            self._save_state()
+            return
+        try:
+            fill = self.broker.market_open(pos.side, amount, price)
+        except Exception as exc:
+            log.error("%s pyramid add failed: %s", self.symbol, exc)
+            fill = None
+        if fill is None or fill.amount <= 0:
+            pos.adds = max_adds
+            self._save_state()
+            return
+        total = pos.amount + fill.amount
+        pos.entry_price = (pos.entry_price * pos.amount + fill.price * fill.amount) / total
+        pos.amount = total
+        pos.entry_fee += fill.fee
+        pos.adds += 1
+        pos.last_add = level
+        worst_case_stop = pos.entry_price - s * pos.r0 / pos.amount
+        if (worst_case_stop - pos.stop_price) * s > 0:
+            pos.stop_price = worst_case_stop
+        self._sync_exchange_stop(now)  # size changed: the exchange stop must cover the whole position
+        msg = (f"➕ 加碼 {pos.side.upper()} {fill.amount:.4f} {self.symbol} @ {fill.price:.6g}"
+               f"（第 {pos.adds} 次）\n持倉 {pos.amount:.4f} 均價 {pos.entry_price:.6g}，停損上移到 {pos.stop_price:.6g}")
+        log.info(msg.replace("\n", " | "))
+        self.notify(msg)
+        self._save_state()
+
     def _check_halt(self, now=None) -> None:
         ok, why = self.risk.can_open()
         if not ok and not self._halted:
@@ -538,12 +615,13 @@ class Trader:
         fees = pos.entry_fee * frac + fill.fee
         pnl = gross - fees - pos.funding * frac
         notional = pos.entry_price * amount
+        risk_amount = (pos.r0 or pos.risk_dist * pos.amount) * frac
         trade = Trade(
             side=pos.side, opened_at=pos.opened_at, closed_at=self._ts(now), regime=pos.regime,
             entry_price=pos.entry_price, exit_price=exit_price, amount=amount, pnl=pnl,
             pnl_pct=pnl / notional * 100 if notional else 0.0, fees=fees,
             funding=pos.funding * frac, reason=reason,
-            r_multiple=pnl / (pos.risk_dist * amount) if pos.risk_dist > 0 else 0.0,
+            r_multiple=pnl / risk_amount if risk_amount > 0 else 0.0,
             symbol=self.symbol,
         )
         self.trades.append(trade)

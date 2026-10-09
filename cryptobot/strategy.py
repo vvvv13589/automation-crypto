@@ -374,10 +374,15 @@ class BreakoutStrategy:
         min_vr = self.p.get("bo_min_volume_ratio", 0) or 0
         if min_vr and not cols["vol_ratio"][i] >= min_vr:  # also rejects NaN
             return Decision(HOLD, TREND, "no volume confirmation")
-        if close > cols["dc_hi"][i] and self.p.get("allow_long", True):
+        # trend filter "coin": only trade breakouts in the direction of the coin's own long EMA
+        ema = cols["ema_long"][i]
+        coin_filter = self.p.get("trend_filter", "none") == "coin"
+        long_ok = not coin_filter or (ema == ema and close > ema)
+        short_ok = not coin_filter or (ema == ema and close < ema)
+        if close > cols["dc_hi"][i] and self.p.get("allow_long", True) and long_ok:
             return Decision(ENTER, TREND, "📝 行情：\n" + self.describe(cols, i, LONG),
                             side=LONG, stop_price=close - dist)
-        if close < cols["dc_lo"][i] and self.p.get("allow_short", True):
+        if close < cols["dc_lo"][i] and self.p.get("allow_short", True) and short_ok:
             return Decision(ENTER, TREND, "📝 行情：\n" + self.describe(cols, i, SHORT),
                             side=SHORT, stop_price=close + dist)
         return Decision(HOLD, TREND, "inside channel")

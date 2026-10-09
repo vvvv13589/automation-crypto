@@ -13,6 +13,7 @@ class RiskManager:
         self.day_start_equity: float | None = None
         self.drawdown_halt = False
         self.daily_halt = False
+        self.floor_halt = False
 
     # -- state persistence -------------------------------------------------
     def to_dict(self) -> dict:
@@ -21,6 +22,7 @@ class RiskManager:
             "day": self.day,
             "day_start_equity": self.day_start_equity,
             "drawdown_halt": self.drawdown_halt,
+            "floor_halt": self.floor_halt,
         }
 
     def load(self, data: dict) -> None:
@@ -28,6 +30,7 @@ class RiskManager:
         self.day = data.get("day")
         self.day_start_equity = data.get("day_start_equity")
         self.drawdown_halt = bool(data.get("drawdown_halt", False))
+        self.floor_halt = bool(data.get("floor_halt", False))
 
     # -- updates -----------------------------------------------------------
     def update(self, equity: float, now: datetime) -> None:
@@ -40,8 +43,14 @@ class RiskManager:
             self.drawdown_halt = True
         if self.day_start_equity and equity <= self.day_start_equity * (1 - self.p["daily_loss_limit"]):
             self.daily_halt = True
+        floor = float(self.p.get("min_equity") or 0)
+        if floor and equity <= floor:
+            self.floor_halt = True
 
     def can_open(self) -> tuple[bool, str]:
+        if self.floor_halt:
+            return False, (f"account fell to the {float(self.p.get('min_equity') or 0):g} U floor - "
+                           "trading stopped (review, then reset-risk)")
         if self.drawdown_halt:
             return False, "max drawdown reached - trading halted (reset state to resume)"
         if self.daily_halt:
