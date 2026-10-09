@@ -47,10 +47,10 @@
 | 最差單月 | -12% | **-41%** |
 
 **提出本金的流程**(收到「帳戶翻倍」通知後)：
-1. 在 tmux 視窗按 Ctrl+C 停止機器人
+1. `sudo systemctl stop cryptobot` 停止機器人
 2. 在 Binance 把本金從 U 本位合約劃轉出來
 3. `python -m cryptobot --live reset-risk`(讓回撤從目前餘額重新計算，否則提領會被當成虧損)
-4. 重新啟動 `python -m cryptobot live --confirm-live`
+4. `sudo systemctl start cryptobot` 重新啟動
 
 ## 其他策略(研究對照用，`--strategy pullback|adaptive`)
 
@@ -124,12 +124,20 @@ python -m cryptobot live --confirm-live
 
 其他選項：`--symbol BTC/USDT:USDT`、`--timeframe 5m`、`--no-daytrade`(允許留倉過夜)、`--spot`(現貨只做多)、`-v`(顯示每筆交易細節)。
 
-### 背景執行(關掉 SSH 也繼續跑)
+### 實盤常駐執行(systemd：開機自動啟動、當掉自動重啟)
 ```bash
-tmux new -s bot
-source .venv/bin/activate && python -m cryptobot paper
-# 按 Ctrl+B 再按 D 離開；tmux attach -t bot 回來；Ctrl+C 安全停止
+sudo cp deploy/cryptobot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now cryptobot
+
+systemctl status cryptobot          # 狀態
+journalctl -u cryptobot -f          # 即時 log(Ctrl+C 離開，不會停掉機器人)
+sudo systemctl restart cryptobot    # 改完程式或設定後重啟
+sudo systemctl stop cryptobot       # 安全停止(持倉的交易所停損單仍有效)
 ```
+服務用系統的 `/usr/bin/python3`，套件請裝在系統層(`sudo pip install -r requirements.txt`)。
+
+模擬交易(paper)可以用 tmux 在前景跑：`tmux new -s paper`，執行 `python -m cryptobot paper`，Ctrl+B 再按 D 離開。
 
 ### 實盤前檢查清單
 1. Binance API key：**只開「合約交易」權限，關閉提領**，綁定伺服器 IP

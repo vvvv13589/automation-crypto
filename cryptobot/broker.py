@@ -21,6 +21,7 @@ import itertools
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime
 
 log = logging.getLogger(__name__)
 
@@ -146,7 +147,7 @@ class PaperBroker:
         fill_price = price * (1 + _sign(side) * self.slippage)
         return self._add(side, amount, fill_price, self.taker_fee)
 
-    def market_close(self, side: str, amount: float, price: float) -> Fill | None:
+    def market_close(self, side: str, amount: float, price: float, since: str | None = None) -> Fill | None:
         amount = min(amount, self.pos_amount)
         if amount <= 0 or self.pos_side != side:
             return Fill(side, 0.0, price, 0.0, external=True)
@@ -326,10 +327,35 @@ class FuturesLiveBroker:
         order = self.ex.create_order(self.symbol, "market", self._order_side(side, True), amount)
         return self._fill(side, order, price)
 
-    def market_close(self, side: str, amount: float, price: float) -> Fill | None:
+    def _external_close_fill(self, side: str, amount: float, price: float, since: str | None) -> Fill:
+        """The position was closed on the exchange (stop order / liquidation / manual):
+        read the real exit price and fees from the account's fills since the entry."""
+        fallback = Fill(side, amount, price, 0.0, external=True)
+        try:
+            ms = int(datetime.fromisoformat(since).timestamp() * 1000) if since else None
+            trades = self.ex.fetch_my_trades(self.symbol, ms)
+        except Exception as exc:
+            log.warning("%s: could not read the exchange-side close fills: %s", self.symbol, exc)
+            return fallback
+        closing = [t for t in trades if t.get("side") == self._order_side(side, False)]
+        qty = sum(float(t.get("amount") or 0) for t in closing)
+        if qty <= 0:
+            return fallback
+        avg = sum(float(t["price"]) * float(t["amount"]) for t in closing) / qty
+        fee = 0.0
+        for t in closing:
+            f = t.get("fee") or {}
+            cost = float(f.get("cost") or 0)
+            if f.get("currency") not in (None, self._quote()):  # e.g. paid in BNB
+                cost = float(t.get("cost") or 0) * self.TAKER_FEE_ESTIMATE
+            fee += cost
+        self._bal_cache = None
+        return Fill(side, qty, avg, fee, external=True)
+
+    def market_close(self, side: str, amount: float, price: float, since: str | None = None) -> Fill | None:
         on_exchange = abs(self.position_amount())
         if on_exchange <= 0:
-            return Fill(side, amount, price, 0.0, external=True)
+            return self._external_close_fill(side, amount, price, since)
         amount = self._amount(min(amount, on_exchange))
         order = self.ex.create_order(self.symbol, "market", self._order_side(side, False), amount,
                                      None, {"reduceOnly": True})
@@ -367,13 +393,15 @@ class FuturesLiveBroker:
 
     # -- exchange-side protective stop -----------------------------------------
     def set_stop(self, side: str, amount: float, stop_price: float, old_id: str | None = None):
-        if old_id:
-            self.cancel_stop(old_id)
+        """Place the new stop first, then cancel the old one: the position is never unprotected.
+        If placing fails the old stop stays on the exchange and the error propagates."""
         stop_price = float(self.ex.price_to_precision(self.symbol, stop_price))
         order = self.ex.create_order(
             self.symbol, "market", self._order_side(side, False), self._amount(amount), None,
             {"stopLossPrice": stop_price, "reduceOnly": True},
         )
+        if old_id:
+            self.cancel_stop(old_id)
         return order["id"]
 
     def cancel_stop(self, order_id: str | None) -> None:
@@ -437,7 +465,7 @@ class SpotLiveBroker:
             return None
         return self._fill(side, self.ex.create_order(self.symbol, "market", "buy", amount), price)
 
-    def market_close(self, side: str, amount: float, price: float) -> Fill | None:
+    def market_close(self, side: str, amount: float, price: float, since: str | None = None) -> Fill | None:
         amount = float(self.ex.amount_to_precision(self.symbol, min(amount, self.position_amount())))
         if amount <= 0:
             return Fill(side, 0.0, price, 0.0, external=True)

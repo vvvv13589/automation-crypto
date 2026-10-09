@@ -7,6 +7,7 @@ import dataclasses
 import json
 import logging
 import os
+import time as time_module
 from dataclasses import asdict, dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
@@ -41,6 +42,7 @@ class Position:
     last_funding_check: Optional[str] = None
     stop_order_id: Optional[str] = None
     risk_dist: float = 0.0  # initial entry-to-stop distance (1R)
+    exchange_stop: Optional[float] = None  # stop price actually working on the exchange
 
 
 @dataclass
@@ -71,6 +73,7 @@ class Trade:
     funding: float
     reason: str
     r_multiple: float = 0.0  # pnl in units of the initial risk (1R = entry-to-stop loss)
+    symbol: str = ""
 
 
 def _from_dict(cls, data: dict):
@@ -107,6 +110,8 @@ class Trader:
         self.trades_today = 0
         self._halted = False
         self.halted_at: Optional[str] = None  # first time the circuit breaker stopped entries
+        self._stop_error: Optional[str] = None  # last exchange-stop failure (notify once)
+        self._stop_retry_at = 0.0
         self.state_path = state_path
         self.journal_path = journal_path
         self._load_state()
@@ -162,9 +167,19 @@ class Trader:
         if not self.journal_path:
             return
         Path(self.journal_path).parent.mkdir(parents=True, exist_ok=True)
+        fields = list(asdict(trade))
         new = not os.path.exists(self.journal_path)
+        if not new:  # journal written by an older version: rewrite it with the current columns
+            with open(self.journal_path, newline="", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                if reader.fieldnames != fields:
+                    rows = list(reader)
+                    with open(self.journal_path, "w", newline="", encoding="utf-8") as out:
+                        writer = csv.DictWriter(out, fieldnames=fields, restval="")
+                        writer.writeheader()
+                        writer.writerows({k: r.get(k, "") for k in fields} for r in rows)
         with open(self.journal_path, "a", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=list(asdict(trade)))
+            writer = csv.DictWriter(fh, fieldnames=fields)
             if new:
                 writer.writeheader()
             writer.writerow(asdict(trade))
@@ -322,24 +337,43 @@ class Trader:
             take_profit=take_profit, regime=regime, best=price, opened_at=self._ts(now),
             entry_fee=fee, last_funding_check=self._ts(now), risk_dist=stop_dist,
         )
-        self._sync_exchange_stop()
         msg = (f"🟢 開倉 {side.upper()} {amount:.4f} {self.symbol} @ {price:.2f}\n"
                f"停損 {stop:.2f}" + (f" 停利 {take_profit:.2f}" if take_profit else "") +
                f"\n{reason}")
         log.info(msg.replace("\n", " | "))
         self.notify(msg)
+        self._sync_exchange_stop(now)
         self._save_state()
 
-    def _sync_exchange_stop(self) -> None:
+    STOP_RETRY_SECONDS = 60
+
+    def _wants_exchange_stop(self) -> bool:
+        return bool(self.cfg.get("futures", {}).get("exchange_stop", True))
+
+    def _sync_exchange_stop(self, now=None) -> None:
+        """Mirror pos.stop_price on the exchange. A position with no exchange stop at all is
+        closed at market; if only an update fails, the old stop keeps working and the update
+        is retried from check_exits()."""
         pos = self.position
-        if pos is None or not self.cfg.get("futures", {}).get("exchange_stop", True):
+        if pos is None or not self._wants_exchange_stop():
             return
+        self._stop_retry_at = time_module.monotonic() + self.STOP_RETRY_SECONDS
         try:
             pos.stop_order_id = self.broker.set_stop(pos.side, pos.amount, pos.stop_price,
                                                      pos.stop_order_id)
+            pos.exchange_stop = pos.stop_price
+            if self._stop_error:
+                self.notify(f"✅ {self.symbol} 交易所停損單已更新為 {pos.stop_price:.6g}")
+            self._stop_error = None
         except Exception as exc:
-            log.error("failed to place exchange stop: %s", exc)
-            self.notify(f"⚠️ 交易所停損單設定失敗: {exc}")
+            log.error("%s: failed to place exchange stop: %s", self.symbol, exc)
+            if pos.stop_order_id is None and self.broker.live:
+                self.notify(f"⚠️ {self.symbol} 交易所停損單掛不上，持倉沒有保護 → 立即市價平倉\n{exc}")
+                self._close(pos.stop_price, now, "exchange stop could not be placed")
+            elif self._stop_error is None:
+                self.notify(f"⚠️ {self.symbol} 停損單更新失敗，原本的停損單 "
+                            f"{pos.exchange_stop or ''} 仍有效，每分鐘自動重試\n{exc}")
+            self._stop_error = str(exc)
 
     # ------------------------------------------------------------------ exits
     def check_exits(self, low: float, high: float, now=None, open_: float | None = None,
@@ -377,6 +411,10 @@ class Trader:
             return True
         if (favourable - pos.best) * s > 0:
             pos.best = favourable
+        if (self.broker.live and self._wants_exchange_stop() and pos.exchange_stop != pos.stop_price
+                and time_module.monotonic() >= self._stop_retry_at):
+            self._sync_exchange_stop(now)  # an earlier stop update failed: retry
+            self._save_state()
         return False
 
     def reconcile(self, price: float, now=None) -> None:
@@ -484,7 +522,7 @@ class Trader:
     def _close(self, price: float, now, reason: str) -> None:
         pos = self.position
         try:
-            fill = self.broker.market_close(pos.side, pos.amount, price)
+            fill = self.broker.market_close(pos.side, pos.amount, price, since=pos.opened_at)
         except Exception as exc:
             log.error("close order failed: %s (will retry)", exc)
             self.notify(f"⚠️ 平倉失敗，將重試: {exc}")
@@ -506,6 +544,7 @@ class Trader:
             pnl_pct=pnl / notional * 100 if notional else 0.0, fees=fees,
             funding=pos.funding * frac, reason=reason,
             r_multiple=pnl / (pos.risk_dist * amount) if pos.risk_dist > 0 else 0.0,
+            symbol=self.symbol,
         )
         self.trades.append(trade)
         self._journal(trade)

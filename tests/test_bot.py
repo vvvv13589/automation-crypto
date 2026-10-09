@@ -779,3 +779,125 @@ def test_telegram_status_command_and_scan_report(cfg, tmp_path, monkeypatch):
     sent.clear()
     r.scan(pd.Timestamp(next(iter(data.values())).index[500]) + pd.Timedelta(seconds=30))
     assert any("掃描完成" in m for m in sent)
+
+
+# ------------------------------------------------------- live exchange stops
+class FakeFuturesExchange:
+    """Just enough ccxt for FuturesLiveBroker: records orders, can reject stop orders."""
+
+    def __init__(self):
+        self.calls, self.fail_stops, self.position, self.my_trades = [], 0, 0.0, []
+        self._ids = 0
+
+    def _id(self, prefix):
+        self._ids += 1
+        return f"{prefix}{self._ids}"
+
+    def amount_to_precision(self, symbol, amount):
+        return amount
+
+    def price_to_precision(self, symbol, price):
+        return price
+
+    def market(self, symbol):
+        return {"settle": "USDT", "limits": {}}
+
+    def fetch_balance(self):
+        return {"info": {"totalMarginBalance": "1000", "availableBalance": "1000"}}
+
+    def fetch_positions(self, symbols=None):
+        if not self.position:
+            return []
+        return [{"symbol": "ETH/USDT:USDT", "contracts": abs(self.position), "contractSize": 1,
+                 "side": LONG if self.position > 0 else SHORT}]
+
+    def fetch_my_trades(self, symbol, since=None):
+        return self.my_trades
+
+    def create_order(self, symbol, type_, side, amount, price=None, params=None):
+        params = params or {}
+        if "stopLossPrice" in params:
+            if self.fail_stops:
+                self.fail_stops -= 1
+                raise RuntimeError("Order would immediately trigger")
+            oid = self._id("s")
+            self.calls.append(("stop", params["stopLossPrice"], oid))
+            return {"id": oid}
+        self.position += amount if side == "buy" else -amount
+        self.calls.append(("order", side, amount))
+        return {"id": self._id("o"), "filled": amount, "average": 100.0, "fee": {"cost": 0.05}}
+
+    def cancel_order(self, oid, symbol, params=None):
+        self.calls.append(("cancel", oid))
+
+
+def _live_trader(cfg, ex, **kw):
+    from cryptobot.broker import FuturesLiveBroker
+    cfg["market"] = "future"
+    return Trader(cfg, FuturesLiveBroker(ex, "ETH/USDT:USDT", 5), **kw)
+
+
+def test_live_stop_update_places_new_stop_before_cancelling_old():
+    from cryptobot.broker import FuturesLiveBroker
+    ex = FakeFuturesExchange()
+    b = FuturesLiveBroker(ex, "ETH/USDT:USDT", 5)
+    first = b.set_stop(LONG, 1.0, 95.0)
+    second = b.set_stop(LONG, 1.0, 97.0, old_id=first)
+    assert ex.calls == [("stop", 95.0, first), ("stop", 97.0, second), ("cancel", first)]
+    ex.fail_stops = 1
+    with pytest.raises(RuntimeError):
+        b.set_stop(LONG, 1.0, 99.0, old_id=second)
+    assert ("cancel", second) not in ex.calls  # the old stop keeps protecting the position
+
+
+def test_live_position_without_exchange_stop_is_closed(market_cfg):
+    ex = FakeFuturesExchange()
+    ex.fail_stops = 1
+    sent = []
+    t = _live_trader(market_cfg, ex, notify=sent.append)
+    t.try_enter(_enter(LONG, 95.0), 100.0, pd.Timestamp("2026-10-08T16:00Z"))
+    assert t.position is None and ex.position == 0
+    assert t.trades[-1].reason == "exchange stop could not be placed"
+    assert any("立即市價平倉" in m for m in sent)
+
+
+def test_failed_stop_update_keeps_old_stop_and_retries(market_cfg):
+    ex = FakeFuturesExchange()
+    sent = []
+    t = _live_trader(market_cfg, ex, notify=sent.append)
+    t.try_enter(_enter(LONG, 95.0), 100.0, pd.Timestamp("2026-10-08T16:00Z"))
+    pos = t.position
+    old_id, old_stop = pos.stop_order_id, pos.exchange_stop
+    pos.stop_price = 97.0
+    ex.fail_stops = 1
+    t._sync_exchange_stop()
+    assert t.position is pos and pos.stop_order_id == old_id and pos.exchange_stop == old_stop
+    assert sum("停損單更新失敗" in m for m in sent) == 1
+    t.check_exits(99.0, 99.0, now=pd.Timestamp("2026-10-08T16:05Z"))  # retry not due yet
+    assert pos.exchange_stop == old_stop
+    t._stop_retry_at = 0
+    t.check_exits(99.0, 99.0, now=pd.Timestamp("2026-10-08T16:06Z"))
+    assert pos.exchange_stop == 97.0 and ("cancel", old_id) in ex.calls
+    assert any("已更新" in m for m in sent)
+
+
+def test_exchange_side_close_records_real_fill_and_symbol(market_cfg, tmp_path):
+    import csv
+    ex = FakeFuturesExchange()
+    journal = tmp_path / "trades.csv"
+    journal.write_text("side,pnl\nshort,-1.0\n", encoding="utf-8")  # journal from an older version
+    t = _live_trader(market_cfg, ex, journal_path=str(journal))
+    t.try_enter(_enter(LONG, 95.0), 100.0, pd.Timestamp("2026-10-08T16:00Z"))
+    amount = t.position.amount
+    ex.position = 0.0  # the exchange-side stop fired
+    ex.my_trades = [{"side": "sell", "amount": amount, "price": 94.8, "cost": amount * 94.8,
+                     "fee": {"cost": 0.14, "currency": "USDT"}}]
+    t.reconcile(96.0, pd.Timestamp("2026-10-08T20:00Z"))
+    tr = t.trades[-1]
+    assert tr.exit_price == pytest.approx(94.8) and tr.fees == pytest.approx(0.05 + 0.14)
+    assert tr.symbol == "ETH/USDT:USDT"
+    with open(journal, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert rows[0]["side"] == "short" and rows[0]["symbol"] == ""
+    assert rows[1]["symbol"] == "ETH/USDT:USDT" and float(rows[1]["exit_price"]) == pytest.approx(94.8)
+

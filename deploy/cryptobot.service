@@ -1,0 +1,22 @@
+# 實盤機器人的 systemd 服務：開機自動啟動、程式結束或當掉 60 秒後自動重啟
+# 安裝：sudo cp deploy/cryptobot.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#       sudo systemctl enable --now cryptobot
+[Unit]
+Description=automation-crypto live trading bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/automation-crypto
+ExecStart=/usr/bin/python3 -m cryptobot live --confirm-live
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=60
+KillSignal=SIGINT
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
