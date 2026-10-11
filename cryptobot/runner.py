@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +18,30 @@ from .notify import make_notifier
 from .trader import Trader
 
 log = logging.getLogger(__name__)
+
+AUTH_REMIND_EVERY = 60  # consecutive failed iterations (~1 per minute) between "still rejected" reminders
+
+
+def is_auth_error(exc: Exception) -> bool:
+    """Binance rejected the API key: wrong key, missing permission, or (usually) an IP not on the whitelist."""
+    try:
+        import ccxt
+        if isinstance(exc, ccxt.AuthenticationError):
+            return True
+    except ImportError:
+        pass
+    return "-2015" in str(exc)
+
+
+def public_ip(exc: Exception | None = None) -> str:
+    """The IP Binance saw (it is in the -2015 message), else ask a public echo service."""
+    m = re.search(r"request ip: ([0-9A-Fa-f:.]+)", str(exc or ""))
+    if m:
+        return m.group(1)
+    try:
+        return urllib.request.urlopen("https://api.ipify.org", timeout=5).read().decode().strip()
+    except Exception:
+        return "查不到"
 
 
 class Runner:
@@ -176,8 +202,20 @@ class ScanRunner:
         self.mode = mode
         from .report import DailyReporter
         self.reporter = DailyReporter(cfg)
+        self._auth_down = False
+        self._prepared = not live
         if live:
+            try:
+                self._ensure_prepared()
+            except SystemExit:
+                raise
+            except Exception as exc:  # e.g. the IP changed: start anyway, retry from the loop
+                self._on_error(exc, 1)
+
+    def _ensure_prepared(self) -> None:
+        if not self._prepared:
             self._prepare_live_account()
+            self._prepared = True
 
     def _prepare_live_account(self) -> None:
         """One-way position mode is required; never touch positions the bot did not open."""
@@ -221,6 +259,26 @@ class ScanRunner:
     def _say(self, text: str) -> None:
         if self.notify:
             self.notify(text)
+
+    def _on_error(self, exc: Exception, errors: int) -> None:
+        """One failed iteration. An API-key rejection is reported at once with the IP Binance
+        saw (then hourly); other errors after 3 and 10 failures, then every ~6 hours."""
+        log.error("iteration failed (%d in a row): %s", errors, exc, exc_info=not is_auth_error(exc))
+        if is_auth_error(exc):
+            if not self._auth_down or errors % AUTH_REMIND_EVERY == 0:
+                ip = public_ip(exc)
+                again = "仍然" if self._auth_down else ""
+                self._say(f"🔑 幣安{again}拒絕 API 連線(-2015)，通常是 IP 變了。\n目前對外 IP：{ip}\n"
+                          f"請到幣安 API 管理 → 編輯 → IP 存取限制，加入這個 IP。\n"
+                          f"機器人每分鐘自動重試，持倉的交易所停損單仍有效。")
+            self._auth_down = True
+        elif errors in (3, 10) or errors % 360 == 0:
+            self._say(f"⚠️ 連續 {errors} 次錯誤(機器人持續重試): {str(exc)[:200]}")
+
+    def _on_ok(self) -> None:
+        if self._auth_down:
+            self._auth_down = False
+            self._say("✅ 幣安 API 連線已恢復，機器人繼續運作")
 
     def refresh_universe(self) -> None:
         from .scanner import pick_universe, summarize_universe
@@ -282,6 +340,7 @@ class ScanRunner:
         return entered
 
     def step(self) -> None:
+        self._ensure_prepared()
         now = datetime.now(timezone.utc)
         self.protect(now)
         import pandas as pd
@@ -329,17 +388,13 @@ class ScanRunner:
         while not self._stop:
             try:
                 self.step()
-                errors = 0
-            except Exception as exc:
+            except Exception as exc:  # keep retrying: exchange-side stops protect open positions meanwhile
                 errors += 1
-                log.exception("iteration failed (%d in a row): %s", errors, exc)
-                if errors in (3, 10):
-                    self._say(f"⚠️ 連續 {errors} 次錯誤: {str(exc)[:200]}")
-                if errors >= 20:
-                    self._say("🛑 錯誤太多，機器人已停止。交易所停損單仍有效，請檢查伺服器。")
-                    break
-                time.sleep(min(60, 2 ** errors))
+                self._on_error(exc, errors)
+                time.sleep(min(60, 2 ** min(errors, 6)))
                 continue
+            errors = 0
+            self._on_ok()
             for _ in range(int(self.cfg["poll_seconds"])):
                 if self._stop:
                     break

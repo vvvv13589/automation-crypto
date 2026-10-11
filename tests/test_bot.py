@@ -1007,3 +1007,45 @@ def test_target_locks_in_profit_then_trades_defensively(cfg, tmp_path):
                   mode="paper", wallet=w2)
     assert sc2.defensive and sc2.risk.p["risk_per_trade"] == 0.005
 
+
+def test_api_rejection_is_reported_with_ip_and_the_bot_keeps_going(cfg, tmp_path, monkeypatch):
+    import ccxt
+    from cryptobot import runner
+    data = {f"C{i}/USDT:USDT": synthetic(bars=600, timeframe="4h", seed=70 + i) for i in range(2)}
+    rejected = ccxt.AuthenticationError('binance {"code":-2015,"msg":"Invalid API-key, IP, or permissions '
+                                        'for action, request ip: 1.169.119.8"}')
+
+    class Live(FakeMarketExchange):
+        down = True
+
+        def fapiPrivateGetPositionSideDual(self):
+            return {"dualSidePosition": False}
+
+        def fetch_positions(self, symbols=None):
+            if self.down:
+                raise rejected
+            return []
+
+    fake = Live(data, 500)
+    sent = []
+    monkeypatch.setattr(runner, "make_exchange", lambda *a, **k: fake)
+    monkeypatch.setattr(runner, "make_notifier", lambda *a, **k: sent.append)
+    monkeypatch.setenv("EXCHANGE_API_KEY", "k")
+    monkeypatch.setenv("EXCHANGE_API_SECRET", "s")
+    cfg.update(state_dir=str(tmp_path / "state"), log_dir=str(tmp_path / "logs"))
+    _scan_cfg(cfg)
+    r = runner.ScanRunner(cfg, live=True)          # starts even though Binance rejects the key
+    assert not r._prepared and len(sent) == 1 and "1.169.119.8" in sent[0]
+    for n in range(2, runner.AUTH_REMIND_EVERY):
+        r._on_error(rejected, n)                   # no message every minute ...
+    assert len(sent) == 1
+    r._on_error(rejected, runner.AUTH_REMIND_EVERY)
+    assert len(sent) == 2 and "仍然" in sent[1]    # ... but an hourly reminder
+    fake.down = False                              # the user whitelisted the new IP
+    r._ensure_prepared()
+    r._on_ok()
+    assert r._prepared and "恢復" in sent[-1]
+    r._on_ok()
+    assert sum("恢復" in m for m in sent) == 1
+    assert runner.public_ip(rejected) == "1.169.119.8"
+
