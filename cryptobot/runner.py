@@ -308,6 +308,18 @@ class ScanRunner:
             t.check_exits(float(price), float(price), now=now)
             t.session_check(float(price), now)
 
+    def funding_rates(self) -> dict[str, float]:
+        """Current funding rate per symbol (one call for all), only when the funding filter is on.
+        On failure the filter is skipped for this scan rather than blocking entries."""
+        if not float(self.cfg["strategy"].get("funding_max", 0) or 0):
+            return {}
+        try:
+            rates = self.exchange.fetch_funding_rates()
+        except Exception as exc:
+            log.warning("funding rates unavailable, filter skipped this scan: %s", str(exc)[:120])
+            return {}
+        return {s: float(r["fundingRate"]) for s, r in rates.items() if r and r.get("fundingRate") is not None}
+
     def scan(self, now) -> list[str]:
         """A candle just closed: evaluate every coin, then enter the strongest signals."""
         self.refresh_universe()
@@ -319,11 +331,14 @@ class ScanRunner:
         symbols = list(dict.fromkeys(self.scanner.open_symbols() + fresh))
         self.scanner.begin_candle()
         self.scanner.market_note = ""
+        funding = self.funding_rates()
         for sym in symbols:
             try:
                 candles = fetch_recent(self.exchange, sym, self.timeframe, self.cfg["history_bars"])
                 if sym.startswith("BTC/"):
                     self.scanner.market_note = btc_note(candles)
+                if sym in funding:
+                    candles = candles.assign(funding=funding[sym])
                 if len(candles) > 1:
                     self.scanner.trader(sym).on_candle(candles, now=now)
             except Exception as exc:  # one bad market must not stop the scan

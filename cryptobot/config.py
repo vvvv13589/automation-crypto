@@ -97,6 +97,7 @@ DEFAULTS: dict = {
         "trend_filter": "none",  # "coin" = long only above the coin's own EMA(ema_trend), short only below
         "pyramid_adds": 0,  # add to a winner this many times (equal size, worst case stays the initial risk)
         "pyramid_step_r": 1.0,  # ... every time it gains this many R beyond the previous entry
+        "funding_max": 0,  # >0: no long while funding > +this per 8h, no short below -this (0 = off)
         # --- pullback strategy ---
         "htf_timeframe": "4h",
         "htf_ema_fast": 20,

@@ -1008,6 +1008,52 @@ def test_target_locks_in_profit_then_trades_defensively(cfg, tmp_path):
     assert sc2.defensive and sc2.risk.p["risk_per_trade"] == 0.005
 
 
+def test_funding_filter_skips_crowded_breakouts(cfg):
+    from cryptobot.strategy import HOLD, BreakoutStrategy
+    n = 80
+
+    def cols(close, funding):
+        c = {k: np.full(n, np.nan) for k in BreakoutStrategy.COLUMNS}
+        c.update(close=np.full(n, close), atr=np.full(n, 2.0), dc_hi=np.full(n, 105.0),
+                 dc_lo=np.full(n, 95.0), funding=np.full(n, funding))
+        return c
+
+    st = BreakoutStrategy(dict(cfg["strategy"], funding_max=0.0005))
+    assert st.decide_at(cols(110, 0.0008), n - 1).action == HOLD     # longs crowded
+    assert st.decide_at(cols(110, 0.0003), n - 1).side == LONG
+    assert st.decide_at(cols(90, -0.0008), n - 1).action == HOLD     # shorts crowded
+    assert st.decide_at(cols(90, 0.0008), n - 1).side == SHORT       # high funding does not block shorts
+    assert st.decide_at(cols(110, np.nan), n - 1).side == LONG       # unknown funding: trade normally
+    off = BreakoutStrategy(dict(cfg["strategy"]))
+    assert off.decide_at(cols(110, 0.01), n - 1).side == LONG        # filter off by default
+    assert "funding" in st.analyze(synthetic(bars=300, timeframe="4h", seed=1)).columns
+
+
+def test_scan_attaches_current_funding_rates(cfg, tmp_path, monkeypatch):
+    from cryptobot import runner
+    from cryptobot.trader import Trader
+    data = {f"C{i}/USDT:USDT": synthetic(bars=600, timeframe="4h", seed=80 + i) for i in range(2)}
+
+    class Ex(FakeMarketExchange):
+        def fetch_funding_rates(self, symbols=None):
+            return {"C0/USDT:USDT": {"fundingRate": 0.0007}, "C1/USDT:USDT": {"fundingRate": None}}
+
+    fake = Ex(data, 500)
+    monkeypatch.setattr(runner, "make_exchange", lambda *a, **k: fake)
+    cfg.update(state_dir=str(tmp_path / "state"), log_dir=str(tmp_path / "logs"))
+    _scan_cfg(cfg)
+    cfg["strategy"]["funding_max"] = 0.0005
+    seen = {}
+    monkeypatch.setattr(Trader, "on_candle", lambda self, candles, now=None, htf=None: seen.setdefault(self.symbol, candles))
+    r = runner.ScanRunner(cfg, live=False)
+    assert r.funding_rates() == {"C0/USDT:USDT": 0.0007}
+    r.scan(next(iter(data.values())).index[500] + pd.Timedelta(seconds=30))
+    assert seen["C0/USDT:USDT"]["funding"].iloc[-1] == 0.0007
+    assert "funding" not in seen["C1/USDT:USDT"]
+    fake.fetch_funding_rates = lambda symbols=None: (_ for _ in ()).throw(RuntimeError("down"))
+    assert r.funding_rates() == {}                                    # failure: filter skipped, no crash
+
+
 def test_api_rejection_is_reported_with_ip_and_the_bot_keeps_going(cfg, tmp_path, monkeypatch):
     import ccxt
     from cryptobot import runner

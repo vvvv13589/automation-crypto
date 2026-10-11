@@ -292,7 +292,7 @@ class BreakoutStrategy:
     of 45 parameter combinations on BTC/ETH/SOL. Modest returns, ~20% drawdowns.
     """
 
-    COLUMNS = ("close", "atr", "dc_hi", "dc_lo", "vol_ratio", "ema_long", "ret_30d", "atr_ratio")
+    COLUMNS = ("close", "atr", "dc_hi", "dc_lo", "vol_ratio", "ema_long", "ret_30d", "atr_ratio", "funding")
     htf_timeframe = None
 
     def __init__(self, params: dict):
@@ -324,7 +324,17 @@ class BreakoutStrategy:
         out["ret_30d"] = out["close"] / out["close"].shift(lb) - 1
         atr_pct = out["atr"] / out["close"]
         out["atr_ratio"] = atr_pct / atr_pct.rolling(lb, min_periods=lb // 2).median()
+        if "funding" not in out:  # live: the scanner attaches the current funding rate; else unknown
+            out["funding"] = np.nan
         return out
+
+    def _funding_ok(self, cols: dict, i: int, side: str) -> bool:
+        """Skip crowded trades: no long while funding is above +funding_max, no short below -funding_max."""
+        limit = float(self.p.get("funding_max", 0) or 0)
+        f = cols["funding"][i]
+        if not limit or f != f:  # filter off, or funding unknown (NaN)
+            return True
+        return f <= limit if side == LONG else f >= -limit
 
     def describe(self, cols: dict, i: int, side: str) -> str:
         """Plain-language market context for the Telegram entry message (facts, not forecasts)."""
@@ -380,9 +390,13 @@ class BreakoutStrategy:
         long_ok = not coin_filter or (ema == ema and close > ema)
         short_ok = not coin_filter or (ema == ema and close < ema)
         if close > cols["dc_hi"][i] and self.p.get("allow_long", True) and long_ok:
+            if not self._funding_ok(cols, i, LONG):
+                return Decision(HOLD, TREND, "funding too high: longs crowded")
             return Decision(ENTER, TREND, "📝 行情：\n" + self.describe(cols, i, LONG),
                             side=LONG, stop_price=close - dist)
         if close < cols["dc_lo"][i] and self.p.get("allow_short", True) and short_ok:
+            if not self._funding_ok(cols, i, SHORT):
+                return Decision(HOLD, TREND, "funding too negative: shorts crowded")
             return Decision(ENTER, TREND, "📝 行情：\n" + self.describe(cols, i, SHORT),
                             side=SHORT, stop_price=close + dist)
         return Decision(HOLD, TREND, "inside channel")
