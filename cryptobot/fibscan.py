@@ -79,6 +79,31 @@ def fmt(x: float) -> str:
     return f"{x:.6g}"
 
 
+def suggested_leverage(close: float, stop: float, cap: int = 5) -> int:
+    """At most `cap`, and low enough that isolated liquidation lies beyond the stop
+    (stop distance + 1.5% maintenance/buffer must stay under 1 / leverage)."""
+    dist = abs(stop - close) / close
+    return max(1, min(cap, int(1 / (dist + 0.015))))
+
+
+def order_steps(s: FibSetup, equity: float | None, risk: float) -> list[str]:
+    """Plain Binance-app steps for one signal (short at market with attached TP/SL)."""
+    name = s.symbol.split("/")[0]
+    r = s.stop - s.close
+    lev = suggested_leverage(s.close, s.stop)
+    steps = [f"    下單：合約 → U本位 → {name}USDT → 逐倉 → 槓桿 {lev} 倍 → 市價 →"]
+    if equity and r > 0:
+        qty = equity * risk / r
+        notional = qty * s.close
+        steps.append(f"          數量 {fmt(qty)} 顆（約 {notional:.0f} U，保證金約 {notional / lev:.1f} U）")
+        steps.append(f"          最多虧約 {equity * risk:.1f} U（帳戶 {risk * 100:g}%）")
+    else:
+        steps.append(f"          數量 = 願意虧的 U ÷ {fmt(r)}（每顆碰到停損會虧 {fmt(r)} U）")
+    steps.append(f"          勾選止盈止損：止盈 {fmt(s.take_profit)}、止損 {fmt(s.stop)}（觸發選標記價格）→ 賣出／開空")
+    steps.append(f"          下單後到「持倉」確認止損有掛上；現價若已低於 {fmt(s.close * 0.97)}（跌超過 3%）就放棄這筆")
+    return steps
+
+
 def build_message(setups: list[FibSetup], equity: float | None = None, risk: float = 0.015,
                   date: str = "") -> str:
     signals = sorted((s for s in setups if s.signal), key=lambda s: -s.touches)
@@ -88,13 +113,10 @@ def build_message(setups: list[FibSetup], equity: float | None = None, risk: flo
         lines.append("✅ 符合條件（第 2 次以上被壓回、日線收盤確認）：")
         for s in signals:
             name = s.symbol.split("/")[0]
-            r = s.stop - s.close
-            size = ""
-            if equity and r > 0:
-                qty = equity * risk / r
-                size = f"｜{risk * 100:g}% 風險 ≈ {fmt(qty)} 顆（名目 {qty * s.close:.0f} U）"
-            lines.append(f"  • {name} {s.level:g} 線 {fmt(s.price)}（第 {s.touches} 次）收 {fmt(s.close)}"
-                         f"｜停損 {fmt(s.stop)}｜止盈 3R {fmt(s.take_profit)}{size}")
+            lines.append(f"  • {name} {s.level:g} 線 {fmt(s.price)}（第 {s.touches} 次被壓回）收 {fmt(s.close)}"
+                         f"｜停損 {fmt(s.stop)}｜止盈 3R {fmt(s.take_profit)}")
+            lines += order_steps(s, equity, risk)
+        lines.append("同時最多做 2–3 筆訊號單；照算好的數量下，不要加大。")
     else:
         lines.append("今天沒有符合條件的訊號。沒有訊號就不用下單 🙂")
     if watch:

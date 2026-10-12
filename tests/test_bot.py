@@ -1028,6 +1028,10 @@ def test_fib_scan_flags_second_rejection_and_watchlist():
     assert s.stop > s.price and s.take_profit == pytest.approx(s.close - 3 * (s.stop - s.close))
     msg = build_message(sig, equity=300, risk=0.015)
     assert "ABC 0.382 線" in msg and "第 2 次" in msg and "停損" in msg
+    assert "ABCUSDT → 逐倉 → 槓桿" in msg and "最多虧約 4.5 U" in msg and "賣出／開空" in msg
+    from cryptobot.fibscan import suggested_leverage
+    assert suggested_leverage(100, 101) == 5 and suggested_leverage(100, 120) == 4   # 20% stop -> 4x
+    assert "數量 = 願意虧的 U" in build_message(sig)                              # no balance known
     near = analyze(_fib_series(68.0, 67.5), "ABC/USDT:USDT")   # close 2.3% under the level, no touch
     n = next(x for x in near if x.level == 0.382)
     assert n.near and not n.signal and n.touches == 2           # it would be the 2nd rejection
