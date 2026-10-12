@@ -1008,6 +1008,36 @@ def test_target_locks_in_profit_then_trades_defensively(cfg, tmp_path):
     assert sc2.defensive and sc2.risk.p["risk_per_trade"] == 0.005
 
 
+def _fib_series(last_high, last_close):
+    """60 days up to 100, 60 days down to 50, a rally that is rejected at the 0.382 level
+    (about 69) on day 165, then the last candle with the given high/close."""
+    close = np.concatenate([np.linspace(60, 100, 60), np.linspace(100, 50, 60), np.linspace(50, 65, 41),
+                            np.full(19, 65.0)])
+    high, low = close + 0.5, close - 0.5
+    high[165], close[165] = 69.2, 67.0
+    high[-1], close[-1] = last_high, last_close
+    idx = pd.date_range("2025-01-01", periods=len(close), freq="D", tz="UTC")
+    return pd.DataFrame({"open": close, "high": high, "low": low, "close": close}, index=idx)
+
+
+def test_fib_scan_flags_second_rejection_and_watchlist():
+    from cryptobot.fibscan import analyze, build_message
+    sig = analyze(_fib_series(69.3, 67.5), "ABC/USDT:USDT")
+    s = next(x for x in sig if x.level == 0.382)
+    assert s.signal and s.touches == 2 and s.price == pytest.approx(49.5 + 0.382 * (100.5 - 49.5))
+    assert s.stop > s.price and s.take_profit == pytest.approx(s.close - 3 * (s.stop - s.close))
+    msg = build_message(sig, equity=300, risk=0.015)
+    assert "ABC 0.382 線" in msg and "第 2 次" in msg and "停損" in msg
+    near = analyze(_fib_series(68.0, 67.5), "ABC/USDT:USDT")   # close 2.3% under the level, no touch
+    n = next(x for x in near if x.level == 0.382)
+    assert n.near and not n.signal and n.touches == 2           # it would be the 2nd rejection
+    assert "觀察中" in build_message(near) and "沒有符合條件" in build_message(near)
+    first = _fib_series(69.3, 67.5)
+    first.loc[first.index[165], ["high", "close"]] = [66.0, 65.5]  # no earlier rejection
+    f1 = next(x for x in analyze(first, "ABC/USDT:USDT") if x.level == 0.382)
+    assert not f1.signal and f1.touches == 1                    # 1st touch is not a signal
+
+
 def test_funding_filter_skips_crowded_breakouts(cfg):
     from cryptobot.strategy import HOLD, BreakoutStrategy
     n = 80

@@ -219,6 +219,9 @@ def main(argv=None) -> int:
     st.add_argument("--send", action="store_true", help="also send it to Telegram")
     rr = sub.add_parser("reset-risk", help="after a withdrawal: restart drawdown tracking from the current balance")
     rr.add_argument("--live", action="store_true", help="reset the live scanner (default: paper)")
+    fs = sub.add_parser("fib-scan", help="daily Fibonacci-rejection short watchlist (alerts only)")
+    fs.add_argument("--send", action="store_true", help="also send it to Telegram")
+    fs.add_argument("--risk", type=float, default=0.015, help="risk per trade used for the size hint")
     live = sub.add_parser("live", help="REAL trading with real funds")
     live.add_argument("--confirm-live", action="store_true", help="required: I accept the risk")
 
@@ -281,6 +284,32 @@ def main(argv=None) -> int:
         print(text)
         if args.send:
             n = make_notifier(cfg, mode, label="[掃描]")
+            if n:
+                n(text)
+        return 0
+    if args.command == "fib-scan":
+        import os
+        from datetime import datetime, timezone
+
+        from .data import fetch_recent, make_exchange
+        from .fibscan import build_message, scan
+        from .notify import make_notifier
+        from .scanner import DEFAULT_UNIVERSE
+        ex = make_exchange(cfg)
+        ex.load_markets()
+        symbols = [f"{c}/USDT:USDT" for c in DEFAULT_UNIVERSE if f"{c}/USDT:USDT" in ex.markets]
+        equity = None
+        if os.getenv("EXCHANGE_API_KEY"):  # size hint from the futures account; optional
+            try:
+                acct = make_exchange(cfg, os.getenv("EXCHANGE_API_KEY"), os.getenv("EXCHANGE_API_SECRET"))
+                equity = float(acct.fetch_balance()["info"]["totalMarginBalance"])
+            except Exception:
+                equity = None
+        text = build_message(scan(ex, symbols, fetch_recent), equity, args.risk,
+                             datetime.now(timezone.utc).strftime("%m/%d"))
+        print(text)
+        if args.send:
+            n = make_notifier(cfg, "live", label="[回撤]")
             if n:
                 n(text)
         return 0
