@@ -98,55 +98,63 @@ def qty_fmt(q: float) -> str:
     return f"{np.floor(q / step + 1e-9) * step:.{max(digits, 0)}f}"
 
 
-def signal_message(n: int, total: int, s: FibSetup, equity: float | None, risk: float,
-                   margin: float | None = None, leverage: int | None = None) -> str:
-    """One self-contained Telegram message: why, then numbered Binance-app steps with the exact values.
+def order_lines(name: str, entry: float, stop: float, take_profit: float, equity: float | None,
+                risk: float, margin: float | None, leverage: int | None,
+                abandon_below: float, abandon_above: float) -> list[str]:
+    """Numbered Binance-app steps for a market short with attached TP/SL, and the loss at the stop.
     Sizing: by risk (equity x risk lost at the stop), or, when ``margin``/``leverage`` are given, a
     fixed cross-margin position of margin x leverage, with the real loss at the stop spelled out."""
-    name = s.symbol.split("/")[0]
-    r = s.stop - s.close
+    r = stop - entry
     fixed = bool(margin and leverage)
-    lev = int(leverage) if fixed else suggested_leverage(s.close, s.stop)
-    lines = [f"📉 訊號 {n}／{total}：{name} 做空",
-             f"第 {s.touches} 次碰到 {s.level:g} 回撤線（{fmt(s.price)}）被壓回",
-             f"昨天收盤：{fmt(s.close)}",
-             "",
-             "【幣安 App 下單步驟】",
+    lev = int(leverage) if fixed else suggested_leverage(entry, stop)
+    lines = ["【幣安 App 下單步驟】",
              f"1️⃣ 合約 → U本位 → 搜尋 {name}USDT",
              f"2️⃣ 保證金選「{'全倉' if fixed else '逐倉'}」，槓桿調成 {lev}x",
              "3️⃣ 下單方式選「市價」"]
     loss = None
     if fixed:
         notional = margin * lev
-        qty = notional / s.close
+        qty = notional / entry
         loss = qty * r + 0.0005 * notional * 2
         lines += [f"4️⃣ 數量輸入：{qty_fmt(qty)}（單位選 {name}）",
                   f"     ＝ 部位約 {notional:.0f} U（保證金 {margin:g} U × {lev} 倍）",
                   "     （App 說數量格式不對的話，改成稍微小一點的數字就好，不要往大填）"]
     elif equity and r > 0:
         qty = equity * risk / r
-        notional = qty * s.close
+        notional = qty * entry
         lines += [f"4️⃣ 數量輸入：{qty_fmt(qty)}（單位選 {name}）",
                   f"     ＝ 約 {notional:.0f} U，保證金約 {notional / lev:.1f} U",
                   "     （App 說數量格式不對的話，改成稍微小一點的數字就好，不要往大填）"]
     else:
         lines += [f"4️⃣ 數量 = 願意虧的 U ÷ {fmt(r)}"]
     lines += ["5️⃣ 勾選「止盈／止損」，觸發選「標記價格」",
-              f"     止盈：{fmt(s.take_profit)}",
-              f"     止損：{fmt(s.stop)}",
+              f"     止盈：{fmt(take_profit)}",
+              f"     止損：{fmt(stop)}",
               "6️⃣ 按紅色的「賣出／做空」",
-              f"7️⃣ 到「持倉」確認有看到止損 {fmt(s.stop)}",
+              f"7️⃣ 到「持倉」確認有看到止損 {fmt(stop)}",
               "",
               "⚠️ 下單前先看現價：",
-              f"・低於 {fmt(s.close * 0.97)} → 已經跌太多，這筆放棄",
-              f"・高於 {fmt(s.price)} → 已經站回線上，這筆放棄"]
+              f"・低於 {fmt(abandon_below)} → 已經跌太多，這筆放棄",
+              f"・高於 {fmt(abandon_above)} → 已經站回線上，這筆放棄"]
     if fixed:
         pct = f"（帳戶 {loss / equity * 100:.0f}%）" if equity else ""
         lines += [f"❗ 碰到停損會虧約 {loss:.1f} U{pct}，不是 {margin:g} U",
                   "❗ 全倉不會很快爆倉，但沒掛停損的話，虧損會一直擴大到吃掉整個帳戶，止損一定要掛"]
     elif equity and r > 0:
         lines.append(f"碰到停損最多虧約 {equity * risk:.1f} U（帳戶 {risk * 100:g}%）")
-    return "\n".join(lines)
+    return lines
+
+
+def signal_message(n: int, total: int, s: FibSetup, equity: float | None, risk: float,
+                   margin: float | None = None, leverage: int | None = None) -> str:
+    """One self-contained Telegram message: why, then numbered Binance-app steps with the exact values."""
+    name = s.symbol.split("/")[0]
+    head = [f"📉 訊號 {n}／{total}：{name} 做空",
+            f"第 {s.touches} 次碰到 {s.level:g} 回撤線（{fmt(s.price)}）被壓回",
+            f"昨天收盤：{fmt(s.close)}",
+            ""]
+    return "\n".join(head + order_lines(name, s.close, s.stop, s.take_profit, equity, risk, margin, leverage,
+                                        s.close * 0.97, s.price))
 
 
 def build_messages(setups: list[FibSetup], equity: float | None = None, risk: float = 0.015,

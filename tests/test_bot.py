@@ -1060,6 +1060,36 @@ def test_fib_messages_are_split_and_capped():
     assert f"碰到停損會虧約 {loss:.1f} U" in cross and "不是 10 U" in cross
 
 
+def _pa_hourly(push_vol=300.0, mid_close=99.0, confirm_vol=200.0):
+    """60 quiet 1h candles around 95 (volume 100), then a push into the 100 level, a pause, a confirm."""
+    n = 60
+    close = np.full(n, 95.0)
+    open_ = np.full(n, 95.0)
+    high, low, vol = close + 0.5, close - 0.5, np.full(n, 100.0)
+    open_[-3], close[-3], high[-3], low[-3], vol[-3] = 97.0, 99.5, 100.2, 96.8, push_vol   # push
+    open_[-2], close[-2], high[-2], low[-2], vol[-2] = 99.5, mid_close, 99.8, 98.8, 100.0  # pause
+    open_[-1], close[-1], high[-1], low[-1], vol[-1] = 99.0, 96.5, 99.2, 96.3, confirm_vol  # confirm
+    idx = pd.date_range("2026-10-01", periods=n, freq="h", tz="UTC")
+    return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close, "volume": vol}, index=idx)
+
+
+def test_fib_price_action_alert(tmp_path):
+    from cryptobot.fibpa import PASignal, daily_levels, detect, message, unseen
+    lv = {lvl: (f, touches) for lvl, f, touches in daily_levels(_fib_series(69.3, 67.5))}
+    assert lv[0.382][1] == 2                                     # two daily rejections so far
+    hit = detect(_pa_hourly(), 100.0)
+    assert hit and hit["entry"] == 96.5 and 100.2 < hit["stop"] < 101
+    assert hit["take_profit"] == pytest.approx(96.5 - 3 * (hit["stop"] - 96.5))
+    assert detect(_pa_hourly(push_vol=150.0), 100.0) is None    # push without volume: no signal
+    assert detect(_pa_hourly(confirm_vol=120.0), 100.0) is None # confirm without volume: no signal
+    assert detect(_pa_hourly(mid_close=100.8), 100.0) is None   # closed back above the level
+    s = PASignal("ABC/USDT:USDT", 0.382, 100.0, 1, hit["push_time"], hit["entry"], hit["stop"], hit["take_profit"])
+    text = message(s, equity=350, risk=0.015, margin=10, leverage=20)
+    assert "價格行為訊號：ABC 做空" in text and "全倉" in text and "停損距離" in text and "止損" in text
+    state = str(tmp_path / "seen.json")
+    assert len(unseen([s], state)) == 1 and unseen([s], state) == []   # alerted once only
+
+
 def test_funding_filter_skips_crowded_breakouts(cfg):
     from cryptobot.strategy import HOLD, BreakoutStrategy
     n = 80

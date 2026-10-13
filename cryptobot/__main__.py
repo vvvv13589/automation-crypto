@@ -224,6 +224,11 @@ def main(argv=None) -> int:
     fs.add_argument("--risk", type=float, default=0.015, help="risk per trade used for the size hint")
     fs.add_argument("--margin", type=float, default=None, help="fixed cross margin per signal in USDT (with --leverage)")
     fs.add_argument("--leverage", type=int, default=None, help="leverage for --margin sizing")
+    fp = sub.add_parser("fib-pa", help="hourly price-action short alert at daily Fibonacci resistance")
+    fp.add_argument("--send", action="store_true", help="send new signals to Telegram")
+    fp.add_argument("--risk", type=float, default=0.015)
+    fp.add_argument("--margin", type=float, default=None)
+    fp.add_argument("--leverage", type=int, default=None)
     live = sub.add_parser("live", help="REAL trading with real funds")
     live.add_argument("--confirm-live", action="store_true", help="required: I accept the risk")
 
@@ -314,6 +319,34 @@ def main(argv=None) -> int:
             n = make_notifier(cfg, "live", label="[回撤]")
             if n:
                 for m in msgs:  # one Telegram message each, easier to read and follow
+                    n(m)
+        return 0
+    if args.command == "fib-pa":
+        import os
+        from pathlib import Path
+
+        from .data import fetch_recent, make_exchange
+        from .fibpa import message, scan, unseen
+        from .notify import make_notifier
+        from .scanner import DEFAULT_UNIVERSE
+        ex = make_exchange(cfg)
+        ex.load_markets()
+        symbols = [f"{c}/USDT:USDT" for c in DEFAULT_UNIVERSE if f"{c}/USDT:USDT" in ex.markets]
+        signals = scan(ex, symbols, fetch_recent)
+        fresh = unseen(signals, str(Path(cfg["state_dir"]) / "fibpa_alerts.json")) if args.send else signals
+        equity = None
+        if fresh and os.getenv("EXCHANGE_API_KEY"):
+            try:
+                acct = make_exchange(cfg, os.getenv("EXCHANGE_API_KEY"), os.getenv("EXCHANGE_API_SECRET"))
+                equity = float(acct.fetch_balance()["info"]["totalMarginBalance"])
+            except Exception:
+                equity = None
+        msgs = [message(s, equity, args.risk, args.margin, args.leverage) for s in fresh]
+        print("\n\n".join(msgs) if msgs else f"no new price-action signal ({len(signals)} active)")
+        if args.send and msgs:
+            n = make_notifier(cfg, "live", label="[價格行為]")
+            if n:
+                for m in msgs:
                     n(m)
         return 0
     if args.command == "reset-risk":
