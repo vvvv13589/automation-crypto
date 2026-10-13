@@ -1027,8 +1027,8 @@ def test_fib_scan_flags_second_rejection_and_watchlist():
     assert s.signal and s.touches == 2 and s.price == pytest.approx(49.5 + 0.382 * (100.5 - 49.5))
     assert s.stop > s.price and s.take_profit == pytest.approx(s.close - 3 * (s.stop - s.close))
     msg = build_message(sig, equity=300, risk=0.015)
-    assert "ABC 0.382 線" in msg and "第 2 次" in msg and "停損" in msg
-    assert "ABCUSDT → 逐倉 → 槓桿" in msg and "最多虧約 4.5 U" in msg and "賣出／開空" in msg
+    assert "ABC 做空" in msg and "0.382 回撤線" in msg and "第 2 次" in msg and "停損" in msg
+    assert "搜尋 ABCUSDT" in msg and "逐倉" in msg and "最多虧約 4.5 U" in msg and "賣出／做空" in msg
     from cryptobot.fibscan import suggested_leverage
     assert suggested_leverage(100, 101) == 5 and suggested_leverage(100, 120) == 4   # 20% stop -> 4x
     assert "數量 = 願意虧的 U" in build_message(sig)                              # no balance known
@@ -1040,6 +1040,20 @@ def test_fib_scan_flags_second_rejection_and_watchlist():
     first.loc[first.index[165], ["high", "close"]] = [66.0, 65.5]  # no earlier rejection
     f1 = next(x for x in analyze(first, "ABC/USDT:USDT") if x.level == 0.382)
     assert not f1.signal and f1.touches == 1                    # 1st touch is not a signal
+
+
+def test_fib_messages_are_split_and_capped():
+    import dataclasses
+    from cryptobot.fibscan import MAX_SIGNALS, analyze, build_messages, qty_fmt
+    base = next(x for x in analyze(_fib_series(69.3, 67.5), "ABC/USDT:USDT") if x.level == 0.382)
+    many = [dataclasses.replace(base, symbol=f"C{i}/USDT:USDT", touches=2 + i) for i in range(5)]
+    msgs = build_messages(many, equity=300)
+    assert len(msgs) == 1 + MAX_SIGNALS                          # summary + 3 signals, no watchlist
+    assert "共 5 個，只列出最強的 3 個" in msgs[0]
+    assert msgs[1].startswith("📉 訊號 1／3：C4 做空")           # most rejections first
+    assert all("1️⃣" in m and "7️⃣" in m for m in msgs[1:])
+    assert qty_fmt(0.1392) == "0.139" and qty_fmt(1156.88) == "1150" and qty_fmt(62.8063) == "62.8"
+    assert len(build_messages([])) == 1 and "不用下單" in build_messages([])[0]
 
 
 def test_funding_filter_skips_crowded_breakouts(cfg):

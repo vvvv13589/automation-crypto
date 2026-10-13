@@ -292,7 +292,7 @@ def main(argv=None) -> int:
         from datetime import datetime, timezone
 
         from .data import fetch_recent, make_exchange
-        from .fibscan import build_message, scan
+        from .fibscan import build_messages, scan
         from .notify import make_notifier
         from .scanner import DEFAULT_UNIVERSE
         ex = make_exchange(cfg)
@@ -305,13 +305,14 @@ def main(argv=None) -> int:
                 equity = float(acct.fetch_balance()["info"]["totalMarginBalance"])
             except Exception:
                 equity = None
-        text = build_message(scan(ex, symbols, fetch_recent), equity, args.risk,
-                             datetime.now(timezone.utc).strftime("%m/%d"))
-        print(text)
+        msgs = build_messages(scan(ex, symbols, fetch_recent), equity, args.risk,
+                              datetime.now(timezone.utc).strftime("%m/%d"))
+        print("\n\n".join(msgs))
         if args.send:
             n = make_notifier(cfg, "live", label="[回撤]")
             if n:
-                n(text)
+                for m in msgs:  # one Telegram message each, easier to read and follow
+                    n(m)
         return 0
     if args.command == "reset-risk":
         import json

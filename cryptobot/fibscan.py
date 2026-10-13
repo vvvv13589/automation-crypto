@@ -86,47 +86,83 @@ def suggested_leverage(close: float, stop: float, cap: int = 5) -> int:
     return max(1, min(cap, int(1 / (dist + 0.015))))
 
 
-def order_steps(s: FibSetup, equity: float | None, risk: float) -> list[str]:
-    """Plain Binance-app steps for one signal (short at market with attached TP/SL)."""
+MAX_SIGNALS = 3  # same-direction setups move together: never suggest more than this per day
+
+
+def qty_fmt(q: float) -> str:
+    """Round a quantity DOWN to 3 significant digits (never suggest more than the risk allows)."""
+    if q <= 0:
+        return "0"
+    digits = 2 - int(np.floor(np.log10(q)))
+    step = 10.0 ** -digits
+    return f"{np.floor(q / step + 1e-9) * step:.{max(digits, 0)}f}"
+
+
+def signal_message(n: int, total: int, s: FibSetup, equity: float | None, risk: float) -> str:
+    """One self-contained Telegram message: why, then numbered Binance-app steps with the exact values."""
     name = s.symbol.split("/")[0]
     r = s.stop - s.close
     lev = suggested_leverage(s.close, s.stop)
-    steps = [f"    下單：合約 → U本位 → {name}USDT → 逐倉 → 槓桿 {lev} 倍 → 市價 →"]
+    lines = [f"📉 訊號 {n}／{total}：{name} 做空",
+             f"第 {s.touches} 次碰到 {s.level:g} 回撤線（{fmt(s.price)}）被壓回",
+             f"昨天收盤：{fmt(s.close)}",
+             "",
+             "【幣安 App 下單步驟】",
+             f"1️⃣ 合約 → U本位 → 搜尋 {name}USDT",
+             f"2️⃣ 保證金選「逐倉」，槓桿調成 {lev}x",
+             "3️⃣ 下單方式選「市價」"]
     if equity and r > 0:
         qty = equity * risk / r
         notional = qty * s.close
-        steps.append(f"          數量 {fmt(qty)} 顆（約 {notional:.0f} U，保證金約 {notional / lev:.1f} U）")
-        steps.append(f"          最多虧約 {equity * risk:.1f} U（帳戶 {risk * 100:g}%）")
+        lines += [f"4️⃣ 數量輸入：{qty_fmt(qty)}（單位選 {name}）",
+                  f"     ＝ 約 {notional:.0f} U，保證金約 {notional / lev:.1f} U",
+                  "     （App 說數量格式不對的話，改成稍微小一點的數字就好，不要往大填）"]
     else:
-        steps.append(f"          數量 = 願意虧的 U ÷ {fmt(r)}（每顆碰到停損會虧 {fmt(r)} U）")
-    steps.append(f"          勾選止盈止損：止盈 {fmt(s.take_profit)}、止損 {fmt(s.stop)}（觸發選標記價格）→ 賣出／開空")
-    steps.append(f"          下單後到「持倉」確認止損有掛上；現價若已低於 {fmt(s.close * 0.97)}（跌超過 3%）就放棄這筆")
-    return steps
+        lines += [f"4️⃣ 數量 = 願意虧的 U ÷ {fmt(r)}"]
+    lines += ["5️⃣ 勾選「止盈／止損」，觸發選「標記價格」",
+              f"     止盈：{fmt(s.take_profit)}",
+              f"     止損：{fmt(s.stop)}",
+              "6️⃣ 按紅色的「賣出／做空」",
+              f"7️⃣ 到「持倉」確認有看到止損 {fmt(s.stop)}",
+              "",
+              "⚠️ 下單前先看現價：",
+              f"・低於 {fmt(s.close * 0.97)} → 已經跌太多，這筆放棄",
+              f"・高於 {fmt(s.price)} → 已經站回線上，這筆放棄"]
+    if equity and r > 0:
+        lines.append(f"碰到停損最多虧約 {equity * risk:.1f} U（帳戶 {risk * 100:g}%）")
+    return "\n".join(lines)
+
+
+def build_messages(setups: list[FibSetup], equity: float | None = None, risk: float = 0.015,
+                   date: str = "") -> list[str]:
+    """Separate Telegram messages: a summary, one per signal (strongest first, at most
+    MAX_SIGNALS), and the watchlist."""
+    signals = sorted((s for s in setups if s.signal), key=lambda s: (-s.touches, s.level))
+    watch = sorted((s for s in setups if s.near), key=lambda s: s.price / s.close)
+    picked = signals[:MAX_SIGNALS]
+    if picked:
+        names = "、".join(s.symbol.split("/")[0] for s in picked)
+        extra = f"（共 {len(signals)} 個，只列出最強的 {len(picked)} 個）" if len(signals) > len(picked) else ""
+        head = [f"📐 今日回撤掃描 {date}", f"✅ 有 {len(picked)} 個做空訊號：{names}{extra}",
+                "同方向的單會一起漲跌，一天最多做 2–3 筆，照算好的數量下，不要加大。",
+                "不做也完全沒關係。"]
+    else:
+        head = [f"📐 今日回撤掃描 {date}", "今天沒有符合條件的訊號，不用下單 🙂"]
+    msgs = ["\n".join(head)]
+    msgs += [signal_message(i, len(picked), s, equity, risk) for i, s in enumerate(picked, 1)]
+    if watch:
+        lines = ["👀 觀察中（還沒被壓回，先不要下單）"]
+        for s in watch[:6]:
+            lines.append(f"・{s.symbol.split('/')[0]}：回撤線 {fmt(s.price)}，現在 {fmt(s.close)}"
+                         f"（差 {(s.price / s.close - 1) * 100:.1f}%）")
+        msgs.append("\n".join(lines))
+    return msgs
 
 
 def build_message(setups: list[FibSetup], equity: float | None = None, risk: float = 0.015,
                   date: str = "") -> str:
-    signals = sorted((s for s in setups if s.signal), key=lambda s: -s.touches)
-    watch = sorted((s for s in setups if s.near), key=lambda s: s.price / s.close)
-    lines = [f"📐 回撤壓力掃描 {date}（只做空・只提醒不下單）"]
-    if signals:
-        lines.append("✅ 符合條件（第 2 次以上被壓回、日線收盤確認）：")
-        for s in signals:
-            name = s.symbol.split("/")[0]
-            lines.append(f"  • {name} {s.level:g} 線 {fmt(s.price)}（第 {s.touches} 次被壓回）收 {fmt(s.close)}"
-                         f"｜停損 {fmt(s.stop)}｜止盈 3R {fmt(s.take_profit)}")
-            lines += order_steps(s, equity, risk)
-        lines.append("同時最多做 2–3 筆訊號單；照算好的數量下，不要加大。")
-    else:
-        lines.append("今天沒有符合條件的訊號。沒有訊號就不用下單 🙂")
-    if watch:
-        lines.append("👀 觀察中（收盤在回撤線下方 3% 內，還沒被壓回）：")
-        for s in watch[:10]:
-            name = s.symbol.split("/")[0]
-            lines.append(f"  • {name} {s.level:g} 線 {fmt(s.price)}，收 {fmt(s.close)}"
-                         f"（差 {(s.price / s.close - 1) * 100:.1f}%，若被壓回是第 {s.touches} 次）")
-    lines.append("規則：等日線收盤確認再進場，不要預掛單；停損 = 回撤線 + 1 ATR。")
-    return "\n".join(lines)
+    """All messages joined (for printing)."""
+    return "\n\n".join(build_messages(setups, equity, risk, date))
 
 
 def scan(exchange, symbols: list[str], fetch) -> list[FibSetup]:
