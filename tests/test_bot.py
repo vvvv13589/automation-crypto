@@ -1054,6 +1054,10 @@ def test_fib_messages_are_split_and_capped():
     assert all("1️⃣" in m and "7️⃣" in m for m in msgs[1:])
     assert qty_fmt(0.1392) == "0.139" and qty_fmt(1156.88) == "1150" and qty_fmt(62.8063) == "62.8"
     assert len(build_messages([])) == 1 and "不用下單" in build_messages([])[0]
+    cross = build_messages([base], equity=350, margin=10, leverage=20)[1]   # fixed 10 U x 20x, cross
+    assert "全倉" in cross and "20x" in cross and "部位約 200 U" in cross
+    loss = 200 / base.close * (base.stop - base.close) + 0.0005 * 200 * 2
+    assert f"碰到停損會虧約 {loss:.1f} U" in cross and "不是 10 U" in cross
 
 
 def test_funding_filter_skips_crowded_breakouts(cfg):

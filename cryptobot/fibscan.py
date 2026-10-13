@@ -98,20 +98,32 @@ def qty_fmt(q: float) -> str:
     return f"{np.floor(q / step + 1e-9) * step:.{max(digits, 0)}f}"
 
 
-def signal_message(n: int, total: int, s: FibSetup, equity: float | None, risk: float) -> str:
-    """One self-contained Telegram message: why, then numbered Binance-app steps with the exact values."""
+def signal_message(n: int, total: int, s: FibSetup, equity: float | None, risk: float,
+                   margin: float | None = None, leverage: int | None = None) -> str:
+    """One self-contained Telegram message: why, then numbered Binance-app steps with the exact values.
+    Sizing: by risk (equity x risk lost at the stop), or, when ``margin``/``leverage`` are given, a
+    fixed cross-margin position of margin x leverage, with the real loss at the stop spelled out."""
     name = s.symbol.split("/")[0]
     r = s.stop - s.close
-    lev = suggested_leverage(s.close, s.stop)
+    fixed = bool(margin and leverage)
+    lev = int(leverage) if fixed else suggested_leverage(s.close, s.stop)
     lines = [f"📉 訊號 {n}／{total}：{name} 做空",
              f"第 {s.touches} 次碰到 {s.level:g} 回撤線（{fmt(s.price)}）被壓回",
              f"昨天收盤：{fmt(s.close)}",
              "",
              "【幣安 App 下單步驟】",
              f"1️⃣ 合約 → U本位 → 搜尋 {name}USDT",
-             f"2️⃣ 保證金選「逐倉」，槓桿調成 {lev}x",
+             f"2️⃣ 保證金選「{'全倉' if fixed else '逐倉'}」，槓桿調成 {lev}x",
              "3️⃣ 下單方式選「市價」"]
-    if equity and r > 0:
+    loss = None
+    if fixed:
+        notional = margin * lev
+        qty = notional / s.close
+        loss = qty * r + 0.0005 * notional * 2
+        lines += [f"4️⃣ 數量輸入：{qty_fmt(qty)}（單位選 {name}）",
+                  f"     ＝ 部位約 {notional:.0f} U（保證金 {margin:g} U × {lev} 倍）",
+                  "     （App 說數量格式不對的話，改成稍微小一點的數字就好，不要往大填）"]
+    elif equity and r > 0:
         qty = equity * risk / r
         notional = qty * s.close
         lines += [f"4️⃣ 數量輸入：{qty_fmt(qty)}（單位選 {name}）",
@@ -128,13 +140,17 @@ def signal_message(n: int, total: int, s: FibSetup, equity: float | None, risk: 
               "⚠️ 下單前先看現價：",
               f"・低於 {fmt(s.close * 0.97)} → 已經跌太多，這筆放棄",
               f"・高於 {fmt(s.price)} → 已經站回線上，這筆放棄"]
-    if equity and r > 0:
+    if fixed:
+        pct = f"（帳戶 {loss / equity * 100:.0f}%）" if equity else ""
+        lines += [f"❗ 碰到停損會虧約 {loss:.1f} U{pct}，不是 {margin:g} U",
+                  "❗ 全倉不會很快爆倉，但沒掛停損的話，虧損會一直擴大到吃掉整個帳戶，止損一定要掛"]
+    elif equity and r > 0:
         lines.append(f"碰到停損最多虧約 {equity * risk:.1f} U（帳戶 {risk * 100:g}%）")
     return "\n".join(lines)
 
 
 def build_messages(setups: list[FibSetup], equity: float | None = None, risk: float = 0.015,
-                   date: str = "") -> list[str]:
+                   date: str = "", margin: float | None = None, leverage: int | None = None) -> list[str]:
     """Separate Telegram messages: a summary, one per signal (strongest first, at most
     MAX_SIGNALS), and the watchlist."""
     signals = sorted((s for s in setups if s.signal), key=lambda s: (-s.touches, s.level))
@@ -149,7 +165,7 @@ def build_messages(setups: list[FibSetup], equity: float | None = None, risk: fl
     else:
         head = [f"📐 今日回撤掃描 {date}", "今天沒有符合條件的訊號，不用下單 🙂"]
     msgs = ["\n".join(head)]
-    msgs += [signal_message(i, len(picked), s, equity, risk) for i, s in enumerate(picked, 1)]
+    msgs += [signal_message(i, len(picked), s, equity, risk, margin, leverage) for i, s in enumerate(picked, 1)]
     if watch:
         lines = ["👀 觀察中（還沒被壓回，先不要下單）"]
         for s in watch[:6]:
@@ -160,9 +176,9 @@ def build_messages(setups: list[FibSetup], equity: float | None = None, risk: fl
 
 
 def build_message(setups: list[FibSetup], equity: float | None = None, risk: float = 0.015,
-                  date: str = "") -> str:
+                  date: str = "", margin: float | None = None, leverage: int | None = None) -> str:
     """All messages joined (for printing)."""
-    return "\n\n".join(build_messages(setups, equity, risk, date))
+    return "\n\n".join(build_messages(setups, equity, risk, date, margin, leverage))
 
 
 def scan(exchange, symbols: list[str], fetch) -> list[FibSetup]:

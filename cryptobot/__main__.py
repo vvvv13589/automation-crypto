@@ -222,6 +222,8 @@ def main(argv=None) -> int:
     fs = sub.add_parser("fib-scan", help="daily Fibonacci-rejection short watchlist (alerts only)")
     fs.add_argument("--send", action="store_true", help="also send it to Telegram")
     fs.add_argument("--risk", type=float, default=0.015, help="risk per trade used for the size hint")
+    fs.add_argument("--margin", type=float, default=None, help="fixed cross margin per signal in USDT (with --leverage)")
+    fs.add_argument("--leverage", type=int, default=None, help="leverage for --margin sizing")
     live = sub.add_parser("live", help="REAL trading with real funds")
     live.add_argument("--confirm-live", action="store_true", help="required: I accept the risk")
 
@@ -306,7 +308,7 @@ def main(argv=None) -> int:
             except Exception:
                 equity = None
         msgs = build_messages(scan(ex, symbols, fetch_recent), equity, args.risk,
-                              datetime.now(timezone.utc).strftime("%m/%d"))
+                              datetime.now(timezone.utc).strftime("%m/%d"), args.margin, args.leverage)
         print("\n\n".join(msgs))
         if args.send:
             n = make_notifier(cfg, "live", label="[回撤]")
