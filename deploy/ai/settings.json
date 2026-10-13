@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": [
+      "Bash(python3 /opt/cryptobot-ai/market.py *)",
+      "Read(//var/lib/cryptobot-ai/work/**)",
+      "Read(//var/lib/cryptobot-ai/inbox/**)"
+    ],
+    "deny": [
+      "Read(//root/**)",
+      "Read(//etc/**)",
+      "Read(//proc/**)",
+      "Read(//home/**)",
+      "Read(//var/lib/cryptobot-ai/home/**)",
+      "Read(**/.env)",
+      "Edit",
+      "Write",
+      "NotebookEdit",
+      "WebFetch",
+      "WebSearch"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "autoAllowBashIfSandboxed": false,
+    "network": {
+      "allowedDomains": ["fapi.binance.com"]
+    },
+    "filesystem": {
+      "denyRead": ["/root", "/etc/cryptobot-butler", "/var/lib/cryptobot-ai/home"]
+    }
+  },
+  "env": {
+    "DISABLE_AUTOUPDATER": "1"
+  }
+}

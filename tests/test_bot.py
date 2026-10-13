@@ -751,7 +751,7 @@ def test_live_fill_reads_fee_from_trades():
     assert fill.fee == pytest.approx(200.0 * 0.0005)
 
 
-def test_telegram_status_command_and_scan_report(cfg, tmp_path, monkeypatch):
+def test_trading_bot_only_sends_and_reports_each_scan(cfg, tmp_path, monkeypatch):
     from cryptobot import runner
     from cryptobot.notify import Telegram
     data = {f"C{i}/USDT:USDT": synthetic(bars=600, timeframe="4h", seed=50 + i) for i in range(2)}
@@ -761,22 +761,13 @@ def test_telegram_status_command_and_scan_report(cfg, tmp_path, monkeypatch):
     _scan_cfg(cfg)
 
     tg = Telegram("TOKEN", "42")
-    sent, inbox = [], [[{"update_id": 7, "message": {"chat": {"id": 42}, "text": "/status"}}]]
+    sent = []
     tg.send = sent.append
-    tg._get_updates = lambda offset: inbox.pop(0) if inbox else []
     r = runner.ScanRunner(cfg, live=False)
     r.notify = tg
+    # the butler is the only getUpdates consumer: the trading bot has no way to poll
+    assert not hasattr(tg, "poll_commands") and not hasattr(r, "answer_commands")
 
-    r.answer_commands(pd.Timestamp("2024-03-01T01:00Z"))
-    assert sent == []                                   # backlog before start-up is ignored
-    inbox.append([{"update_id": 8, "message": {"chat": {"id": 999}, "text": "/status"}},   # stranger
-                  {"update_id": 9, "message": {"chat": {"id": 42}, "text": "/status"}}])
-    r._last_poll = 0
-    r.answer_commands(pd.Timestamp("2024-03-01T01:00Z"))
-    assert len(sent) == 1 and "即時狀態" in sent[0] and "帳戶總額" in sent[0]
-    assert tg._offset == 10
-
-    sent.clear()
     r.scan(pd.Timestamp(next(iter(data.values())).index[500]) + pd.Timedelta(seconds=30))
     assert any("掃描完成" in m for m in sent)
 

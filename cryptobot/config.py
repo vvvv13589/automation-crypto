@@ -44,7 +44,7 @@ DEFAULTS: dict = {
         "telegram": True,
         "daily_report": "09:00",  # daily Telegram status (local time); "" = off
         "scan_report": True,  # short Telegram update after every 4h scan
-        # Telegram "/status" always replies with the current positions
+        # Telegram commands (/status ...) are answered by the butler: python -m cryptobot butler
         "timezone": "Asia/Taipei",
     },
     "scanner": {
@@ -58,6 +58,11 @@ DEFAULTS: dict = {
         "settle_seconds": 20,  # wait after a candle closes before fetching it
         "exclude": [],  # base assets to never trade, e.g. ["PEPE"]
     },  # needs TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in .env
+    "butler": {  # Telegram butler AI chat (Claude Code on the user's subscription)
+        "model": "sonnet",
+        "idle_hours": 2,  # a new conversation starts after this long without messages
+        "max_turns": 10,  # tool steps per answer (keeps subscription usage down)
+    },
     "goals": {
         "base_capital": 0,  # your stake in USDT; 0 = no milestone alerts
         "double_alert": True,  # Telegram when the account doubles: take the stake out

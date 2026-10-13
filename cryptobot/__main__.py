@@ -229,7 +229,8 @@ def main(argv=None) -> int:
     fp.add_argument("--risk", type=float, default=0.015)
     fp.add_argument("--margin", type=float, default=None)
     fp.add_argument("--leverage", type=int, default=None)
-    live = sub.add_parser("live", help="REAL trading with real funds")
+    sub.add_parser("butler", help="Telegram butler: answers commands and AI chat (the only Telegram reader)")
+    live =sub.add_parser("live", help="REAL trading with real funds")
     live.add_argument("--confirm-live", action="store_true", help="required: I accept the risk")
 
     args = parser.parse_args(argv)
@@ -263,6 +264,11 @@ def main(argv=None) -> int:
         return cmd_optimize(cfg, args)
     if args.command == "scan-backtest":
         return cmd_scan_backtest(cfg, args)
+    if args.command == "butler":
+        import os
+
+        from .butler import main as butler_main
+        return butler_main(cfg, os.getcwd())
     if args.command == "status":
         import os
 

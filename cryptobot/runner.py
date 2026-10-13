@@ -366,22 +366,8 @@ class ScanRunner:
             self._last_bar = bar
         if self.reporter.due(now):
             self.send_report(now)
-        self.answer_commands(now)
-
-    def answer_commands(self, now) -> None:
-        """Telegram commands from your own chat: /status (or 狀態) replies with the current report."""
-        poll = getattr(self.notify, "poll_commands", None)
-        if poll is None or time.time() - getattr(self, "_last_poll", 0) < 10:
-            return
-        self._last_poll = time.time()
-        for text in poll():
-            cmd = text.split()[0].split("@")[0].lower()
-            if cmd in ("/status", "status", "狀態", "/狀態"):
-                from .report import build_report
-                self._say(build_report(self.scanner, self.exchange, self.cfg, self.mode, now,
-                                       title="📊 即時狀態", compact=True))
-            elif cmd in ("/help", "/start"):
-                self._say("可用指令：/status 查看目前持倉與餘額")
+        # Telegram commands are answered by the butler (python -m cryptobot butler), the only
+        # getUpdates consumer: the trading bot only sends.
 
     def send_report(self, now) -> str:
         from .report import build_report

@@ -1,0 +1,23 @@
+# Telegram 管家：唯一讀取 Telegram 訊息的程式（指令、AI 聊天），和交易機器人分開執行，
+# 交易機器人停止或當掉時仍可使用。安裝步驟見 deploy/setup-butler.sh
+[Unit]
+Description=automation-crypto Telegram butler
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/automation-crypto
+ExecStart=/usr/bin/python3 -m cryptobot butler
+Environment=PYTHONUNBUFFERED=1
+# CLAUDE_CODE_OAUTH_TOKEN=...（claude setup-token 產生，root 600；沒有這個檔時 AI 聊天停用）
+EnvironmentFile=-/etc/cryptobot-butler/claude.env
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

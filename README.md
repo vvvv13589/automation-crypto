@@ -137,6 +137,16 @@ sudo systemctl stop cryptobot       # 安全停止(持倉的交易所停損單�
 ```
 服務用系統的 `/usr/bin/python3`，套件請裝在系統層(`sudo pip install -r requirements.txt`)。
 
+### Telegram 管家(`python -m cryptobot butler`)
+和交易機器人分開的 systemd 服務 `cryptobot-telegram`，是唯一讀取 Telegram 訊息的程式（交易機器人只發通知），交易機器人停止或當掉時仍可使用。只回應 `TELEGRAM_CHAT_ID`，所有指令寫入 `logs/butler_audit.log`。
+- `/status`、`/ip`、`/scan`、`/new`、`/help`；一般文字或 K 線截圖交給 AI 分析
+- AI 是 VM 上的 Claude Code（使用者的訂閱，`claude setup-token` 產生的憑證放在 `/etc/cryptobot-butler/claude.env`），以無權限使用者 `butlerai` 執行：讀不到 `.env`、只能讀帳戶快照與設定、交易紀錄副本，只能執行 `deploy/ai/market.py` 查公開行情（Claude Code 權限白名單 + bubblewrap 沙盒，設定在 `deploy/ai/settings.json`）
+```bash
+sudo bash deploy/setup-butler.sh                 # 建立 butlerai、安裝 Claude Code 與沙盒、安裝服務
+sudo systemctl enable --now cryptobot-telegram
+journalctl -u cryptobot-telegram -f
+```
+
 模擬交易(paper)可以用 tmux 在前景跑：`tmux new -s paper`，執行 `python -m cryptobot paper`，Ctrl+B 再按 D 離開。
 
 ### 實盤前檢查清單
@@ -158,7 +168,9 @@ cryptobot/
   backtest.py    回測與績效統計
   optimize.py    參數搜尋 + 樣本外驗證
   runner.py      即時交易迴圈(斷線自動重試、與交易所持倉同步)
-  notify.py      Telegram 通知
+  notify.py      Telegram 通知(只發送)
+  butler.py      Telegram 管家：指令、帳戶快照、AI 聊天轉接
+  ai.py          AI 聊天(Claude Code 非互動模式、唯讀權限、對話記憶)
   indicators.py  EMA、RSI、ATR、ADX、布林通道
   data.py        K 線下載 / CSV / 模擬行情
 tests/           單元測試(含多空、當沖換日、資金費率、無未來函數檢查)
