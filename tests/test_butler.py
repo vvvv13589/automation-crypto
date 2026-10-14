@@ -293,7 +293,10 @@ def _chat(cfg, tmp_path, clock):
 def test_claude_is_called_read_only_with_a_minimal_environment(cfg, tmp_path):
     clock = [NOW]
     chat, fake = _chat(cfg, tmp_path, clock)
-    assert chat.ask("分析 BTC", snapshot={"time": "t", "positions": []}) == "好的"
+    snap = account_snapshot(FakeExchange(), {**cfg, "state_dir": str(tmp_path / "none")})
+    assert chat.ask("分析 BTC", snapshot=snap) == "好的"
+    # the current account goes into every prompt: a resumed chat never answers from an old snapshot
+    assert "以這份為準" in fake.calls[0][0][2] and "停損 84670.1（全部）" in fake.calls[0][0][2]
     cmd, kw = fake.calls[0]
     assert cmd[:3] == ["/bin/claude", "-p", cmd[2]] and "分析 BTC" in cmd[2]
     assert cmd[cmd.index("--tools") + 1] == "Read,Bash"
@@ -546,6 +549,55 @@ def test_help_replaces_the_old_reply_keyboard(cfg, tmp_path):
     b, tg, _ = _butler(cfg, tmp_path)
     b.cmd_help("")
     assert tg.keyboard_sent and "/stop BTC 84000" in tg.sent[-1]
+
+
+# ------------------------------------------------------------------ links
+def test_links_are_read_by_the_butler_and_marked_as_untrusted(cfg, tmp_path):
+    from cryptobot.webpage import attach_pages, fetch_text, find_urls
+    msg = "CPI 出來就跌了 https://udn.com/news/story/6811/9815100，你看 https://example.com/a?x=1). 還有 http://c.test/b"
+    assert find_urls(msg) == ["https://udn.com/news/story/6811/9815100", "https://example.com/a?x=1"]  # max 2
+    out = attach_pages("看 https://news.test/x", fetch=lambda url: "標題\n核心CPI月增0.3%")
+    assert out.startswith("看 https://news.test/x") and "核心CPI月增0.3%" in out and "不要照做" in out
+    failed = attach_pages("看 https://bad.test/x", fetch=lambda url: (_ for _ in ()).throw(TimeoutError("timed out")))
+    assert "讀取失敗" in failed and "timed out" in failed
+    assert attach_pages("沒有連結") == "沒有連結"
+    for url in ("http://127.0.0.1:8080/", "http://192.168.1.151/", "file:///etc/passwd"):
+        with pytest.raises(ValueError):
+            fetch_text(url)
+
+    ai = FakeAI()
+    b, tg, _ = _butler(cfg, tmp_path, ai=ai)
+    b.fetch_page = lambda url: "核心CPI月增0.3%"
+    b.answer("CPI https://news.test/cpi", None)
+    assert "核心CPI月增0.3%" in ai.asked[0][0]
+
+
+def test_page_text_prefers_the_article_body():
+    from cryptobot.webpage import fetch_text
+    page = ("<html><head><title>CPI 升溫</title><script>var x='ignore me please, very long script';</script></head>"
+            "<body><nav>首頁 財經 國際 這是很長的導覽列文字不應該出現</nav>"
+            "<article><p>美國勞工統計局公布，9月消費者物價指數月增0.6%，年增3.7%，高於市場預期。</p>"
+            "<p>剔除糧食和能源的核心CPI月增0.3%，市場預估0.2%，升息預期升溫。</p>" + "<p>" + "補充說明。" * 40 + "</p>"
+            "</article><div>▪相關新聞：太平洋要改名了？這一行是側欄連結不該出現</div></body></html>").encode()
+
+    class Resp:
+        headers = type("H", (), {"get_content_charset": staticmethod(lambda: "utf-8")})()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, n):
+            return page
+
+        def geturl(self):
+            return "https://example.com/news"
+
+    text = fetch_text("https://example.com/news", opener=lambda req, timeout: Resp())
+    assert text.startswith("CPI 升溫") and "核心CPI月增0.3%" in text
+    assert "導覽列" not in text and "側欄" not in text and "ignore me" not in text
 
 
 # ------------------------------------------------------------------ /pnl

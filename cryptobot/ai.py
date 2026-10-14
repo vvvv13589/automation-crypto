@@ -28,6 +28,18 @@ AI_USER = "butlerai"
 SHIPPED = ("settings.json", "system-prompt.md", "market.py")  # copied from deploy/ai/ on start
 
 
+def account_brief(snapshot: dict) -> str:
+    """The current account in every prompt: a resumed conversation must never answer from an
+    older snapshot (e.g. say a position has no stop right after the user placed one)."""
+    if not snapshot.get("positions") and snapshot.get("error"):
+        return f"【目前帳戶】{snapshot['error']}"
+    if "positions" not in snapshot:
+        return "【目前帳戶】沒有資料"
+    from .butler import format_status
+    return ("【目前帳戶：剛從交易所讀取，以這份為準；對話中較早提到的帳戶、持倉、停損資訊都已過時】\n"
+            + format_status(snapshot))
+
+
 class ClaudeChat:
     def __init__(self, cfg: dict, repo_dir: str, claude_bin: str, token: str, root: str = AI_ROOT,
                  tools_dir: str = TOOLS_DIR, user: str | None = AI_USER, run=subprocess.run, clock=time.time):
@@ -121,7 +133,7 @@ class ClaudeChat:
             note = f"🆕 超過 {self.idle / 3600:g} 小時沒對話，已開新對話\n\n"
         self.prepare(snapshot or {})
         prompt = text or "請分析這張圖"
-        prompt += f"\n\n（帳戶快照已更新：{self.work_dir / 'account.json'}，{(snapshot or {}).get('time', '')}）"
+        prompt += f"\n\n{account_brief(snapshot or {})}\n（細節：{self.work_dir / 'account.json'}）"
         if image:
             prompt += f"\n（使用者傳來的圖片：{image}，請用 Read 讀取後分析）"
         resumed = self.session_id is not None

@@ -58,7 +58,8 @@ HELP = """🤵 Telegram 管家指令
 
 💬 AI
 /new　開新對話（超過 2 小時沒講話也會自動開新的）
-直接打字或傳 K 線截圖 → AI 分析（唯讀，不能下單或改任何東西）"""
+直接打字或傳 K 線截圖 → AI 分析（唯讀，不能下單或改任何東西）
+訊息裡貼新聞連結，管家會代為讀取網頁文字給 AI 參考（每則最多 2 個連結）"""
 
 COMMANDS = [("status", "帳戶與持倉"), ("pnl", "機器人 vs 手動 已實現損益"), ("ip", "對外 IP 與 API 狀態"),
             ("scan", "回撤掃描"),
@@ -309,6 +310,8 @@ class Butler:
         self.public_ip = public_ip or default_ip
         self.run_cmd, self.clock = run, clock
         self.inbox_dir = Path(inbox_dir) if inbox_dir else None
+        from .webpage import fetch_text
+        self.fetch_page = fetch_text
         self.ex_lock = threading.Lock()  # ccxt clients are not thread-safe
         self.offset = self._load_offset()
         self.jobs: queue.Queue = queue.Queue()
@@ -653,7 +656,8 @@ class Butler:
             snap = self.snapshot()
         except Exception as exc:
             snap = {"error": f"讀不到帳戶：{str(exc)[:200]}"}
-        return self.ai.ask(text, image=image, snapshot=snap)
+        from .webpage import attach_pages  # the AI has no internet: links are fetched here
+        return self.ai.ask(attach_pages(text, self.fetch_page), image=image, snapshot=snap)
 
     def worker(self) -> None:
         while not self._stop:
