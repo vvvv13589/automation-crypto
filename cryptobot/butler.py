@@ -218,6 +218,16 @@ def _order(o: dict) -> dict:
             "type": str(info.get("orderType") or info.get("type") or o.get("type") or "")}
 
 
+def mark_leftovers(orders: list[dict], position_side: str) -> list[dict]:
+    """Reduce-only stops / targets on the opening side (e.g. a buy stop left over from a short
+    after flipping long) can never fill: show them as leftovers, not as protection."""
+    closing = "sell" if position_side == "long" else "buy"
+    for o in orders:
+        if o["kind"] in ("stop", "tp") and o.get("side") and o["side"] != closing:
+            o["kind"] = "leftover"
+    return orders
+
+
 def account_snapshot(exchange, cfg: dict) -> dict:
     """Balance, every open position (bot or manual) and its resting orders. Read-only calls."""
     info = exchange.fetch_balance().get("info") or {}
@@ -239,7 +249,8 @@ def account_snapshot(exchange, cfg: dict) -> dict:
             "entry": float(p.get("entryPrice") or 0), "mark": float(p.get("markPrice") or 0),
             "unrealized": float(p.get("unrealizedPnl") or 0),
             "liquidation": float(p.get("liquidationPrice") or 0),
-            "leverage": p.get("leverage"), "margin_mode": p.get("marginMode"), "orders": orders,
+            "leverage": p.get("leverage"), "margin_mode": p.get("marginMode"),
+            "orders": mark_leftovers(orders, p.get("side")),
         })
     return {
         "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -283,6 +294,8 @@ def format_status(snap: dict, bot_state: str = "", tz: str = "Asia/Taipei") -> s
         lines.append(f"{'🤖' if p['owner'] == 'bot' else '✋'} {p['coin']} {side} {_px(p['amount'])}{lev}{mode}"
                      f" @ {_px(p['entry'])} → {_px(p['mark'])}  {p['unrealized']:+.2f} U")
         lines.append(f"    停損 {_orders_line(p['orders'], 'stop')}｜止盈 {_orders_line(p['orders'], 'tp')}")
+        if any(o["kind"] == "leftover" for o in p["orders"]):
+            lines.append(f"    ⚠️ 方向不對的殘單（不會成交，可在幣安取消）：{_orders_line(p['orders'], 'leftover')}")
         if not any(o["kind"] == "stop" for o in p["orders"]):
             missing.append(p["coin"])
     if missing:

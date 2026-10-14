@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from .butler import _order, _px
+from .butler import _order, _px, mark_leftovers
 
 BOT_WARNING = ("🤖 注意：這是交易機器人開的倉，機器人也在管理它：它記得自己的停損價，價格碰到時"
                "仍會市價平倉；移動停損時會再掛回它自己的停損單；部分平倉它不會察覺（它的單都是只減倉，不會反向開倉）。")
@@ -102,6 +102,9 @@ def plan_stop(snapshot: dict, coin: str, price: float) -> Plan:
              f"新停損 {_px(price)}：整個部位 {_px(p['amount'])}，只減倉，觸發後市價平倉",
              f"觸發時預估損益 {pnl:+.2f} U（未含手續費與滑價）",
              ("先掛新停損，成功後再取消舊的：" + "、".join(_px(o["price"]) for o in old)) if old else "目前沒有停損單"]
+    left = [o for o in p["orders"] if o["kind"] == "leftover"]
+    if left:
+        lines.append("也會取消方向不對的殘單：" + "、".join(_px(o["price"]) for o in left))
     liq = p.get("liquidation") or 0
     if liq and (price - liq) * s <= 0:
         lines.append(f"⚠️ 停損在強平價 {_px(liq)} 之外，會先被強平")
@@ -204,11 +207,11 @@ def _live_position(exchange, symbol: str) -> dict | None:
     return None
 
 
-def _orders(exchange, symbol: str) -> list[dict]:
+def _orders(exchange, symbol: str, side: str | None = None) -> list[dict]:
     out = []
     for params in ({}, {"trigger": True}):
         out += [{**_order(o), "trigger": bool(params)} for o in exchange.fetch_open_orders(symbol, params=params)]
-    return out
+    return mark_leftovers(out, side) if side else out
 
 
 def _cancel(exchange, symbol: str, o: dict) -> None:
@@ -242,8 +245,8 @@ def execute(exchange, plan: Plan) -> str:
     if amount <= 0:
         raise OpError(f"數量太小（{_px(held * plan.fraction)}），交易所無法下單")
 
-    if plan.kind == "stop":
-        old = [o for o in _orders(exchange, plan.symbol) if o["kind"] == "stop"]
+    if plan.kind == "stop":  # replaced: the old stops and any leftovers from an earlier opposite position
+        old = [o for o in _orders(exchange, plan.symbol, plan.side) if o["kind"] in ("stop", "leftover")]
         price = float(exchange.price_to_precision(plan.symbol, plan.price))
         order = exchange.create_order(plan.symbol, "market", close_side, amount, None,
                                       {"stopLossPrice": price, "reduceOnly": True})

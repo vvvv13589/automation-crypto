@@ -515,6 +515,20 @@ def test_stop_on_the_wrong_side_or_unknown_coin_is_refused(cfg, tmp_path):
     assert tg.prompts == {} and _sent_orders(ex) == []
 
 
+def test_leftover_stop_from_an_opposite_position_is_flagged_and_replaced(cfg, tmp_path):
+    b, tg, ex, _ = _trading_butler(cfg, tmp_path)
+    ex.orders["ETH/USDT:USDT"].append({"id": "short-left", "trigger": True, "side": "buy", "triggerPrice": 2600,
+                                       "amount": 0.3, "reduceOnly": True,
+                                       "info": {"orderType": "STOP_MARKET", "closePosition": False}})
+    b.cmd_status("")
+    assert "停損 —" in tg.sent[-1] and "方向不對的殘單" in tg.sent[-1] and "沒有停損單：ETH" in tg.sent[-1]
+    b.cmd_stop("ETH 2400")
+    assert "也會取消方向不對的殘單：2600" in list(tg.prompts.values())[-1][0]
+    _press(tg, b)
+    assert [c[0] for c in _sent_orders(ex)] == ["create_order", "cancel_order"]
+    assert ex.orders["ETH/USDT:USDT"][0]["side"] == "sell"
+
+
 def test_failed_new_stop_keeps_the_old_one(cfg, tmp_path):
     b, tg, ex, _ = _trading_butler(cfg, tmp_path)
     b.cmd_stop("BTC 84000")
