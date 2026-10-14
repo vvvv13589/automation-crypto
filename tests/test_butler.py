@@ -41,6 +41,11 @@ class FakeTelegram:
         self.prompts[mid] = (text, token)
         return mid
 
+    def choose(self, text, options):
+        mid = len(self.prompts) + 500
+        self.prompts[mid] = (text, options)
+        return mid
+
     def close_prompt(self, message_id, text):
         self.edits.append((message_id, text))
 
@@ -404,6 +409,18 @@ class TradingExchange(FakeExchange):
     def fetch_order(self, oid, symbol):
         return {"id": oid, "filled": None}
 
+    def fetch_ohlcv(self, symbol, tf, limit=100):
+        """BTC: 4h range 83200-83800 (ATR 600) with a swing high 84200 and low 82000 inside the
+        last 20 bars; daily range 83000-84000 with 86000 / 80000 in the last 10 days."""
+        n = 60 if tf == "4h" else 30
+        rows = [[i, 83500, 83800, 83200, 83500, 1] if tf == "4h" else [i, 83500, 84000, 83000, 83500, 1]
+                for i in range(n)]
+        if tf == "4h":
+            rows[-18][2], rows[-17][3] = 84200, 82000
+        else:
+            rows[-5][2], rows[-5][3] = 86000, 80000
+        return rows
+
     def cancel_order(self, oid, symbol, params=None):
         self.calls.append(("cancel_order", oid, dict(params or {})))
         self.orders[symbol] = [o for o in self.orders[symbol] if o["id"] != oid]
@@ -449,10 +466,49 @@ def test_stop_is_shown_first_then_placed_before_the_old_one_is_cancelled(cfg, tm
     assert "propose" in audit and "confirmed" in audit and "result" in audit
 
 
+def _pick(tg, b, n, update_id=70):
+    mid, (text, options) = list(tg.prompts.items())[-1]
+    tg.inbox.append([{"update_id": update_id, "callback_query": {
+        "id": "cb", "from": {"id": 42}, "data": options[n - 1][1],
+        "message": {"message_id": mid, "chat": {"id": 42}}}}])
+    b.poll()
+
+
+def test_stop_without_price_lists_levels_then_confirms_the_picked_one(cfg, tmp_path):
+    b, tg, ex, _ = _trading_butler(cfg, tmp_path)
+    tg.inbox.append([_msg("/stop BTC")])
+    b.poll()
+    text, options = list(tg.prompts.values())[-1]
+    assert "建議停損" in text and "目前停損 84670.1" in text
+    assert [o[0] for o in options] == ["1. 停損 83556.1", "2. 停損 84367", "3. 停損 86167"]
+    assert "保本" in text and "4h 近 20 根波段高點上方" in text and "日線近 10 天高點上方" in text
+    assert "ATR" in text and _sent_orders(ex) == []
+    _pick(tg, b, 2)
+    assert "已選 2. 停損 84367" in tg.edits[-1][1] and b.pending and _sent_orders(ex) == []  # picking alone sends nothing
+    text, _ = list(tg.prompts.values())[-1]
+    assert "新停損 84367" in text
+    _press(tg, b, update_id=71)
+    assert _sent_orders(ex)[0] == ("create_order", "BTC/USDT:USDT", "market", "buy", 0.013,
+                                   {"stopLossPrice": 84367.0, "reduceOnly": True})
+
+
+def test_tp_without_price_offers_structure_and_r_targets(cfg, tmp_path):
+    b, tg, ex, clock = _trading_butler(cfg, tmp_path)
+    b.cmd_tp("BTC")
+    text, options = list(tg.prompts.values())[-1]
+    assert [o[0] for o in options] == ["1. 止盈 82442.1", "2. 止盈 82000", "3. 止盈 81328.1", "4. 止盈 80000"]
+    assert "1R 目標（以目前停損算 R）" in text and "2R 目標" in text and "+14.48 U" in text
+    clock[0] += 121
+    b.poll()                                            # the whole list expires together
+    assert b.pending == {} and "作廢" in tg.edits[-1][1]
+    b.cmd_tp("BTC 80000")                               # no amount = whole position
+    assert "數量 0.013（100%）" in list(tg.prompts.values())[-1][0]
+
+
 def test_stop_on_the_wrong_side_or_unknown_coin_is_refused(cfg, tmp_path):
     b, tg, ex, _ = _trading_butler(cfg, tmp_path)
     tg.inbox.append([_msg("/stop BTC 83000", update_id=1), _msg("/stop SOL 100", update_id=2),
-                     _msg("/stop BTC", update_id=3), _msg("/stop BTC abc", update_id=4)])
+                     _msg("/stop BTC 1 2", update_id=3), _msg("/stop BTC abc", update_id=4)])
     b.poll()
     assert "要高於現價" in tg.sent[0] and "SOL 沒有持倉" in tg.sent[1]
     assert "用法" in tg.sent[2] and "看不懂價格" in tg.sent[3]
@@ -493,7 +549,7 @@ def test_take_profit_amount_and_validation(cfg, tmp_path):
     assert _sent_orders(ex) == [("create_order", "ETH/USDT:USDT", "market", "sell", 0.25,
                                  {"takeProfitPrice": 2600.0, "reduceOnly": True})]
     assert "止盈已掛上 2600" in tg.sent[-1] and "止盈 2600（0.25）" in tg.sent[-1]
-    for bad, why in (("ETH 2400 50%", "要高於現價"), ("ETH 2600 1", "超過持倉"), ("ETH 2600", "用法")):
+    for bad, why in (("ETH 2400 50%", "要高於現價"), ("ETH 2600 1", "超過持倉"), ("ETH 2600 50% x", "用法")):
         tg.inbox.append([_msg(f"/tp {bad}", update_id=60)])
         b.poll()
         assert why in tg.sent[-1]

@@ -142,6 +142,60 @@ def plan_close(snapshot: dict, coin: str, qty: str = "100%") -> Plan:
     return Plan("close", p["symbol"], coin, p["side"], p["owner"], None, f, amount, "\n".join(lines))
 
 
+# ------------------------------------------------------------------ suggested levels
+def _atr(candles: list, n: int = 14) -> float:
+    trs = [max(h - l, abs(h - candles[i - 1][4]), abs(l - candles[i - 1][4]))
+           for i, (_, _, h, l, _, _) in enumerate(candles) if i > 0]
+    return sum(trs[-n:]) / min(n, len(trs)) if trs else 0.0
+
+
+def suggest(snapshot: dict, coin: str, kind: str, h4: list, d1: list, rnd=lambda x: x) -> tuple[str, list[float]]:
+    """Stop (kind="stop") or take-profit ("tp") levels from structure and volatility, nearest
+    first. ``h4`` / ``d1`` are OHLCV rows [ms, open, high, low, close, volume], oldest first."""
+    p = find_position(snapshot, coin)
+    s, mark, entry, amt = _sign(p["side"]), p["mark"], p["entry"], p["amount"]
+    atr = _atr(h4)
+    stop_now = min((o["price"] for o in _stops(p)), key=lambda x: abs(x - mark), default=None)
+    beyond = (lambda x: (mark - x) * s > 0) if kind == "stop" else (lambda x: (x - mark) * s > 0)
+    hi4, lo4 = max(r[2] for r in h4[-20:]), min(r[3] for r in h4[-20:])
+    hi1, lo1 = max(r[2] for r in d1[-10:]), min(r[3] for r in d1[-10:])
+    pad = 0.002 * mark  # a little past the swing point, where the idea is proven wrong
+    cands = []
+    if kind == "stop":
+        cands += [((lo4 - pad) if s > 0 else (hi4 + pad), "4h 近 20 根波段" + ("低點下方" if s > 0 else "高點上方")),
+                  ((lo1 - pad) if s > 0 else (hi1 + pad), "日線近 10 天" + ("低點下方" if s > 0 else "高點上方")),
+                  (mark - s * 1.5 * atr, "現價外 1.5 倍 ATR")]
+        if (mark - entry) * s > 0:
+            cands.append((entry, "保本（進場價）"))
+    else:
+        cands += [(lo4 if s < 0 else hi4, "4h 近 20 根波段" + ("低點" if s < 0 else "高點")),
+                  (lo1 if s < 0 else hi1, "日線近 10 天" + ("低點" if s < 0 else "高點"))]
+        risk = abs(entry - stop_now) if stop_now else 1.5 * atr
+        base = "（以目前停損算 R）" if stop_now else "（沒有停損，以 1.5 倍 ATR 當 1R）"
+        cands += [(entry + s * risk, f"1R 目標{base}"), (entry + s * 2 * risk, "2R 目標")]
+    picked: list[tuple[float, str]] = []
+    for price, why in sorted(cands, key=lambda c: abs(c[0] - mark)):
+        price = rnd(price) if price > 0 else price  # exchange tick size
+        if price > 0 and beyond(price) and all(abs(price - q) > 0.003 * mark for q, _ in picked):
+            picked.append((price, why))
+    picked = picked[:4]
+    side = "多單" if s > 0 else "空單"
+    lines = [f"{'🛑 建議停損' if kind == 'stop' else '🎯 建議止盈'}：{coin} {side} {_px(amt)}，均價 {_px(entry)}，現價 {_px(mark)}"]
+    if kind == "stop" and stop_now:
+        lines.append(f"目前停損 {_px(stop_now)}")
+    tps = sorted(o["price"] for o in p["orders"] if o["kind"] == "tp")
+    if kind == "tp" and tps:
+        lines.append(f"目前止盈 {'、'.join(_px(x) for x in tps)}")
+    for i, (price, why) in enumerate(picked, 1):
+        pnl = round((price - entry) * amt * s, 2) or 0.0  # no "-0.00" at break-even
+        lines.append(f"{i}. {_px(price)}　距現價 {abs(price / mark - 1) * 100:.1f}%　觸發時 {pnl:+.2f} U　{why}")
+    if not picked:
+        lines.append("算不出合適的點位，請自己輸入價格")
+    lines.append(f"（4h ATR {_px(atr)}。點下面的價格會再顯示確認內容；"
+                 + ("止盈預設整個部位，要部分止盈請輸入 /tp 幣種 價格 50%）" if kind == "tp" else "停損涵蓋整個部位）"))
+    return "\n".join(lines), [p_ for p_, _ in picked]
+
+
 # ------------------------------------------------------------------ execution
 def _live_position(exchange, symbol: str) -> dict | None:
     for p in exchange.fetch_positions([symbol]):

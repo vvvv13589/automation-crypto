@@ -37,6 +37,7 @@ STALE_SECONDS = 600  # messages older than this (sent while the butler was down)
 SCAN_ARGS = ["fib-scan", "--send", "--margin", "10", "--leverage", "20"]  # same as cryptobot-fibscan
 
 CONFIRM_SECONDS = 60  # a money operation not confirmed within this is void
+CHOICE_SECONDS = 120  # suggested stop / take-profit levels to pick from
 
 HELP = """🤵 Telegram 管家指令
 📊 查看
@@ -47,7 +48,8 @@ HELP = """🤵 Telegram 管家指令
 
 💰 管理部位（先顯示內容，按 ✅ 確認才下單，60 秒沒按就作廢）
 /stop BTC 84000　掛上或移動停損：整個部位、只減倉，先掛新的再取消舊的
-/tp BTC 80000 50%　掛止盈：只減倉，數量可寫 50% 或幣數（例如 0.005）
+/tp BTC 80000 50%　掛止盈：只減倉，數量可寫 50% 或幣數（例如 0.005），不寫 = 整個部位
+/stop BTC、/tp BTC　不寫價格 → 列出建議點位（波段高低點、ATR、保本、1R／2R），點選後再確認
 /close BTC　市價全部平倉（並取消該幣剩下的停損止盈）
 /close BTC 50%　市價平掉一半
 
@@ -63,7 +65,8 @@ HELP = """🤵 Telegram 管家指令
 
 COMMANDS = [("status", "帳戶與持倉"), ("pnl", "機器人 vs 手動 已實現損益"), ("ip", "對外 IP 與 API 狀態"),
             ("scan", "回撤掃描"),
-            ("stop", "掛／移動停損：/stop BTC 84000"), ("tp", "掛止盈：/tp BTC 80000 50%"),
+            ("stop", "掛／移動停損：/stop BTC 84000（不寫價格=建議）"),
+            ("tp", "掛止盈：/tp BTC 80000 50%（不寫價格=建議）"),
             ("close", "市價平倉：/close BTC 或 /close BTC 50%"), ("pause", "暫停開新倉"),
             ("resume", "恢復開新倉"), ("restart", "重啟交易機器人"), ("new", "AI 開新對話"), ("help", "指令說明")]
 KEYBOARD = [["/status", "/pnl", "/ip", "/scan"], ["/pause", "/resume", "/help"]]  # replaces any older reply keyboard
@@ -135,6 +138,16 @@ class TelegramBot:
         """A message with ✅ / ❌ buttons; returns its message id (None if it could not be sent)."""
         buttons = {"inline_keyboard": [[{"text": "✅ 確認", "callback_data": f"ok:{token}"},
                                         {"text": "❌ 取消", "callback_data": f"no:{token}"}]]}
+        try:
+            return self._call("sendMessage", {"chat_id": self.chat_id, "text": text[:TG_LIMIT],
+                                              "reply_markup": buttons})["message_id"]
+        except Exception as exc:
+            log.warning("telegram send failed: %s", exc)
+            return None
+
+    def choose(self, text: str, options: list[tuple[str, str]]) -> int | None:
+        """A message with one button per option (label, callback data), one per row."""
+        buttons = {"inline_keyboard": [[{"text": label, "callback_data": data}] for label, data in options]}
         try:
             return self._call("sendMessage", {"chat_id": self.chat_id, "text": text[:TG_LIMIT],
                                               "reply_markup": buttons})["message_id"]
@@ -529,11 +542,35 @@ class Butler:
                                "message_id": mid, "summary": summary}
         self.audit("propose", f"{token} {summary.splitlines()[0]} | {summary.splitlines()[1] if len(summary.splitlines()) > 1 else ''}")
 
+    def offer(self, summary: str, options: list[tuple[str, object]]) -> None:
+        """One button per option; picking one runs its callable (which proposes the real
+        operation with ✅ / ❌), so a pick alone never places an order."""
+        import secrets
+
+        group = secrets.token_hex(4)
+        tokens = [secrets.token_hex(4) for _ in options]
+        mid = self.tg.choose(f"{summary}\n\n⏳ {CHOICE_SECONDS} 秒內有效",
+                             [(label, f"pick:{t}") for (label, _), t in zip(options, tokens)])
+        if mid is None:
+            self.tg.send("⚠️ 選項訊息送不出去")
+            return
+        for (label, action), t in zip(options, tokens):
+            self.pending[t] = {"action": action, "expires": self.clock() + CHOICE_SECONDS, "message_id": mid,
+                               "summary": summary, "group": group, "label": label}
+
+    def _drop_group(self, op: dict) -> None:
+        for t, other in list(self.pending.items()):
+            if op.get("group") and other.get("group") == op["group"]:
+                del self.pending[t]
+
     def expire(self) -> None:
         for token, op in list(self.pending.items()):
-            if self.clock() > op["expires"]:
+            if token in self.pending and self.clock() > op["expires"]:
                 del self.pending[token]
-                self.tg.close_prompt(op["message_id"], f"{op['summary']}\n\n⌛ 超過 {CONFIRM_SECONDS} 秒沒確認，已作廢")
+                self._drop_group(op)
+                limit = CHOICE_SECONDS if op.get("group") else CONFIRM_SECONDS
+                self.tg.close_prompt(op["message_id"], f"{op['summary']}\n\n⌛ 超過 {limit} 秒沒"
+                                                       f"{'選' if op.get('group') else '確認'}，已作廢")
                 self.audit("expired", token)
 
     def on_button(self, cq: dict) -> None:
@@ -548,9 +585,24 @@ class Butler:
             self.tg.answer_button(cq["id"], "這個確認已經失效")
             return
         if self.clock() > op["expires"]:
+            self._drop_group(op)
             self.tg.answer_button(cq["id"], "已逾時作廢")
-            self.tg.close_prompt(op["message_id"], f"{op['summary']}\n\n⌛ 超過 {CONFIRM_SECONDS} 秒沒確認，已作廢")
+            self.tg.close_prompt(op["message_id"], f"{op['summary']}\n\n⌛ 已逾時作廢")
             self.audit("expired", token)
+            return
+        if op.get("group"):  # a suggested level was picked: show the real confirmation next
+            self._drop_group(op)
+            if verdict != "pick":
+                self.tg.answer_button(cq["id"])
+                return
+            self.tg.answer_button(cq["id"], f"已選 {op['label']}")
+            self.tg.close_prompt(op["message_id"], f"{op['summary']}\n\n👉 已選 {op['label']}")
+            self.audit("picked", f"{token} {op['label']}")
+            from .manage import OpError
+            try:
+                op["action"]()
+            except OpError as exc:
+                self.tg.send(f"❌ {exc}")
             return
         if verdict != "ok":
             self.tg.answer_button(cq["id"], "已取消")
@@ -582,8 +634,11 @@ class Butler:
         from .manage import parse_coin, parse_price, plan_stop
 
         parts = arg.split()
+        if len(parts) == 1:
+            self.suggest_levels(parse_coin(parts[0]), "stop")
+            return
         if len(parts) != 2:
-            self.tg.send("用法：/stop 幣種 價格，例如 /stop BTC 84000")
+            self.tg.send("用法：/stop 幣種 價格，例如 /stop BTC 84000；只打 /stop BTC 會列出建議點位")
             return
         plan = plan_stop(self.snapshot(), parse_coin(parts[0]), parse_price(parts[1]))
         self.propose(plan.summary, lambda: self._trade(plan))
@@ -592,11 +647,34 @@ class Butler:
         from .manage import parse_coin, parse_price, plan_tp
 
         parts = arg.split()
-        if len(parts) != 3:
-            self.tg.send("用法：/tp 幣種 價格 數量，例如 /tp BTC 80000 50% 或 /tp BTC 80000 0.005")
+        if len(parts) == 1:
+            self.suggest_levels(parse_coin(parts[0]), "tp")
             return
-        plan = plan_tp(self.snapshot(), parse_coin(parts[0]), parse_price(parts[1]), parts[2])
+        if len(parts) not in (2, 3):
+            self.tg.send("用法：/tp 幣種 價格 [數量]，例如 /tp BTC 80000 50%（不寫數量 = 整個部位）；"
+                         "只打 /tp BTC 會列出建議點位")
+            return
+        plan = plan_tp(self.snapshot(), parse_coin(parts[0]), parse_price(parts[1]),
+                       parts[2] if len(parts) == 3 else "100%")
         self.propose(plan.summary, lambda: self._trade(plan))
+
+    def suggest_levels(self, coin: str, kind: str) -> None:
+        from .manage import find_position, suggest
+
+        snap = self.snapshot()
+        sym = find_position(snap, coin)["symbol"]
+        with self.ex_lock:
+            self.exchange.load_markets()
+            h4 = self.exchange.fetch_ohlcv(sym, "4h", limit=60)
+            d1 = self.exchange.fetch_ohlcv(sym, "1d", limit=30)
+            text, prices = suggest(snap, coin, kind, h4, d1,
+                                   rnd=lambda x: float(self.exchange.price_to_precision(sym, x)))
+        cmd = self.cmd_stop if kind == "stop" else self.cmd_tp
+        if not prices:
+            self.tg.send(text)
+            return
+        self.offer(text, [(f"{i}. {'停損' if kind == 'stop' else '止盈'} {x:.10g}",
+                           lambda x=x: cmd(f"{coin} {x:.10g}")) for i, x in enumerate(prices, 1)])
 
     def cmd_close(self, arg: str) -> None:
         from .manage import parse_coin, plan_close
