@@ -48,7 +48,7 @@ HELP = """🤵 Telegram 管家指令
 
 💰 管理部位（先顯示內容，按 ✅ 確認才下單，60 秒沒按就作廢）
 /stop BTC 84000　掛上或移動停損：整個部位、只減倉，先掛新的再取消舊的
-/tp BTC 80000 50%　掛止盈：只減倉，數量可寫 50% 或幣數（例如 0.005），不寫 = 整個部位
+/tp BTC 80000 50%　掛止盈：只減倉，數量可寫 50% 或幣數（例如 0.005），不寫會讓你選 25～100%
 /stop BTC、/tp BTC　不寫價格 → 列出建議點位（波段高低點、ATR、保本、1R／2R），點選後再確認
 /close BTC　市價全部平倉（並取消該幣剩下的停損止盈）
 /close BTC 50%　市價平掉一半
@@ -664,11 +664,20 @@ class Butler:
             self.suggest_levels(parse_coin(parts[0]), "tp")
             return
         if len(parts) not in (2, 3):
-            self.tg.send("用法：/tp 幣種 價格 [數量]，例如 /tp BTC 80000 50%（不寫數量 = 整個部位）；"
+            self.tg.send("用法：/tp 幣種 價格 [數量]，例如 /tp BTC 80000 50%（不寫數量會讓你選 25～100%）；"
                          "只打 /tp BTC 會列出建議點位")
             return
-        plan = plan_tp(self.snapshot(), parse_coin(parts[0]), parse_price(parts[1]),
-                       parts[2] if len(parts) == 3 else "100%")
+        coin, price = parse_coin(parts[0]), parse_price(parts[1])
+        snap = self.snapshot()
+        if len(parts) == 2:  # no amount: pick how much of the position to take off
+            plan_tp(snap, coin, price, "100%")  # validates side / price before asking
+            from .manage import find_position
+            held = find_position(snap, coin)["amount"]
+            self.offer(f"🎯 {coin} 止盈 {price:.10g}：要平掉多少？（持倉 {held:.6g}）",
+                       [(f"{pct}%（約 {held * pct / 100:.6g}）", lambda pct=pct: self.cmd_tp(f"{coin} {price:.10g} {pct}%"))
+                        for pct in (25, 50, 75, 100)])
+            return
+        plan = plan_tp(snap, coin, price, parts[2])
         self.propose(plan.summary, lambda: self._trade(plan))
 
     def suggest_levels(self, coin: str, kind: str) -> None:

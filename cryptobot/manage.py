@@ -195,7 +195,7 @@ def suggest(snapshot: dict, coin: str, kind: str, h4: list, d1: list, rnd=lambda
     if not picked:
         lines.append("算不出合適的點位，請自己輸入價格")
     lines.append(f"（4h ATR {_px(atr)}。點下面的價格會再顯示確認內容；"
-                 + ("止盈預設整個部位，要部分止盈請輸入 /tp 幣種 價格 50%）" if kind == "tp" else "停損涵蓋整個部位）"))
+                 + ("選好價格後再選要平掉 25%／50%／75%／100%）" if kind == "tp" else "停損涵蓋整個部位）"))
     return "\n".join(lines), [p_ for p_, _ in picked]
 
 

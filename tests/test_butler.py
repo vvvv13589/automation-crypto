@@ -501,8 +501,18 @@ def test_tp_without_price_offers_structure_and_r_targets(cfg, tmp_path):
     clock[0] += 121
     b.poll()                                            # the whole list expires together
     assert b.pending == {} and "作廢" in tg.edits[-1][1]
-    b.cmd_tp("BTC 80000")                               # no amount = whole position
-    assert "數量 0.013（100%）" in list(tg.prompts.values())[-1][0]
+    b.cmd_tp("BTC")                                     # pick a level, then how much to take off
+    _pick(tg, b, 4, update_id=80)
+    text, options = list(tg.prompts.values())[-1]
+    assert "要平掉多少" in text and [o[0] for o in options] == [
+        "25%（約 0.00325）", "50%（約 0.0065）", "75%（約 0.00975）", "100%（約 0.013）"]
+    _pick(tg, b, 2, update_id=81)
+    assert "止盈 80000：數量 0.0065（50%）" in list(tg.prompts.values())[-1][0] and _sent_orders(ex) == []
+    b.cmd_tp("BTC 80000")                               # typed without an amount: the same choice
+    assert "要平掉多少" in list(tg.prompts.values())[-1][0]
+    from cryptobot.manage import OpError
+    with pytest.raises(OpError, match="要低於現價"):  # wrong side is refused before asking
+        b.cmd_tp("BTC 85000")
 
 
 def test_stop_on_the_wrong_side_or_unknown_coin_is_refused(cfg, tmp_path):
