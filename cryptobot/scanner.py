@@ -78,6 +78,7 @@ class Scanner:
         self.traders: dict[str, Trader] = {}
         self._candidates: list[tuple[float, Trader, object, float]] = []
         self.market_note = ""  # extra context line for entry messages (set by the live runner)
+        self.paused = False  # /pause from the Telegram butler: no new positions or adds
         self._load_portfolio()
 
     # ------------------------------------------------------------ persistence
@@ -134,6 +135,7 @@ class Scanner:
                        journal_path=journal, notify=self.notify, risk=self.risk)
             t.entry_gate = self._gate
             t.defensive = self.defensive
+            t.paused = self.paused
             self.traders[symbol] = t
         return self.traders[symbol]
 
@@ -153,6 +155,22 @@ class Scanner:
 
     def begin_candle(self) -> None:
         self._candidates = []
+
+    def pause_path(self) -> Path | None:
+        return Path(self.state_dir) / f"{tag_for(self.cfg, self.mode)}_paused.json" if self.state_dir else None
+
+    def check_pause(self) -> bool:
+        """The butler's /pause creates the flag file and /resume removes it. While paused the
+        bot opens nothing new and does not pyramid; open positions keep their stops and exits."""
+        path = self.pause_path()
+        paused = bool(path and path.exists())
+        if paused != self.paused:
+            self.paused = paused
+            for t in self.traders.values():
+                t.paused = paused
+            self._notify("⏸ 機器人已暫停開新倉（現有持倉照常管理停損與出場），/resume 恢復" if paused
+                         else "▶️ 機器人已恢復開新倉")
+        return paused
 
     def account_equity(self) -> float | None:
         if self.wallet is not None:
@@ -221,7 +239,8 @@ class Scanner:
         """Enter the strongest collected signals while slots are free."""
         entered = []
         self.check_goals(self.account_equity(), now)
-        if self.target_reached and self.goals.get("stop_at_target", True) and not self.defensive:
+        if self.check_pause() or (self.target_reached and self.goals.get("stop_at_target", True)
+                                  and not self.defensive):
             self._candidates = []
             self.save()
             return entered

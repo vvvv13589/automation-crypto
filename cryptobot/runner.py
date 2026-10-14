@@ -291,6 +291,7 @@ class ScanRunner:
 
     def protect(self, now) -> None:
         """Between candles: stops, targets, limit fills and exchange-side closes."""
+        self.scanner.check_pause()  # /pause from Telegram also stops pyramid adds at once
         open_syms = self.scanner.open_symbols()
         if not open_syms:
             return
@@ -346,7 +347,8 @@ class ScanRunner:
         entered = self.scanner.finish_candle(now)
         if self.cfg.get("notify", {}).get("scan_report"):
             from .report import build_report
-            head = f"🆕 開倉：{', '.join(s.split('/')[0] for s in entered)}" if entered else "這次沒有新訊號"
+            head = (f"🆕 開倉：{', '.join(s.split('/')[0] for s in entered)}" if entered
+                    else "⏸ 暫停開新倉中" if self.scanner.paused else "這次沒有新訊號")
             self._say(build_report(self.scanner, self.exchange, self.cfg, self.mode, now,
                                    title=f"⏰ 掃描完成（{head}）", compact=True))
         open_syms = self.scanner.open_symbols()

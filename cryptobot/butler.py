@@ -4,8 +4,10 @@
 
 Runs independently of the trading bot so it still answers when the bot is stopped or
 crashed. Only messages from TELEGRAM_CHAT_ID are handled; every command is written to the
-audit log. Phase 1 is read-only: /help /status /ip /scan /new, and plain text or photos go
-to the AI (cryptobot/ai.py), which only ever sees a snapshot of the account.
+audit log. Read-only: /help /status /ip /scan /new; plain text or photos go to the AI
+(cryptobot/ai.py), which only ever sees a snapshot of the account. Money operations (/stop /tp
+/close, cryptobot/manage.py) and bot control (/resume /restart) run only after a ✅ button
+press within 60 seconds; /pause (only lowers risk) runs at once.
 """
 
 from __future__ import annotations
@@ -34,14 +36,35 @@ TG_LIMIT = 4000  # Telegram allows 4096 characters per message; leave room for a
 STALE_SECONDS = 600  # messages older than this (sent while the butler was down) are skipped
 SCAN_ARGS = ["fib-scan", "--send", "--margin", "10", "--leverage", "20"]  # same as cryptobot-fibscan
 
+CONFIRM_SECONDS = 60  # a money operation not confirmed within this is void
+
 HELP = """🤵 Telegram 管家指令
+📊 查看
 /status　帳戶總額、可用餘額、所有持倉（🤖 機器人／✋ 手動）、停損止盈、未實現損益
 /ip　VM 對外 IP、幣安 API 是否接受連線、最近 24 小時有沒有 -2015 拒絕
-/scan　立刻跑一次回撤掃描（和每天 09:00 的一樣），結果直接傳到這裡
-/new　AI 開新對話（超過 2 小時沒講話也會自動開新的）
-/help　顯示這份說明
+/scan　立刻跑一次回撤掃描（和每天 09:00 的一樣）
 
-直接打字或傳 K 線截圖 → AI 分析（唯讀：看得到行情、帳戶、持倉、掛單、設定與交易紀錄，不能下單或改任何東西）"""
+💰 管理部位（先顯示內容，按 ✅ 確認才下單，60 秒沒按就作廢）
+/stop BTC 84000　掛上或移動停損：整個部位、只減倉，先掛新的再取消舊的
+/tp BTC 80000 50%　掛止盈：只減倉，數量可寫 50% 或幣數（例如 0.005）
+/close BTC　市價全部平倉（並取消該幣剩下的停損止盈）
+/close BTC 50%　市價平掉一半
+
+🤖 交易機器人
+/pause　暫停開新倉（現有持倉照常管理）
+/resume　恢復開新倉
+/restart　重啟交易機器人
+
+💬 AI
+/new　開新對話（超過 2 小時沒講話也會自動開新的）
+直接打字或傳 K 線截圖 → AI 分析（唯讀，不能下單或改任何東西）"""
+
+COMMANDS = [("status", "帳戶與持倉"), ("ip", "對外 IP 與 API 狀態"), ("scan", "回撤掃描"),
+            ("stop", "掛／移動停損：/stop BTC 84000"), ("tp", "掛止盈：/tp BTC 80000 50%"),
+            ("close", "市價平倉：/close BTC 或 /close BTC 50%"), ("pause", "暫停開新倉"),
+            ("resume", "恢復開新倉"), ("restart", "重啟交易機器人"), ("new", "AI 開新對話"), ("help", "指令說明")]
+KEYBOARD = [["/status", "/ip", "/scan"], ["/pause", "/resume", "/help"]]  # replaces any older reply keyboard
+KEYBOARD_VERSION = 1  # bump to send the keyboard again after changing it
 
 
 def split_message(text: str, limit: int = TG_LIMIT) -> list[str]:
@@ -68,6 +91,13 @@ class TelegramBot:
         self.files = f"https://api.telegram.org/file/bot{token}"
         self.chat_id = str(chat_id)
 
+    def setup(self) -> None:
+        """The "/" command menu in the chat."""
+        try:
+            self._call("setMyCommands", {"commands": [{"command": c, "description": d} for c, d in COMMANDS]})
+        except Exception as exc:
+            log.warning("setMyCommands failed: %s", exc)
+
     def _call(self, method: str, params: dict | None = None, timeout: float = 15):
         body = json.dumps(params or {}).encode()
         req = urllib.request.Request(f"{self.api}/{method}", data=body,
@@ -79,20 +109,48 @@ class TelegramBot:
         return data["result"]
 
     def updates(self, offset: int | None, timeout: int = 25) -> list[dict]:
-        params = {"timeout": timeout, "allowed_updates": ["message"]}
+        params = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
         if offset is not None:
             params["offset"] = offset
         return self._call("getUpdates", params, timeout=timeout + 10)
 
-    def send(self, text: str) -> bool:
+    def send(self, text: str, keyboard: bool = False) -> bool:
+        """Split into Telegram-sized parts; ``keyboard`` also (re)sets the reply keyboard."""
         ok = True
         for part in split_message(text):
+            params = {"chat_id": self.chat_id, "text": part}
+            if keyboard:
+                params["reply_markup"] = {"keyboard": KEYBOARD, "resize_keyboard": True, "is_persistent": True}
             try:
-                self._call("sendMessage", {"chat_id": self.chat_id, "text": part})
+                self._call("sendMessage", params)
             except Exception as exc:
                 log.warning("telegram send failed: %s", exc)
                 ok = False
         return ok
+
+    def ask(self, text: str, token: str) -> int | None:
+        """A message with ✅ / ❌ buttons; returns its message id (None if it could not be sent)."""
+        buttons = {"inline_keyboard": [[{"text": "✅ 確認", "callback_data": f"ok:{token}"},
+                                        {"text": "❌ 取消", "callback_data": f"no:{token}"}]]}
+        try:
+            return self._call("sendMessage", {"chat_id": self.chat_id, "text": text[:TG_LIMIT],
+                                              "reply_markup": buttons})["message_id"]
+        except Exception as exc:
+            log.warning("telegram send failed: %s", exc)
+            return None
+
+    def close_prompt(self, message_id: int, text: str) -> None:
+        """Replace a confirmation prompt's text and remove its buttons."""
+        try:
+            self._call("editMessageText", {"chat_id": self.chat_id, "message_id": message_id, "text": text[:TG_LIMIT]})
+        except Exception as exc:
+            log.warning("telegram edit failed: %s", exc)
+
+    def answer_button(self, callback_id: str, text: str = "") -> None:
+        try:
+            self._call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text}, timeout=5)
+        except Exception:
+            pass
 
     def typing(self) -> None:
         try:
@@ -254,23 +312,33 @@ class Butler:
         self.jobs: queue.Queue = queue.Queue()
         self.busy = threading.Event()
         self._stop = False
+        self.pending: dict[str, dict] = {}  # confirmation token -> operation waiting for ✅
+        self.pause_path = Path(cfg["state_dir"]) / f"{tag_for(cfg, 'live')}_paused.json"
 
     # -- persistence / audit ----------------------------------------------------
-    def _load_offset(self) -> int | None:
+    def _load_state(self) -> dict:
         try:
             with open(self.state_path, encoding="utf-8") as fh:
-                return int(json.load(fh)["offset"])
+                return json.load(fh)
         except Exception:
-            return None
+            return {}
 
-    def _save_offset(self) -> None:
+    def _load_offset(self) -> int | None:
+        offset = self._load_state().get("offset")
+        return int(offset) if offset is not None else None
+
+    def _save_state(self, **extra) -> None:
         if not self.state_path:
             return
+        data = {**self._load_state(), **extra, "offset": self.offset}
         Path(self.state_path).parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"offset": self.offset}, fh)
+            json.dump(data, fh)
         os.replace(tmp, self.state_path)
+
+    def _save_offset(self) -> None:
+        self._save_state()
 
     def audit(self, kind: str, detail: str = "") -> None:
         line = f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {kind} {detail}".rstrip()
@@ -286,6 +354,13 @@ class Butler:
         stale = 0
         for u in updates:
             self.offset = max(self.offset or 0, int(u.get("update_id", 0)) + 1)
+            if u.get("callback_query"):
+                try:
+                    self.on_button(u["callback_query"])
+                except Exception as exc:
+                    log.exception("button failed")
+                    self.tg.send(f"⚠️ 處理失敗：{str(exc)[:300]}")
+                continue
             msg = u.get("message") or {}
             chat = str((msg.get("chat") or {}).get("id"))
             if chat != self.tg.chat_id:
@@ -302,6 +377,7 @@ class Butler:
                 self.tg.send(f"⚠️ 處理失敗：{str(exc)[:300]}")
         if updates:
             self._save_offset()
+        self.expire()
         if stale:
             self.tg.send(f"⏭ 略過 {stale} 則管家離線時傳的舊訊息（超過 {STALE_SECONDS // 60} 分鐘），需要的話請重傳")
 
@@ -313,11 +389,18 @@ class Butler:
             cmd = cmd.split("@")[0].lower()
             self.audit("command", text[:200])
             handler = {"/help": self.cmd_help, "/start": self.cmd_help, "/status": self.cmd_status,
-                       "/ip": self.cmd_ip, "/scan": self.cmd_scan, "/new": self.cmd_new}.get(cmd)
+                       "/ip": self.cmd_ip, "/scan": self.cmd_scan, "/new": self.cmd_new,
+                       "/stop": self.cmd_stop, "/tp": self.cmd_tp, "/close": self.cmd_close,
+                       "/pause": self.cmd_pause, "/resume": self.cmd_resume,
+                       "/restart": self.cmd_restart}.get(cmd)
             if handler is None:
                 self.tg.send(f"不認得 {cmd}，輸入 /help 看可用指令")
                 return
-            handler(arg.strip())
+            from .manage import OpError
+            try:
+                handler(arg.strip())
+            except OpError as exc:
+                self.tg.send(f"❌ {exc}")
             return
         if text in ("狀態", "status"):
             self.audit("command", text)
@@ -342,7 +425,7 @@ class Butler:
 
     # -- commands -----------------------------------------------------------------
     def cmd_help(self, _arg: str) -> None:
-        self.tg.send(HELP)
+        self.tg.send(HELP, keyboard=True)
 
     def snapshot(self) -> dict:
         with self.ex_lock:
@@ -404,6 +487,135 @@ class Butler:
             self.ai.reset()
         self.tg.send("🆕 已開新的 AI 對話")
 
+    # -- money operations (phase 2): propose, confirm with a button, execute --------------
+    def propose(self, summary: str, action) -> None:
+        """Show what will happen with ✅ / ❌; ``action()`` runs only after ✅ within the time limit."""
+        import secrets
+
+        token = secrets.token_hex(4)
+        text = f"{summary}\n\n⏳ {CONFIRM_SECONDS} 秒內按 ✅ 確認才會執行"
+        mid = self.tg.ask(text, token)
+        if mid is None:
+            self.tg.send("⚠️ 確認訊息送不出去，這個操作沒有執行")
+            return
+        self.pending[token] = {"action": action, "expires": self.clock() + CONFIRM_SECONDS,
+                               "message_id": mid, "summary": summary}
+        self.audit("propose", f"{token} {summary.splitlines()[0]} | {summary.splitlines()[1] if len(summary.splitlines()) > 1 else ''}")
+
+    def expire(self) -> None:
+        for token, op in list(self.pending.items()):
+            if self.clock() > op["expires"]:
+                del self.pending[token]
+                self.tg.close_prompt(op["message_id"], f"{op['summary']}\n\n⌛ 超過 {CONFIRM_SECONDS} 秒沒確認，已作廢")
+                self.audit("expired", token)
+
+    def on_button(self, cq: dict) -> None:
+        chat = str(((cq.get("message") or {}).get("chat") or {}).get("id"))
+        if chat != self.tg.chat_id or str((cq.get("from") or {}).get("id")) != self.tg.chat_id:
+            self.audit("ignored-button", f"chat={chat} from={(cq.get('from') or {}).get('id')}")
+            self.tg.answer_button(cq["id"])
+            return
+        verdict, _, token = str(cq.get("data", "")).partition(":")
+        op = self.pending.pop(token, None)
+        if op is None:
+            self.tg.answer_button(cq["id"], "這個確認已經失效")
+            return
+        if self.clock() > op["expires"]:
+            self.tg.answer_button(cq["id"], "已逾時作廢")
+            self.tg.close_prompt(op["message_id"], f"{op['summary']}\n\n⌛ 超過 {CONFIRM_SECONDS} 秒沒確認，已作廢")
+            self.audit("expired", token)
+            return
+        if verdict != "ok":
+            self.tg.answer_button(cq["id"], "已取消")
+            self.tg.close_prompt(op["message_id"], f"{op['summary']}\n\n❌ 已取消，沒有下單")
+            self.audit("cancelled", token)
+            return
+        self.tg.answer_button(cq["id"], "執行中…")
+        self.tg.close_prompt(op["message_id"], f"{op['summary']}\n\n⏳ 已確認，執行中…")
+        self.audit("confirmed", token)
+        from .manage import OpError
+        try:
+            result = op["action"]()
+        except OpError as exc:
+            result = f"❌ 沒有執行：{exc}"
+        except Exception as exc:
+            log.exception("operation failed")
+            result = f"⚠️ 執行失敗：{str(exc)[:400]}"
+        self.audit("result", f"{token} {result}")
+        self.tg.close_prompt(op["message_id"], f"{op['summary']}\n\n✅ 已確認（結果見下一則）")
+        self.tg.send(result)
+
+    def _trade(self, plan) -> str:
+        from .manage import execute
+
+        with self.ex_lock:
+            return execute(self.exchange, plan)
+
+    def cmd_stop(self, arg: str) -> None:
+        from .manage import parse_coin, parse_price, plan_stop
+
+        parts = arg.split()
+        if len(parts) != 2:
+            self.tg.send("用法：/stop 幣種 價格，例如 /stop BTC 84000")
+            return
+        plan = plan_stop(self.snapshot(), parse_coin(parts[0]), parse_price(parts[1]))
+        self.propose(plan.summary, lambda: self._trade(plan))
+
+    def cmd_tp(self, arg: str) -> None:
+        from .manage import parse_coin, parse_price, plan_tp
+
+        parts = arg.split()
+        if len(parts) != 3:
+            self.tg.send("用法：/tp 幣種 價格 數量，例如 /tp BTC 80000 50% 或 /tp BTC 80000 0.005")
+            return
+        plan = plan_tp(self.snapshot(), parse_coin(parts[0]), parse_price(parts[1]), parts[2])
+        self.propose(plan.summary, lambda: self._trade(plan))
+
+    def cmd_close(self, arg: str) -> None:
+        from .manage import parse_coin, plan_close
+
+        parts = arg.split()
+        if len(parts) not in (1, 2):
+            self.tg.send("用法：/close 幣種 [百分比]，例如 /close BTC 或 /close BTC 50%")
+            return
+        plan = plan_close(self.snapshot(), parse_coin(parts[0]), parts[1] if len(parts) == 2 else "100%")
+        self.propose(plan.summary, lambda: self._trade(plan))
+
+    def cmd_pause(self, _arg: str) -> None:
+        """Stopping new entries only lowers risk, so it needs no confirmation."""
+        if self.pause_path.exists():
+            self.tg.send("⏸ 交易機器人本來就是暫停開新倉狀態，/resume 可恢復")
+            return
+        self.pause_path.parent.mkdir(parents=True, exist_ok=True)
+        self.pause_path.write_text(json.dumps({"paused_at": datetime.now(timezone.utc).isoformat()}))
+        self.audit("paused")
+        state = self.service_state("cryptobot")
+        note = ("交易機器人幾秒內會回覆「⏸ 機器人已暫停開新倉」" if state == "active"
+                else f"（交易機器人目前是 {state}，啟動後就會照暫停狀態運作）")
+        self.tg.send(f"⏸ 已設定暫停開新倉：現有持倉照常管理停損與出場。\n{note}")
+
+    def cmd_resume(self, _arg: str) -> None:
+        if not self.pause_path.exists():
+            self.tg.send("▶️ 交易機器人沒有暫停，正在正常開新倉")
+            return
+
+        def resume():
+            self.pause_path.unlink(missing_ok=True)
+            return "▶️ 已解除暫停：交易機器人下一次掃描起會照訊號開新倉"
+        self.propose("▶️ 恢復交易機器人開新倉\n之後每 4 小時掃描到訊號就會用真實資金開倉", resume)
+
+    def cmd_restart(self, _arg: str) -> None:
+        def restart():
+            r = self.run_cmd(["systemctl", "restart", "cryptobot"], capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                return f"⚠️ 重啟失敗：{(r.stderr or r.stdout or '')[-300:]}"
+            time.sleep(5)
+            state = self.service_state("cryptobot")
+            return (f"🔄 交易機器人已重啟，狀態：{state}" if state == "active"
+                    else f"⚠️ 已送出重啟，但目前狀態是 {state}，請用 /status 或看日誌確認")
+        self.propose(f"🔄 重啟交易機器人（systemctl restart cryptobot，目前 {self.service_state('cryptobot')}）\n"
+                     "重啟期間大約 1 分鐘不會掃描，現有持倉的交易所停損單照常有效", restart)
+
     # -- AI worker ------------------------------------------------------------------
     def answer(self, text: str, photo: str | None) -> str:
         image = None
@@ -456,6 +668,10 @@ class Butler:
             backlog = self.tg.updates(-1, timeout=0)
             self.offset = int(backlog[-1]["update_id"]) + 1 if backlog else None
         threading.Thread(target=self.worker, daemon=True).start()
+        self.tg.setup()
+        if self._load_state().get("keyboard") != KEYBOARD_VERSION:  # replace the old reply keyboard once
+            self.tg.send("🤵 管家已更新：可以管理部位與控制交易機器人了，輸入 /help 查看", keyboard=True)
+            self._save_state(keyboard=KEYBOARD_VERSION)
         self.audit("start")
         errors = 0
         while not self._stop:
@@ -463,8 +679,8 @@ class Butler:
                 self.poll()
                 errors = 0
             except Exception as exc:
-                errors += 1
-                log.warning("poll failed (%d): %s", errors, str(exc)[:200])
+                errors += 1  # a single long-poll timeout is normal on a slow line
+                log.log(logging.INFO if errors == 1 else logging.WARNING, "poll failed (%d): %s", errors, str(exc)[:200])
                 time.sleep(min(60, 2 ** min(errors, 6)))
         self.audit("stop")
 

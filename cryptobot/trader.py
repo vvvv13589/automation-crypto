@@ -116,6 +116,7 @@ class Trader:
         self._stop_error: Optional[str] = None  # last exchange-stop failure (notify once)
         self._stop_retry_at = 0.0
         self.defensive = False  # set by the scanner after the target: no pyramiding
+        self.paused = False  # set by the scanner while paused from Telegram: no pyramiding either
         self.state_path = state_path
         self.journal_path = journal_path
         self._load_state()
@@ -544,7 +545,7 @@ class Trader:
         initial size again and raise the stop so the worst case is still the initial risk."""
         pos = self.position
         max_adds = int(self.cfg["strategy"].get("pyramid_adds", 0) or 0)
-        if (pos is None or self.defensive or pos.adds >= max_adds or pos.r0 <= 0
+        if (pos is None or self.defensive or self.paused or pos.adds >= max_adds or pos.r0 <= 0
                 or pos.risk_dist <= 0 or pos.take_profit is not None):
             return
         s = _sign(pos.side)
