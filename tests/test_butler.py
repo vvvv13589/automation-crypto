@@ -548,6 +548,82 @@ def test_help_replaces_the_old_reply_keyboard(cfg, tmp_path):
     assert tg.keyboard_sent and "/stop BTC 84000" in tg.sent[-1]
 
 
+# ------------------------------------------------------------------ /pnl
+def _fill(t, side, qty, realized=0.0, fee=0.1, client="ios_x", fid=None):
+    return {"symbol": "BTCUSDT", "time": t, "id": fid or t, "side": side, "qty": qty,
+            "realized": realized, "commission": fee, "client": client}
+
+
+def test_round_trips_rebuilt_back_from_the_current_position():
+    from cryptobot.pnl import build_trips
+    fills = [_fill(1, "BUY", 1.0, -5),           # closes a short from before the history: skipped
+             _fill(2, "SELL", 2.0), _fill(3, "BUY", 1.0, 10), _fill(4, "BUY", 1.0, 8),   # short 2 -> flat
+             _fill(5, "BUY", 3.0), _fill(6, "SELL", 4.0, 6),                             # long 3, flips short 1
+             _fill(7, "SELL", 0.5)]                                                       # still short 1.5
+    trips = build_trips(fills, position=-1.5)
+    assert [(t.side, t.opened, t.closed) for t in trips] == [("short", 2, 4), ("long", 5, 6), ("short", 6, None)]
+    assert trips[0].pnl == pytest.approx(18 - 0.3) and trips[1].pnl == pytest.approx(6 - 0.2)
+    assert trips[2].pnl == pytest.approx(-0.1)
+
+
+def test_trips_are_split_into_bot_and_manual():
+    from cryptobot.pnl import Trip, classify
+    windows = [("BTCUSDT", 1000, 5000, -1.0), (None, 9000, 9500, -1.0)]  # old journal row without a coin
+    bot = Trip("BTCUSDT", "long", 1000, 5000, fills=[_fill(1000, "BUY", 1, client="x-cvBPrNm9a"),
+                                                       _fill(5000, "SELL", 1, client="x-cvBPrNm9b")])
+    app_same_time = Trip("BTCUSDT", "long", 2000, 3000, fills=[_fill(2000, "BUY", 1), _fill(3000, "SELL", 1)])
+    script_later = Trip("BTCUSDT", "long", 600000, 700000, fills=[_fill(600000, "BUY", 1, client="x-cvBPrNm9c"),
+                                                                   _fill(700000, "SELL", 1, client="x-cvBPrNm9d")])
+    old_row = Trip("ONDOUSDT", "short", 9000, 9500, fills=[_fill(9000, "SELL", 1, client="x-cvBPrNm9e"),
+                                                           _fill(9500, "BUY", 1, client="x-cvBPrNm9f")])
+    for t in (bot, app_same_time, script_later, old_row):
+        classify(t, windows)
+    assert [t.owner for t in (bot, app_same_time, script_later, old_row)] == ["bot", "manual", "manual", "bot"]
+
+
+def test_pnl_report_from_exchange_records(cfg, tmp_path):
+    from cryptobot.pnl import collect, format_pnl
+    day = 86_400_000
+    now = 100 * day
+    logs = Path(cfg["log_dir"])
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "binance_scan_live_trades.csv").write_text(
+        "symbol,opened_at,closed_at,pnl,r_multiple\n"
+        f"ETH/USDT:USDT,{pd_ts(now - 5 * day)},{pd_ts(now - 4 * day)},-10,-1.0\n")
+    fills = {"ETHUSDT": [{"time": now - 5 * day, "id": 1, "orderId": 11, "side": "SELL", "qty": "1", "realizedPnl": "0", "commission": "0.5"},
+                         {"time": now - 4 * day, "id": 2, "orderId": 12, "side": "BUY", "qty": "1", "realizedPnl": "-9", "commission": "0.5"}],
+             "BTCUSDT": [{"time": now - 3 * day, "id": 3, "orderId": 13, "side": "BUY", "qty": "1", "realizedPnl": "0", "commission": "1"},
+                         {"time": now - 2 * day, "id": 4, "orderId": 14, "side": "SELL", "qty": "1", "realizedPnl": "30", "commission": "1"}]}
+    clients = {11: "x-cvBPrNm9a", 12: "x-cvBPrNm9b", 13: "ios_a", 14: "ios_b"}
+
+    class Ex:
+        def fapiPrivateGetIncome(self, p):
+            rows = [{"symbol": s, "incomeType": "COMMISSION", "income": f"-{f['commission']}", "time": f["time"], "asset": "USDT"}
+                    for s, fs in fills.items() for f in fs]
+            rows.append({"symbol": "", "incomeType": "TRANSFER", "income": "100", "time": now - day, "asset": "USDT"})
+            rows.append({"symbol": "ETHUSDT", "incomeType": "FUNDING_FEE", "income": "-0.25", "time": now - 4.5 * day, "asset": "USDT"})
+            return [r for r in rows if p["startTime"] <= r["time"] <= p["endTime"]]
+
+        def fapiPrivateGetUserTrades(self, p):
+            return [f for f in fills[p["symbol"]] if p["startTime"] <= f["time"] <= p["endTime"]]
+
+        def fapiPrivateGetAllOrders(self, p):
+            return [{"orderId": f["orderId"], "clientOrderId": clients[f["orderId"]]} for f in self.fapiPrivateGetUserTrades(p)]
+
+        def fetch_positions(self):
+            return []
+
+    text = format_pnl(collect(Ex(), cfg, 30, now_ms=now))
+    assert "🤖 機器人：1 筆，賺 0 筆（0%），合計 -10.25 U" in text and "-1.00R" in text
+    assert "✋ 手動：1 筆，賺 1 筆（100%），合計 +28.00 U" in text
+    assert "轉入轉出 +100.00 U" in text
+
+
+def pd_ts(ms):
+    import pandas as pd
+    return pd.Timestamp(ms, unit="ms", tz="UTC").isoformat()
+
+
 def test_paused_scanner_opens_nothing_and_stops_adds(cfg, tmp_path):
     from cryptobot.backtest import make_paper_broker
     from cryptobot.scanner import Scanner

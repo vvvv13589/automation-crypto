@@ -43,6 +43,7 @@ HELP = """🤵 Telegram 管家指令
 /status　帳戶總額、可用餘額、所有持倉（🤖 機器人／✋ 手動）、停損止盈、未實現損益
 /ip　VM 對外 IP、幣安 API 是否接受連線、最近 24 小時有沒有 -2015 拒絕
 /scan　立刻跑一次回撤掃描（和每天 09:00 的一樣）
+/pnl　機器人與手動各自的已實現損益、勝率、盈虧比（最近 30 天；/pnl 7 看 7 天）
 
 💰 管理部位（先顯示內容，按 ✅ 確認才下單，60 秒沒按就作廢）
 /stop BTC 84000　掛上或移動停損：整個部位、只減倉，先掛新的再取消舊的
@@ -59,12 +60,13 @@ HELP = """🤵 Telegram 管家指令
 /new　開新對話（超過 2 小時沒講話也會自動開新的）
 直接打字或傳 K 線截圖 → AI 分析（唯讀，不能下單或改任何東西）"""
 
-COMMANDS = [("status", "帳戶與持倉"), ("ip", "對外 IP 與 API 狀態"), ("scan", "回撤掃描"),
+COMMANDS = [("status", "帳戶與持倉"), ("pnl", "機器人 vs 手動 已實現損益"), ("ip", "對外 IP 與 API 狀態"),
+            ("scan", "回撤掃描"),
             ("stop", "掛／移動停損：/stop BTC 84000"), ("tp", "掛止盈：/tp BTC 80000 50%"),
             ("close", "市價平倉：/close BTC 或 /close BTC 50%"), ("pause", "暫停開新倉"),
             ("resume", "恢復開新倉"), ("restart", "重啟交易機器人"), ("new", "AI 開新對話"), ("help", "指令說明")]
-KEYBOARD = [["/status", "/ip", "/scan"], ["/pause", "/resume", "/help"]]  # replaces any older reply keyboard
-KEYBOARD_VERSION = 1  # bump to send the keyboard again after changing it
+KEYBOARD = [["/status", "/pnl", "/ip", "/scan"], ["/pause", "/resume", "/help"]]  # replaces any older reply keyboard
+KEYBOARD_VERSION = 2  # bump to send the keyboard again after changing it
 
 
 def split_message(text: str, limit: int = TG_LIMIT) -> list[str]:
@@ -389,7 +391,7 @@ class Butler:
             cmd = cmd.split("@")[0].lower()
             self.audit("command", text[:200])
             handler = {"/help": self.cmd_help, "/start": self.cmd_help, "/status": self.cmd_status,
-                       "/ip": self.cmd_ip, "/scan": self.cmd_scan, "/new": self.cmd_new,
+                       "/ip": self.cmd_ip, "/scan": self.cmd_scan, "/new": self.cmd_new, "/pnl": self.cmd_pnl,
                        "/stop": self.cmd_stop, "/tp": self.cmd_tp, "/close": self.cmd_close,
                        "/pause": self.cmd_pause, "/resume": self.cmd_resume,
                        "/restart": self.cmd_restart}.get(cmd)
@@ -481,6 +483,28 @@ class Butler:
         except Exception as exc:
             self.tg.send(f"⚠️ 回撤掃描失敗：{str(exc)[:300]}")
         self.audit("scan-done")
+
+    def cmd_pnl(self, arg: str) -> None:
+        try:
+            days = int(arg or 30)
+        except ValueError:
+            days = 0
+        if not 1 <= days <= 90:
+            self.tg.send("用法：/pnl 或 /pnl 天數（1–90），例如 /pnl 7")
+            return
+        self.tg.send(f"🧮 計算最近 {days} 天的損益（讀幣安成交紀錄，約 10 秒）…")
+        threading.Thread(target=self._pnl, args=(days,), daemon=True).start()
+
+    def _pnl(self, days: int) -> None:
+        from .pnl import collect, format_pnl
+
+        try:
+            with self.ex_lock:
+                data = collect(self.exchange, self.cfg, days)
+            self.tg.send(format_pnl(data))
+        except Exception as exc:
+            log.exception("pnl failed")
+            self.tg.send(f"⚠️ 損益計算失敗：{str(exc)[:300]}")
 
     def cmd_new(self, _arg: str) -> None:
         if self.ai is not None:
