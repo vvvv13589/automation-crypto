@@ -47,6 +47,8 @@ HELP = """🤵 Telegram 管家指令
 /pnl　機器人與手動各自的已實現損益、勝率、盈虧比（最近 30 天；/pnl 7 看 7 天）
 
 💰 管理部位（先顯示內容，按 ✅ 確認才下單，60 秒沒按就作廢）
+點下方「🛑 停損」「🎯 止盈」「💥 平倉」→ 點持倉 → 點建議價格／數量 → ✅（全程點擊）
+也可以直接打指令：
 /stop BTC 84000　掛上或移動停損：整個部位、只減倉，先掛新的再取消舊的
 /tp BTC 80000 50%　掛止盈：只減倉，數量可寫 50% 或幣數（例如 0.005），不寫會讓你選 25～100%
 /stop BTC、/tp BTC　不寫價格 → 列出建議點位（波段高低點、ATR、保本、1R／2R），點選後再確認
@@ -69,8 +71,9 @@ COMMANDS = [("status", "帳戶與持倉"), ("pnl", "機器人 vs 手動 已實�
             ("tp", "掛止盈：/tp BTC 80000 50%（不寫價格=建議）"),
             ("close", "市價平倉：/close BTC 或 /close BTC 50%"), ("pause", "暫停開新倉"),
             ("resume", "恢復開新倉"), ("restart", "重啟交易機器人"), ("new", "AI 開新對話"), ("help", "指令說明")]
-KEYBOARD = [["/status", "/pnl", "/ip", "/scan"], ["/pause", "/resume", "/help"]]  # replaces any older reply keyboard
-KEYBOARD_VERSION = 2  # bump to send the keyboard again after changing it
+KEYBOARD = [["🛑 停損", "🎯 止盈", "💥 平倉"], ["/status", "/pnl", "/ip", "/help"]]  # replaces any older reply keyboard
+KEYBOARD_VERSION = 3  # bump to send the keyboard again after changing it
+BUTTONS = {"🛑 停損": "/stop", "🎯 止盈": "/tp", "💥 平倉": "/close"}  # reply-keyboard text -> command
 
 
 def split_message(text: str, limit: int = TG_LIMIT) -> list[str]:
@@ -414,6 +417,7 @@ class Butler:
 
     def handle(self, msg: dict) -> None:
         text = (msg.get("text") or msg.get("caption") or "").strip()
+        text = BUTTONS.get(text, text)
         photo = self._photo_id(msg)
         if text.startswith("/") and not photo:
             cmd, _, arg = text.partition(" ")
@@ -647,6 +651,9 @@ class Butler:
         from .manage import parse_coin, parse_price, plan_stop
 
         parts = arg.split()
+        if not parts:
+            self.pick_position("stop")
+            return
         if len(parts) == 1:
             self.suggest_levels(parse_coin(parts[0]), "stop")
             return
@@ -660,6 +667,9 @@ class Butler:
         from .manage import parse_coin, parse_price, plan_tp
 
         parts = arg.split()
+        if not parts:
+            self.pick_position("tp")
+            return
         if len(parts) == 1:
             self.suggest_levels(parse_coin(parts[0]), "tp")
             return
@@ -679,6 +689,28 @@ class Butler:
             return
         plan = plan_tp(snap, coin, price, parts[2])
         self.propose(plan.summary, lambda: self._trade(plan))
+
+    def pick_position(self, kind: str) -> None:
+        """Tap-only flow: every open position as a button, then levels / amounts, then ✅."""
+        snap = self.snapshot()
+        if not snap["positions"]:
+            self.tg.send("目前沒有持倉")
+            return
+        title = {"stop": "🛑 要掛／移動哪一個的停損？", "tp": "🎯 要掛哪一個的止盈？", "close": "💥 要平哪一個？"}[kind]
+
+        def label(p):
+            side = "多" if p["side"] == "long" else "空"
+            return f"{'🤖' if p['owner'] == 'bot' else '✋'} {p['coin']} {side}　{p['unrealized']:+.2f} U"
+
+        def action(p):
+            if kind in ("stop", "tp"):
+                return lambda: self.suggest_levels(p["coin"], kind)
+            return lambda: self.offer(
+                f"💥 {p['coin']} 要平掉多少？（持倉 {p['amount']:.6g}，未實現 {p['unrealized']:+.2f} U）",
+                [(f"{pct}%（約 {p['unrealized'] * pct / 100:+.2f} U）", lambda pct=pct: self.cmd_close(f"{p['coin']} {pct}%"))
+                 for pct in (25, 50, 75, 100)])
+        self.offer(title + "\n（要自訂價格可直接打，例如 /stop BTC 84000）",
+                   [(label(p), action(p)) for p in snap["positions"]])
 
     def suggest_levels(self, coin: str, kind: str) -> None:
         from .manage import find_position, suggest
@@ -702,6 +734,9 @@ class Butler:
         from .manage import parse_coin, plan_close
 
         parts = arg.split()
+        if not parts:
+            self.pick_position("close")
+            return
         if len(parts) not in (1, 2):
             self.tg.send("用法：/close 幣種 [百分比]，例如 /close BTC 或 /close BTC 50%")
             return

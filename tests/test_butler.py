@@ -492,6 +492,33 @@ def test_stop_without_price_lists_levels_then_confirms_the_picked_one(cfg, tmp_p
                                    {"stopLossPrice": 84367.0, "reduceOnly": True})
 
 
+def test_everything_by_tapping_from_the_reply_keyboard(cfg, tmp_path):
+    b, tg, ex, _ = _trading_butler(cfg, tmp_path)
+    tg.inbox.append([_msg("🛑 停損")])
+    b.poll()
+    text, options = list(tg.prompts.values())[-1]
+    assert "哪一個的停損" in text and [o[0] for o in options] == ["🤖 BTC 空　+0.73 U", "✋ ETH 多　+5.00 U"]
+    _pick(tg, b, 1, update_id=90)                       # BTC -> its suggested stops
+    assert "建議停損：BTC" in list(tg.prompts.values())[-1][0]
+    _pick(tg, b, 2, update_id=91)                       # a level -> the usual confirmation
+    assert "新停損 84367" in list(tg.prompts.values())[-1][0] and _sent_orders(ex) == []
+
+    tg.inbox.append([_msg("💥 平倉", update_id=92)])
+    b.poll()
+    _pick(tg, b, 2, update_id=93)                       # ETH -> how much
+    text, options = list(tg.prompts.values())[-1]
+    assert "ETH 要平掉多少" in text and options[1][0] == "50%（約 +2.50 U）"
+    _pick(tg, b, 2, update_id=94)
+    assert "部分平倉" in list(tg.prompts.values())[-1][0]
+    _press(tg, b, update_id=95)
+    assert ("create_order", "ETH/USDT:USDT", "market", "sell", 0.25, {"reduceOnly": True}) in ex.calls
+
+    ex.pos.clear()
+    tg.inbox.append([_msg("🎯 止盈", update_id=96)])
+    b.poll()
+    assert tg.sent[-1] == "目前沒有持倉"
+
+
 def test_tp_without_price_offers_structure_and_r_targets(cfg, tmp_path):
     b, tg, ex, clock = _trading_butler(cfg, tmp_path)
     b.cmd_tp("BTC")
