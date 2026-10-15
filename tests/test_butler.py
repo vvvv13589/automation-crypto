@@ -464,9 +464,9 @@ def test_stop_is_shown_first_then_placed_before_the_old_one_is_cancelled(cfg, tm
     # an amount-based bridge stop, the old whole-position stop goes, the new whole-position stop
     # (one allowed per position, shown on the app's position card), then the bridge goes
     assert _sent_orders(ex) == [
-        ("create_order", "BTC/USDT:USDT", "market", "buy", 0.013, {"stopLossPrice": 84000.0, "reduceOnly": True}),
+        ("create_order", "BTC/USDT:USDT", "market", "buy", 0.013, {"stopLossPrice": 84000.0, "reduceOnly": True, "timeInForce": "GTE_GTC", "priceProtect": True}),
         ("cancel_order", "old-stop", {"trigger": True}),
-        ("create_order", "BTC/USDT:USDT", "market", "buy", None, {"stopLossPrice": 84000.0, "closePosition": True}),
+        ("create_order", "BTC/USDT:USDT", "market", "buy", None, {"stopLossPrice": 84000.0, "closePosition": True, "timeInForce": "GTE_GTC", "priceProtect": True}),
         ("cancel_order", "new-1", {"trigger": True})]
     assert "整倉停損" in tg.sent[-1] and "停損 84000（全部）" in tg.sent[-1]  # read back
     assert "已確認" in tg.edits[-1][1]
@@ -497,7 +497,7 @@ def test_stop_without_price_lists_levels_then_confirms_the_picked_one(cfg, tmp_p
     assert "新停損 84367" in text
     _press(tg, b, update_id=71)
     assert _sent_orders(ex)[0] == ("create_order", "BTC/USDT:USDT", "market", "buy", 0.013,
-                                   {"stopLossPrice": 84367.0, "reduceOnly": True})
+                                   {"stopLossPrice": 84367.0, "reduceOnly": True, "timeInForce": "GTE_GTC", "priceProtect": True})
 
 
 def test_everything_by_tapping_from_the_reply_keyboard(cfg, tmp_path):
@@ -590,10 +590,10 @@ def test_whole_position_stop_falls_back_to_the_amount_stop_and_tp_100_is_whole(c
     _press(tg, b, update_id=60)
     assert "整倉止盈" in tg.sent[-1]
     assert ("create_order", "BTC/USDT:USDT", "market", "buy", None,
-            {"takeProfitPrice": 80000.0, "closePosition": True}) in _sent_orders(ex)
+            {"takeProfitPrice": 80000.0, "closePosition": True, "timeInForce": "GTE_GTC", "priceProtect": True}) in _sent_orders(ex)
     b.cmd_tp("BTC 79000 100%")                          # a second whole take-profit is refused: amount-based
     _press(tg, b, update_id=61)
-    assert "數量 0.013" in tg.sent[-1] and "條件單" in tg.sent[-1]
+    assert "數量 0.013" in tg.sent[-1] and "持倉上看得到" in tg.sent[-1]
 
 
 def test_failed_new_stop_keeps_the_old_one(cfg, tmp_path):
@@ -628,7 +628,7 @@ def test_take_profit_amount_and_validation(cfg, tmp_path):
     assert "數量 0.25（50%）" in text and "+25.00 U" in text and "交易機器人" not in text
     _press(tg, b)
     assert _sent_orders(ex) == [("create_order", "ETH/USDT:USDT", "market", "sell", 0.25,
-                                 {"takeProfitPrice": 2600.0, "reduceOnly": True})]
+                                 {"takeProfitPrice": 2600.0, "reduceOnly": True, "timeInForce": "GTE_GTC", "priceProtect": True})]
     assert "止盈已掛上 2600" in tg.sent[-1] and "止盈 2600（0.25）" in tg.sent[-1]
     for bad, why in (("ETH 2400 50%", "要高於現價"), ("ETH 2600 1", "超過持倉"), ("ETH 2600 50% x", "用法")):
         tg.inbox.append([_msg(f"/tp {bad}", update_id=60)])

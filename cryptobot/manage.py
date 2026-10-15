@@ -13,6 +13,11 @@ from dataclasses import dataclass, field
 
 from .butler import _order, _px, mark_leftovers
 
+# Like a stop / take-profit set on the position in the Binance app: lives with the position (shown
+# on the position card, cancelled when the position is closed) and is not triggered by a wick far
+# from the mark price. Verified on the live account 2026-10-15 (Binance accepted both, app shows them).
+POSITION_LINKED = {"timeInForce": "GTE_GTC", "priceProtect": True}
+
 BOT_WARNING = ("🤖 注意：這是交易機器人開的倉，機器人也在管理它：它記得自己的停損價，價格碰到時"
                "仍會市價平倉；移動停損時會再掛回它自己的停損單；部分平倉它不會察覺（它的單都是只減倉，不會反向開倉）。")
 
@@ -250,7 +255,7 @@ def execute(exchange, plan: Plan) -> str:
         price = float(exchange.price_to_precision(plan.symbol, plan.price))
         # 1. an amount-based stop first, so there is never a moment without one ...
         bridge = exchange.create_order(plan.symbol, "market", close_side, amount, None,
-                                       {"stopLossPrice": price, "reduceOnly": True})
+                                       {"stopLossPrice": price, "reduceOnly": True, **POSITION_LINKED})
         failed = []
         for o in old:  # 2. ... then the old stops go
             try:
@@ -261,12 +266,12 @@ def execute(exchange, plan: Plan) -> str:
         # the position card, follows size changes). Binance allows one per position, hence the bridge.
         try:
             exchange.create_order(plan.symbol, "market", close_side, None, None,
-                                  {"stopLossPrice": price, "closePosition": True})
+                                  {"stopLossPrice": price, "closePosition": True, **POSITION_LINKED})
             _cancel(exchange, plan.symbol, {"id": bridge["id"], "trigger": True})
             head = f"✅ 新停損已掛上 {_px(price)}：整倉停損（幣安 App 的持倉上看得到）"
         except Exception as exc:
             head = (f"✅ 新停損已掛上 {_px(price)}，數量 {_px(amount)}（單號 {bridge.get('id')}）\n"
-                    f"（整倉停損掛不上：{str(exc)[:80]}，改用數量型停損，在 App 的「委託 → 條件單」）")
+                    f"（整倉停損掛不上：{str(exc)[:80]}，改用數量型停損）")
         if old:
             head += f"\n已取消舊停損 {len(old) - len(failed)} 張"
         if failed:
@@ -278,14 +283,14 @@ def execute(exchange, plan: Plan) -> str:
         if plan.fraction >= 1 - 1e-9:  # whole position: a position take-profit, as in the app
             try:
                 exchange.create_order(plan.symbol, "market", close_side, None, None,
-                                      {"takeProfitPrice": price, "closePosition": True})
+                                      {"takeProfitPrice": price, "closePosition": True, **POSITION_LINKED})
                 return f"✅ 止盈已掛上 {_px(price)}：整倉止盈（幣安 App 的持倉上看得到）\n{_after(exchange, plan)}"
             except Exception:
                 pass  # e.g. a whole-position take-profit already exists: add an amount-based one
         order = exchange.create_order(plan.symbol, "market", close_side, amount, None,
-                                      {"takeProfitPrice": price, "reduceOnly": True})
+                                      {"takeProfitPrice": price, "reduceOnly": True, **POSITION_LINKED})
         return (f"✅ 止盈已掛上 {_px(price)}，數量 {_px(amount)}（單號 {order.get('id')}，"
-                f"在 App 的「委託 → 條件單」）\n{_after(exchange, plan)}")
+                f"幣安 App 的持倉上看得到）\n{_after(exchange, plan)}")
 
     # market close
     order = exchange.create_order(plan.symbol, "market", close_side, amount, None, {"reduceOnly": True})
