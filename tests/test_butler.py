@@ -394,11 +394,15 @@ class TradingExchange(FakeExchange):
         oid = f"new-{self._n}"
         if "stopLossPrice" in params or "takeProfitPrice" in params:
             tp = "takeProfitPrice" in params
-            self.orders[symbol].append({"id": oid, "trigger": True, "side": side, "amount": amount,
+            kind = "TAKE_PROFIT_MARKET" if tp else "STOP_MARKET"
+            whole = bool(params.get("closePosition"))
+            if whole and any(o["info"]["closePosition"] and o["info"]["orderType"] == kind for o in self.orders[symbol]):
+                raise RuntimeError('binance {"code":-4130,"msg":"An open stop or take profit order with GTE and '
+                                   'closePosition in the direction is existing."}')
+            self.orders[symbol].append({"id": oid, "trigger": True, "side": side, "amount": None if whole else amount,
                                         "triggerPrice": params.get("takeProfitPrice") or params.get("stopLossPrice"),
                                         "takeProfitPrice": params.get("takeProfitPrice"), "reduceOnly": True,
-                                        "info": {"orderType": "TAKE_PROFIT_MARKET" if tp else "STOP_MARKET",
-                                                 "closePosition": False}})
+                                        "info": {"orderType": kind, "closePosition": whole}})
             return {"id": oid}
         p = self.pos[symbol]  # reduce-only market close
         p["contracts"] = round(p["contracts"] - amount, 6)
@@ -457,10 +461,14 @@ def test_stop_is_shown_first_then_placed_before_the_old_one_is_cancelled(cfg, tm
     assert "-5.77 U" in text and "84670.1" in text and "交易機器人開的倉" in text and "60 秒" in text
     assert _sent_orders(ex) == []                      # nothing sent before ✅
     _press(tg, b)
+    # an amount-based bridge stop, the old whole-position stop goes, the new whole-position stop
+    # (one allowed per position, shown on the app's position card), then the bridge goes
     assert _sent_orders(ex) == [
         ("create_order", "BTC/USDT:USDT", "market", "buy", 0.013, {"stopLossPrice": 84000.0, "reduceOnly": True}),
-        ("cancel_order", "old-stop", {"trigger": True})]
-    assert "新停損已掛上 84000" in tg.sent[-1] and "停損 84000（0.013）" in tg.sent[-1]  # read back
+        ("cancel_order", "old-stop", {"trigger": True}),
+        ("create_order", "BTC/USDT:USDT", "market", "buy", None, {"stopLossPrice": 84000.0, "closePosition": True}),
+        ("cancel_order", "new-1", {"trigger": True})]
+    assert "整倉停損" in tg.sent[-1] and "停損 84000（全部）" in tg.sent[-1]  # read back
     assert "已確認" in tg.edits[-1][1]
     audit = Path(b.audit_path).read_text(encoding="utf-8")
     assert "propose" in audit and "confirmed" in audit and "result" in audit
@@ -562,8 +570,30 @@ def test_leftover_stop_from_an_opposite_position_is_flagged_and_replaced(cfg, tm
     b.cmd_stop("ETH 2400")
     assert "也會取消方向不對的殘單：2600" in list(tg.prompts.values())[-1][0]
     _press(tg, b)
-    assert [c[0] for c in _sent_orders(ex)] == ["create_order", "cancel_order"]
-    assert ex.orders["ETH/USDT:USDT"][0]["side"] == "sell"
+    assert [c[0] for c in _sent_orders(ex)] == ["create_order", "cancel_order", "create_order", "cancel_order"]
+    assert [(o["side"], o["info"]["closePosition"]) for o in ex.orders["ETH/USDT:USDT"]] == [("sell", True)]
+
+
+def test_whole_position_stop_falls_back_to_the_amount_stop_and_tp_100_is_whole(cfg, tmp_path):
+    b, tg, ex, _ = _trading_butler(cfg, tmp_path)
+    ex.orders["BTC/USDT:USDT"].append({"id": "keep", "trigger": True, "side": "buy", "triggerPrice": 85000,
+                                       "amount": None, "reduceOnly": True,
+                                       "info": {"orderType": "STOP_MARKET", "closePosition": True}})
+    real_cancel = ex.cancel_order
+    ex.cancel_order = lambda oid, s, p=None: (_ for _ in ()).throw(RuntimeError("busy")) if oid == "keep" \
+        else real_cancel(oid, s, p)
+    b.cmd_stop("BTC 84000")
+    _press(tg, b)                                       # an old whole stop that will not cancel
+    assert "改用數量型停損" in tg.sent[-1] and "取消失敗" in tg.sent[-1]
+    assert any(o["id"] == "new-1" and o["amount"] == 0.013 for o in ex.orders["BTC/USDT:USDT"])  # bridge kept
+    b.cmd_tp("BTC 80000 100%")
+    _press(tg, b, update_id=60)
+    assert "整倉止盈" in tg.sent[-1]
+    assert ("create_order", "BTC/USDT:USDT", "market", "buy", None,
+            {"takeProfitPrice": 80000.0, "closePosition": True}) in _sent_orders(ex)
+    b.cmd_tp("BTC 79000 100%")                          # a second whole take-profit is refused: amount-based
+    _press(tg, b, update_id=61)
+    assert "數量 0.013" in tg.sent[-1] and "條件單" in tg.sent[-1]
 
 
 def test_failed_new_stop_keeps_the_old_one(cfg, tmp_path):
