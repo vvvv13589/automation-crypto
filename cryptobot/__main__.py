@@ -230,8 +230,11 @@ def main(argv=None) -> int:
     fp.add_argument("--margin", type=float, default=None)
     fp.add_argument("--leverage", type=int, default=None)
     sub.add_parser("butler", help="Telegram butler: answers commands and AI chat (the only Telegram reader)")
-    at = sub.add_parser("ai-trader", help="AI discretionary trader on the top 50 coins (paper, no API key)")
+    at = sub.add_parser("ai-trader", help="AI discretionary trader on the top 50 coins (paper; --live for the AI sub-account)")
     at.add_argument("--once", action="store_true", help="one decision now, then exit")
+    at.add_argument("--live", action="store_true", help="trade the AI sub-account for real (+ paper mirror)")
+    at.add_argument("--check", action="store_true", help="read-only check of the AI sub-account key")
+    at.add_argument("--live-test", metavar="COIN", help="smallest real round trip on COIN, then exit")
     live =sub.add_parser("live", help="REAL trading with real funds")
     live.add_argument("--confirm-live", action="store_true", help="required: I accept the risk")
 
@@ -275,7 +278,8 @@ def main(argv=None) -> int:
         import os
 
         from .aitrader import main as aitrader_main
-        return aitrader_main(cfg, os.getcwd(), once=args.once)
+        return aitrader_main(cfg, os.getcwd(), once=args.once, live=args.live, check=args.check,
+                             test_coin=args.live_test)
     if args.command == "status":
         import os
 

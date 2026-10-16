@@ -1,12 +1,16 @@
-"""AI discretionary trader (paper): Claude reads the top-50 market and the news and decides.
+"""AI discretionary trader: Claude reads the top-50 market and the news and decides.
 
-    python3 -m cryptobot ai-trader            # loop forever (systemd cryptobot-aitrader)
-    python3 -m cryptobot ai-trader --once     # one decision now, then exit (testing)
+    python3 -m cryptobot ai-trader                 # paper only (200 U simulated)
+    python3 -m cryptobot ai-trader --live          # AI sub-account for real + the paper mirror
+    python3 -m cryptobot ai-trader --check         # read-only: is the live key the AI sub-account?
+    python3 -m cryptobot ai-trader --live-test DOGE # smallest real round trip: open, stop, tp, close
+    python3 -m cryptobot ai-trader --once          # one paper decision now, then exit
 
 The AI only *proposes* actions as JSON; every action passes hard limits in code (Guard) that it
 cannot change: a stop on every trade, max risk per trade, max account leverage, max positions,
-stops may only be tightened, and no new trades below the equity floor. Fills are simulated on
-live Binance prices (taker fee + slippage, real funding at 00/08/16 UTC). No API key is used.
+stops may only be tightened, and no new trades below the equity floor. Live stops and
+take-profits rest on the exchange. Paper fills use live Binance prices (taker fee + slippage,
+real funding at 00/08/16 UTC). Live keys: AITRADER_API_KEY / AITRADER_API_SECRET.
 """
 
 from __future__ import annotations
@@ -28,7 +32,10 @@ from .ai import AI_ROOT, ClaudeChat
 log = logging.getLogger(__name__)
 
 DEFAULTS = {
-    "starting_cash": 200.0,
+    "paper_cash": 200.0,  # simulated account, mirrors every decision
+    "live_cash": 50.0,  # what was put into the AI sub-account (for % and the target)
+    "target_multiple": 5,
+    "live_max_equity": 120.0,  # refuse to run on an account bigger than this (wrong API key?)
     "model": "opus",
     "max_turns": 25,
     "decide_minutes": 60,  # regular decision every hour
@@ -38,7 +45,7 @@ DEFAULTS = {
     "max_positions": 4,
     "max_risk_pct": 5.0,  # loss at the stop, % of equity, per trade
     "max_leverage": 5.0,  # total open notional / equity
-    "floor": 100.0,  # no new positions at or below this equity
+    "floor_frac": 0.5,  # no new positions at or below this share of the starting cash
     "min_stop_pct": 0.3,
     "max_stop_pct": 25.0,
     "taker_fee": 0.0005,
@@ -59,6 +66,10 @@ URGENT = re.compile(r"hack|exploit|drain|stolen|delist|liquidat|crash|plunge|sec
                     r"fed\b|fomc|rate (cut|hike)|cpi|tariff|bankrupt|halt|outage|depeg|lawsuit|ban\b|"
                     r"approv|will list|launchpool|emergency", re.I)
 UA = {"User-Agent": "Mozilla/5.0 (cryptobot ai-trader)"}
+
+
+def settings(cfg: dict) -> dict:
+    return {**DEFAULTS, **(cfg.get("aitrader") or {})}
 
 
 def _get(url: str, timeout: int = 15) -> bytes:
@@ -200,21 +211,27 @@ class Market:
         return "\n".join(lines)
 
 
-# -- paper book + hard limits -----------------------------------------------------------
+
+# -- accounts: paper book, live book, hard limits -----------------------------------------
+class LiveError(Exception):
+    """A live order could not be done; the message is shown to the user and the AI."""
+
+
 class Book:
     """Simulated USDT-perpetual account. State survives restarts (JSON)."""
 
-    def __init__(self, path: Path, trades_csv: Path, cfg: dict):
-        self.path, self.trades_csv, self.cfg = path, trades_csv, cfg
-        if path.exists():
-            s = json.loads(path.read_text())
-        else:
-            s = {"cash": cfg["starting_cash"], "positions": {}, "started": time.time(), "last_check": time.time(),
-                 "last_funding": None}
-        self.cash: float = s["cash"]
-        self.positions: dict[str, dict] = s["positions"]
-        self.started: float = s["started"]
-        self.last_check: float = s["last_check"]
+    live = False
+    label = "模擬"
+
+    def __init__(self, path: Path, trades_csv: Path, cfg: dict, starting_cash: float, clock=time.time):
+        self.path, self.trades_csv, self.cfg, self.clock = path, trades_csv, cfg, clock
+        self.starting_cash = starting_cash
+        self.floor = starting_cash * cfg["floor_frac"]
+        s = json.loads(path.read_text()) if path.exists() else {}
+        self.cash: float = s.get("cash", starting_cash)
+        self.positions: dict[str, dict] = s.get("positions", {})
+        self.started: float = s.get("started", clock())
+        self.last_check: float = s.get("last_check", clock())
         self.last_funding = s.get("last_funding")
         self.btc_start = s.get("btc_start")
 
@@ -233,28 +250,19 @@ class Book:
     def notional(self, prices: dict[str, float]) -> float:
         return sum(p["qty"] * prices.get(c, p["entry"]) for c, p in self.positions.items())
 
-    def open(self, coin: str, side: str, price: float, qty: float, stop: float, tp: float | None,
-             reason: str, now: float) -> dict:
-        fill = price * (1 + self.cfg["slippage"] * (1 if side == "long" else -1))
-        fee = fill * qty * self.cfg["taker_fee"]
-        self.cash -= fee
-        self.positions[coin] = {"side": side, "qty": qty, "entry": fill, "stop": stop, "tp": tp, "opened": now,
-                                "reason": reason, "fees": fee, "funding": 0.0, "init_stop": stop}
+    def _new(self, coin, side, qty, entry, stop, tp, reason, now, fee, **extra) -> dict:
+        self.positions[coin] = {"side": side, "qty": qty, "entry": entry, "stop": stop, "tp": tp, "opened": now,
+                                "reason": reason, "fees": fee, "funding": 0.0, "init_stop": stop, **extra}
         self.save()
         return self.positions[coin]
 
-    def close(self, coin: str, price: float, why: str, now: float, slip: bool = True) -> dict:
-        p = self.positions.pop(coin)
+    def _record(self, coin: str, p: dict, exit_px: float, exit_fee: float, why: str, now: float) -> dict:
         sgn = 1 if p["side"] == "long" else -1
-        fill = price * (1 - self.cfg["slippage"] * sgn) if slip else price
-        fee = fill * p["qty"] * self.cfg["taker_fee"]
-        gross = (fill - p["entry"]) * p["qty"] * sgn
-        self.cash += gross - fee
+        net = (exit_px - p["entry"]) * p["qty"] * sgn - exit_fee - p["fees"] + p["funding"]
         risk = abs(p["entry"] - p["init_stop"]) * p["qty"]
-        net = gross - fee - p["fees"] + p["funding"]
-        row = {"coin": coin, "side": p["side"], "opened": utc(p["opened"]), "closed": utc(now), "entry": fmt(p["entry"]),
-               "exit": fmt(fill), "qty": fmt(p["qty"]), "pnl": round(net, 2), "r": round(net / risk, 2) if risk else 0,
-               "why": why, "reason": p["reason"]}
+        row = {"coin": coin, "side": p["side"], "opened": utc(p["opened"]), "closed": utc(now),
+               "entry": fmt(p["entry"]), "exit": fmt(exit_px), "qty": fmt(p["qty"]), "pnl": round(net, 2),
+               "r": round(net / risk, 2) if risk else 0, "why": why, "reason": p["reason"]}
         new = not self.trades_csv.exists()
         with self.trades_csv.open("a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=list(row))
@@ -264,12 +272,190 @@ class Book:
         self.save()
         return row
 
+    def open(self, coin: str, side: str, price: float, qty: float, stop: float, tp: float | None,
+             reason: str, now: float) -> dict:
+        fill = price * (1 + self.cfg["slippage"] * (1 if side == "long" else -1))
+        fee = fill * qty * self.cfg["taker_fee"]
+        self.cash -= fee
+        return self._new(coin, side, qty, fill, stop, tp, reason, now, fee)
+
+    def close(self, coin: str, price: float, why: str, now: float, slip: bool = True) -> dict:
+        p = self.positions.pop(coin)
+        sgn = 1 if p["side"] == "long" else -1
+        fill = price * (1 - self.cfg["slippage"] * sgn) if slip else price
+        fee = fill * p["qty"] * self.cfg["taker_fee"]
+        self.cash += (fill - p["entry"]) * p["qty"] * sgn - fee
+        return self._record(coin, p, fill, fee, why, now)
+
+    def move_stop(self, coin: str, stop: float, now: float) -> None:
+        self.positions[coin].update(stop=stop, since=now)
+        self.save()
+
+    def set_tp(self, coin: str, tp: float | None) -> None:
+        self.positions[coin]["tp"] = tp
+        self.save()
+
     def apply_funding(self, rates: dict[str, float], prices: dict[str, float]) -> None:
         for c, p in self.positions.items():
             amt = p["qty"] * prices.get(c, p["entry"]) * rates.get(c, 0) * (-1 if p["side"] == "long" else 1)
             p["funding"] += amt
             self.cash += amt
         self.save()
+
+    def sync_exits(self, ex, now: float) -> list[tuple[dict, str]]:
+        """Stops / take-profits hit by any 1m candle since the last check."""
+        closed = []
+        for coin, p in list(self.positions.items()):
+            # only whole minutes after the entry / last stop change: earlier prices never applied
+            start = max(self.last_check - 60, p.get("since", p["opened"]))
+            first = int(-(-p.get("since", p["opened"]) // 60) * 60_000)
+            try:
+                bars = ex.fetch_ohlcv(f"{coin}/USDT:USDT", "1m", since=int(start // 60 * 60_000), limit=500)
+                bars = [b for b in bars if b[0] >= first]
+            except Exception as exc:
+                log.warning("1m %s: %s", coin, exc)
+                continue
+            long = p["side"] == "long"
+            for _, o, h, l, _c, _v in bars:
+                stop_hit = (l <= p["stop"]) if long else (h >= p["stop"])
+                tp_hit = p["tp"] is not None and ((h >= p["tp"]) if long else (l <= p["tp"]))
+                if stop_hit:  # worst case first when both are inside one candle
+                    gap = (o < p["stop"]) if long else (o > p["stop"])
+                    closed.append((self.close(coin, o if gap else p["stop"], "停損", now), "🛑"))
+                    break
+                if tp_hit:
+                    closed.append((self.close(coin, p["tp"], "止盈", now, slip=False), "🎯"))
+                    break
+        self.last_check = now
+        self.save()
+        return closed
+
+
+class LiveBook(Book):
+    """A real Binance USDT-M account (meant to be a sub-account used only by the AI trader).
+    Stops and take-profits rest on the exchange, so the position is protected even if this
+    process or the VM is down. A position is never left without a stop: if placing it fails,
+    the position is closed at once."""
+
+    live = True
+    label = "真倉"
+
+    def __init__(self, path: Path, trades_csv: Path, cfg: dict, starting_cash: float, ex, clock=time.time,
+                 broker_factory=None):
+        super().__init__(path, trades_csv, cfg, starting_cash, clock)
+        self.ex = ex
+        if broker_factory is None:
+            from .broker import FuturesLiveBroker
+            broker_factory = lambda sym: FuturesLiveBroker(ex, sym, int(cfg["max_leverage"]), "isolated")
+        self._factory, self._brokers = broker_factory, {}
+
+    def broker(self, coin: str):
+        if coin not in self._brokers:
+            self._brokers[coin] = self._factory(f"{coin}/USDT:USDT")
+        return self._brokers[coin]
+
+    def equity(self, prices: dict[str, float]) -> float:
+        return self.broker("BTC").equity(0)
+
+    def exchange_positions(self) -> dict[str, float]:
+        out = {}
+        for p in self.ex.fetch_positions():
+            amt = float(p.get("contracts") or 0) * float(p.get("contractSize") or 1)
+            if amt:
+                out[p["symbol"].split("/")[0]] = amt if p.get("side") == "long" else -amt
+        return out
+
+    def check_account(self) -> str | None:
+        """Refuse to trade an account that is not the AI's own (e.g. the main bot's keys)."""
+        eq = self.equity({})
+        if eq > self.cfg["live_max_equity"]:
+            return (f"帳戶權益 {eq:.2f} U 超過 live_max_equity {self.cfg['live_max_equity']:g} U："
+                    "這可能不是 AI 專用的子帳戶，拒絕啟動")
+        unknown = sorted(set(self.exchange_positions()) - set(self.positions))
+        if unknown:
+            return f"帳戶裡有不是 AI 開的倉位 {', '.join(unknown)}：這可能不是 AI 專用的子帳戶，拒絕啟動"
+        return None
+
+    def _place_tp(self, b, side: str, amount: float, tp: float) -> str:
+        price = float(self.ex.price_to_precision(b.symbol, tp))
+        order = self.ex.create_order(b.symbol, "market", "sell" if side == "long" else "buy", b._amount(amount),
+                                     None, {"takeProfitPrice": price, "reduceOnly": True})
+        return order["id"]
+
+    def open(self, coin, side, price, qty, stop, tp, reason, now) -> dict:
+        b = self.broker(coin)
+        dist = abs(price - stop) / price
+        # isolated leverage low enough that liquidation lies well beyond the stop
+        lev = int(max(1, min(self.cfg["max_leverage"], 1 / (dist + 0.02))))
+        free = b.free_margin(price)
+        qty = min(qty, free * 0.9 * lev / price)
+        b.use_leverage(lev)
+        fill = b.market_open(side, qty, price)
+        if fill is None or fill.amount <= 0:
+            limits = (self.ex.market(b.symbol).get("limits") or {}).get("cost") or {}
+            raise LiveError(f"數量太小，低於交易所最低下單（{qty * price:.1f} U，最低 {limits.get('min')} U）")
+        try:
+            stop_id = b.set_stop(side, fill.amount, stop)
+        except Exception as exc:
+            b.market_close(side, fill.amount, price)
+            raise LiveError(f"停損掛單失敗，已立刻市價平倉：{str(exc)[:150]}")
+        tp_id = None
+        if tp:
+            try:
+                tp_id = self._place_tp(b, side, fill.amount, tp)
+            except Exception as exc:
+                log.warning("%s take-profit failed: %s", coin, exc)
+                tp = None
+        return self._new(coin, side, fill.amount, fill.price, stop, tp, reason, now, fill.fee,
+                         stop_id=stop_id, tp_id=tp_id, leverage=lev)
+
+    def close(self, coin, price, why, now, slip=True) -> dict:
+        p = self.positions[coin]
+        b = self.broker(coin)
+        b.cancel_stop(p.get("stop_id"))
+        b.cancel_stop(p.get("tp_id"))
+        since = datetime.fromtimestamp(p["opened"], timezone.utc).isoformat()
+        fill = b.market_close(p["side"], p["qty"], price, since=since)
+        self.positions.pop(coin)
+        exit_px = fill.price if fill else price
+        if why is None:  # closed on the exchange: by the stop or by the take-profit order
+            near_tp = p.get("tp") and abs(exit_px - p["tp"]) < abs(exit_px - p["stop"])
+            why = "止盈" if near_tp else "停損"
+        return self._record(coin, p, exit_px, fill.fee if fill else 0.0, why, now)
+
+    def move_stop(self, coin, stop, now) -> None:
+        p = self.positions[coin]
+        p["stop_id"] = self.broker(coin).set_stop(p["side"], p["qty"], stop, p.get("stop_id"))
+        super().move_stop(coin, stop, now)
+
+    def set_tp(self, coin, tp) -> None:
+        p = self.positions[coin]
+        b = self.broker(coin)
+        new_id = self._place_tp(b, p["side"], p["qty"], tp) if tp else None
+        b.cancel_stop(p.get("tp_id"))
+        p["tp_id"] = new_id
+        super().set_tp(coin, tp)
+
+    def apply_funding(self, rates, prices) -> None:
+        pass  # real funding is already in the exchange balance
+
+    def sync_exits(self, ex, now) -> list[tuple[dict, str]]:
+        """Positions the exchange closed (stop / take-profit / liquidation / manual)."""
+        if not self.positions:
+            return []
+        try:
+            live = self.exchange_positions()
+        except Exception as exc:
+            log.warning("positions: %s", exc)
+            return []
+        closed = []
+        for coin in [c for c in self.positions if c not in live]:
+            row = self.close(coin, self.positions[coin]["stop"], None, now)
+            closed.append((row, "🎯" if row["why"] == "止盈" else "🛑"))
+        self.last_check = now
+        self.save()
+        return closed
+
 
 
 class Guard:
@@ -290,8 +476,8 @@ class Guard:
         if side not in ("long", "short"):
             return False, "side 要是 long/short", None
         eq = book.equity(prices)
-        if eq <= c["floor"]:
-            return False, f"權益 {eq:.1f} ≤ 底線 {c['floor']:g}，停止開新倉", None
+        if eq <= book.floor:
+            return False, f"權益 {eq:.1f} ≤ 底線 {book.floor:g}，停止開新倉", None
         try:
             stop = float(a["stop"])
         except (KeyError, TypeError, ValueError):
@@ -376,17 +562,23 @@ def parse_decision(text: str) -> dict:
     raise ValueError(f"no decision JSON in reply: {text[-300:]}")
 
 
+
 # -- the loop -----------------------------------------------------------------------
 class AITrader:
-    def __init__(self, cfg: dict, ex, ai, notify=None, clock=time.time, fetch=_get):
-        self.cfg = {**DEFAULTS, **(cfg.get("aitrader") or {})}
+    """One AI decision per round, applied to every book: books[0] is the one the AI sees and the
+    user is told about (the live account when live); the others mirror it silently (paper)."""
+
+    def __init__(self, cfg: dict, ex, ai, notify=None, clock=time.time, fetch=_get, books=None):
+        self.cfg = settings(cfg)
         state, logs = Path(cfg.get("state_dir", "state")), Path(cfg.get("log_dir", "logs"))
         state.mkdir(parents=True, exist_ok=True)
         logs.mkdir(parents=True, exist_ok=True)
         self.ex, self.ai, self.clock = ex, ai, clock
         self.notify = notify or (lambda text: None)
         self.market = Market(ex, self.cfg["universe"])
-        self.book = Book(state / "aitrader_book.json", logs / "aitrader_trades.csv", self.cfg)
+        self.books = books or [Book(state / "aitrader_book.json", logs / "aitrader_trades.csv", self.cfg,
+                                    self.cfg["paper_cash"], clock)]
+        self.book = self.books[0]
         self.news = News(state / "aitrader_news.json", fetch=fetch, clock=clock)
         self.journal = logs / "aitrader_decisions.jsonl"
         self.guard = Guard(self.cfg)
@@ -400,7 +592,7 @@ class AITrader:
     # -- prices / stops ---------------------------------------------------------------
     def prices(self) -> dict[str, float]:
         out = {}
-        for c in self.book.positions:
+        for c in {c for b in self.books for c in b.positions}:
             try:
                 out[c] = self.market.price(c)
             except Exception as exc:
@@ -408,42 +600,23 @@ class AITrader:
         return out
 
     def check_exits(self) -> None:
-        """Stops / take-profits hit by any 1m candle since the last check."""
         now = self.clock()
-        for coin, p in list(self.book.positions.items()):
-            # only whole minutes after the entry / last stop change: earlier prices never applied
-            start = max(self.book.last_check - 60, p.get("since", p["opened"]))
-            first = int(-(-p.get("since", p["opened"]) // 60) * 60_000)
-            try:
-                bars = self.ex.fetch_ohlcv(f"{coin}/USDT:USDT", "1m", since=int(start // 60 * 60_000), limit=500)
-                bars = [b for b in bars if b[0] >= first]
-            except Exception as exc:
-                log.warning("1m %s: %s", coin, exc)
-                continue
-            long = p["side"] == "long"
-            for _, o, h, l, _c, _v in bars:
-                stop_hit = (l <= p["stop"]) if long else (h >= p["stop"])
-                tp_hit = p["tp"] is not None and ((h >= p["tp"]) if long else (l <= p["tp"]))
-                if stop_hit:  # worst case first when both are inside one candle
-                    gap = (o < p["stop"]) if long else (o > p["stop"])
-                    self._closed(self.book.close(coin, o if gap else p["stop"], "停損", now), "🛑")
-                    break
-                if tp_hit:
-                    self._closed(self.book.close(coin, p["tp"], "止盈", now, slip=False), "🎯")
-                    break
-        self.book.last_check = now
-        self.book.save()
+        for b in self.books:
+            for row, icon in b.sync_exits(self.ex, now):
+                if b is self.book:
+                    self._closed(row, icon)
 
     def funding(self) -> None:
-        """Real funding at 00/08/16 UTC, using the rate just before settlement."""
+        """Paper books: real funding at 00/08/16 UTC, using the rate just before settlement."""
         now = datetime.fromtimestamp(self.clock(), timezone.utc)
         slot = now.replace(minute=0, second=0, microsecond=0, hour=now.hour // 8 * 8).isoformat()
-        if self.book.last_funding is None:
-            self.book.last_funding = slot
-        if slot != self.book.last_funding and self.book.positions:
-            self.book.apply_funding(self.market.funding(), self.prices())
-        self.book.last_funding = slot
-        self.book.save()
+        for b in self.books:
+            if b.live:
+                continue
+            if b.last_funding is not None and slot != b.last_funding and b.positions:
+                b.apply_funding(self.market.funding(), self.prices())
+            b.last_funding = slot
+            b.save()
 
     def _closed(self, row: dict, icon: str) -> None:
         eq = self.book.equity(self.prices())
@@ -452,11 +625,12 @@ class AITrader:
                     f"權益 {eq:.2f} U")
 
     # -- deciding ---------------------------------------------------------------
-    def positions_text(self, prices: dict) -> str:
-        if not self.book.positions:
+    def positions_text(self, prices: dict, book=None) -> str:
+        book = book or self.book
+        if not book.positions:
             return "（目前沒有倉位）"
         out = []
-        for c, p in self.book.positions.items():
+        for c, p in book.positions.items():
             px = prices.get(c, p["entry"])
             sgn = 1 if p["side"] == "long" else -1
             pnl = (px - p["entry"]) * p["qty"] * sgn
@@ -466,6 +640,13 @@ class AITrader:
                        f"開倉 {utc(p['opened'])} 理由：{p['reason']}")
         return "\n".join(out)
 
+    @staticmethod
+    def trades(book) -> list[dict]:
+        if not book.trades_csv.exists():
+            return []
+        with book.trades_csv.open(encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
     def history_text(self, n: int = 8) -> str:
         lines = []
         if self.journal.exists():
@@ -473,21 +654,19 @@ class AITrader:
                 d = json.loads(raw)
                 acts = "; ".join(f"{a.get('type')} {a.get('coin', '')} {a.get('result', '')}" for a in d.get("actions", []))
                 lines.append(f"{d['time']} 看法：{d.get('view', '')[:200]} | 動作：{acts or '觀望'}")
-        trades = []
-        if self.book.trades_csv.exists():
-            with self.book.trades_csv.open(encoding="utf-8") as f:
-                trades = list(csv.DictReader(f))[-10:]
         lines.append("最近平倉：" + ("; ".join(f"{t['coin']} {t['side']} {t['pnl']}U ({t['r']}R, {t['why']})"
-                                         for t in trades) or "無"))
-        return "\n".join(lines) or "（第一次決策）"
+                                         for t in self.trades(self.book)[-10:]) or "無"))
+        return "\n".join(lines)
 
     def build_prompt(self, universe: list[str], prices: dict, trigger: str) -> str:
-        eq = self.book.equity(prices)
-        c = self.cfg
+        b, c = self.book, self.cfg
+        eq = b.equity(prices)
+        small = ("\n實盤帳戶很小：名目價值低於交易所最低下單金額的單會被拒絕（多數幣約 5 U，BTC 約 100 U、ETH 約 20 U），"
+                 "倉位名目約為「權益 × 風險% ÷ 停損距離%」。" if b.live else "")
         return f"""現在時間 {utc(self.clock())} UTC。觸發原因：{trigger}
 
-【帳戶（模擬）】權益 {eq:.2f} U（起始 {c['starting_cash']:g} U，目標 1000 U），已用槓桿 {self.book.notional(prices) / eq if eq else 0:.2f} 倍
-【硬性限制（程式強制，違反的動作會被拒絕）】每筆風險 ≤ {c['max_risk_pct']:g}% 權益；總槓桿 ≤ {c['max_leverage']:g} 倍；最多 {c['max_positions']} 個倉位、一幣一倉、不加倉；停損距離 {c['min_stop_pct']}–{c['max_stop_pct']}%；停損只能收緊；權益 ≤ {c['floor']:g} U 停止開新倉。
+【帳戶（{b.label}）】權益 {eq:.2f} U（起始 {b.starting_cash:g} U，目標 {b.starting_cash * c['target_multiple']:g} U），已用槓桿 {b.notional(prices) / eq if eq else 0:.2f} 倍
+【硬性限制（程式強制，違反的動作會被拒絕）】每筆風險 ≤ {c['max_risk_pct']:g}% 權益；總槓桿 ≤ {c['max_leverage']:g} 倍；最多 {c['max_positions']} 個倉位、一幣一倉、不加倉；停損距離 {c['min_stop_pct']}–{c['max_stop_pct']}%；停損只能收緊；權益 ≤ {b.floor:g} U 停止開新倉。{small}
 
 【目前倉位】
 {self.positions_text(prices)}
@@ -505,9 +684,10 @@ class AITrader:
     def decide(self, trigger: str) -> None:
         universe = self.market.universe()
         prices = self.prices()
-        if self.book.btc_start is None:
-            self.book.btc_start = self.market.price("BTC")
-            self.book.save()
+        for b in self.books:
+            if b.btc_start is None:
+                b.btc_start = self.market.price("BTC")
+                b.save()
         prompt = self.build_prompt(universe, prices, trigger)
         self.last_decision = self.clock()
         try:
@@ -516,93 +696,106 @@ class AITrader:
             log.error("decision failed: %s", exc)
             self._journal({"view": f"決策失敗：{str(exc)[:200]}", "actions": []}, trigger, {})
             return
-        results = [self.execute(a, universe) for a in decision.get("actions", [])[:8]]
+        actions = decision.get("actions", [])[:8]
+        results = [self.execute(a, universe, self.book) for a in actions]
+        mirror = {b.label: [self.execute(a, universe, b) for a in actions] for b in self.books[1:]}
         decision["actions"] = results
-        self._journal(decision, trigger, meta)
+        self._journal({**decision, "mirror": mirror} if mirror else decision, trigger, meta)
         acted = [a for a in results if a.get("ok")]
         rejected = [a for a in results if not a.get("ok")]
         if acted or rejected:
             msg = [f"🧠 {decision.get('view', '')[:400]}"]
             msg += [a["msg"] for a in acted]
-            msg += [f"⛔ 被風控擋下：{a.get('type')} {a.get('coin', '')} — {a['result']}" for a in rejected]
+            msg += [f"⛔ 沒有執行：{a.get('type')} {a.get('coin', '')} — {a['result']}" for a in rejected]
             self.notify("\n\n".join(msg))
 
-    def execute(self, a: dict, universe: list[str]) -> dict:
+    def execute(self, a: dict, universe: list[str], book) -> dict:
         kind, coin = a.get("type"), str(a.get("coin", "")).upper()
         out = {"type": kind, "coin": coin, "reason": str(a.get("reason", ""))[:300]}
         try:
+            return {**out, **self._execute(kind, coin, a, universe, book, out["reason"])}
+        except LiveError as exc:
+            return {**out, "ok": False, "result": str(exc)}
+        except Exception as exc:
+            log.exception("%s %s %s failed", book.label, kind, coin)
+            return {**out, "ok": False, "result": f"交易所錯誤：{str(exc)[:200]}"}
+
+    def _execute(self, kind, coin, a, universe, book, reason) -> dict:
+        try:
             price = self.market.price(coin)
         except Exception as exc:
-            return {**out, "ok": False, "result": f"拿不到價格：{exc}"}
+            return {"ok": False, "result": f"拿不到價格：{exc}"}
         prices = {**self.prices(), coin: price}
         now = self.clock()
         if kind == "open":
-            ok, note, n = self.guard.check_open(a, self.book, price, prices, universe)
+            ok, note, n = self.guard.check_open(a, book, price, prices, universe)
             if not ok:
-                return {**out, "ok": False, "result": note}
-            p = self.book.open(coin, n["side"], price, n["qty"], n["stop"], n["tp"], n["reason"], now)
-            eq = self.book.equity(prices)
+                return {"ok": False, "result": note}
+            p = book.open(coin, n["side"], price, n["qty"], n["stop"], n["tp"], n["reason"], now)
+            eq = book.equity(prices)
             loss = abs(p["entry"] - p["stop"]) * p["qty"]
-            return {**out, "ok": True, "result": f"開倉 {n['risk_pct']:.2f}%{note}",
+            return {"ok": True, "result": f"開倉 {loss / eq * 100:.2f}%{note}",
                     "msg": f"🟢 開{'多' if n['side'] == 'long' else '空'} {coin} @ {fmt(p['entry'])}{note}\n"
-                           f"停損 {fmt(n['stop'])}（打到虧 {loss:.2f} U = {loss / eq * 100:.1f}%）"
-                           f"{'，止盈 ' + fmt(n['tp']) if n['tp'] else ''}\n"
+                           f"停損 {fmt(p['stop'])}（打到虧 {loss:.2f} U = {loss / eq * 100:.1f}%）"
+                           f"{'，止盈 ' + fmt(p['tp']) if p['tp'] else ''}\n"
                            f"倉位 {p['qty'] * p['entry']:.1f} U（{p['qty'] * p['entry'] / eq:.1f} 倍）\n理由：{n['reason']}"}
         if kind == "close":
-            if coin not in self.book.positions:
-                return {**out, "ok": False, "result": "沒有倉位"}
-            row = self.book.close(coin, price, "AI 平倉", now)
-            return {**out, "ok": True, "result": f"{row['pnl']:+.2f}U",
+            if coin not in book.positions:
+                return {"ok": False, "result": "沒有倉位"}
+            row = book.close(coin, price, "AI 平倉", now)
+            return {"ok": True, "result": f"{row['pnl']:+.2f}U",
                     "msg": f"⚪ 平倉 {coin}：{row['entry']} → {row['exit']}，{row['pnl']:+.2f} U（{row['r']:+.2f}R）\n"
-                           f"理由：{out['reason']}"}
+                           f"理由：{reason}"}
         if kind == "move_stop":
-            ok, note, n = self.guard.check_stop(a, self.book, price)
+            ok, note, n = self.guard.check_stop(a, book, price)
             if not ok:
-                return {**out, "ok": False, "result": note}
-            old = self.book.positions[coin]["stop"]
-            self.book.positions[coin].update(stop=n["stop"], since=now)
-            self.book.save()
-            return {**out, "ok": True, "result": f"{fmt(old)}→{fmt(n['stop'])}",
-                    "msg": f"🔧 {coin} 停損 {fmt(old)} → {fmt(n['stop'])}\n理由：{out['reason']}"}
+                return {"ok": False, "result": note}
+            old = book.positions[coin]["stop"]
+            book.move_stop(coin, n["stop"], now)
+            return {"ok": True, "result": f"{fmt(old)}→{fmt(n['stop'])}",
+                    "msg": f"🔧 {coin} 停損 {fmt(old)} → {fmt(n['stop'])}\n理由：{reason}"}
         if kind == "take_profit":
-            p = self.book.positions.get(coin)
+            p = book.positions.get(coin)
             if not p:
-                return {**out, "ok": False, "result": "沒有倉位"}
+                return {"ok": False, "result": "沒有倉位"}
             try:
                 tp = float(a["take_profit"]) if a.get("take_profit") else None
             except (TypeError, ValueError):
-                return {**out, "ok": False, "result": "止盈價格不對"}
+                return {"ok": False, "result": "止盈價格不對"}
             if tp is not None and (tp - price) * (1 if p["side"] == "long" else -1) <= 0:
-                return {**out, "ok": False, "result": "止盈在錯的一邊"}
-            p["tp"] = tp
-            self.book.save()
-            return {**out, "ok": True, "result": f"止盈 {fmt(tp) if tp else '取消'}",
-                    "msg": f"🎯 {coin} 止盈改為 {fmt(tp) if tp else '無'}\n理由：{out['reason']}"}
-        return {**out, "ok": False, "result": f"不認得的動作 {kind}"}
+                return {"ok": False, "result": "止盈在錯的一邊"}
+            book.set_tp(coin, tp)
+            return {"ok": True, "result": f"止盈 {fmt(tp) if tp else '取消'}",
+                    "msg": f"🎯 {coin} 止盈改為 {fmt(tp) if tp else '無'}\n理由：{reason}"}
+        return {"ok": False, "result": f"不認得的動作 {kind}"}
 
     def _journal(self, decision: dict, trigger: str, meta: dict) -> None:
         row = {"time": utc(self.clock()), "trigger": trigger, "view": decision.get("view", ""),
                "watch": decision.get("watch", ""), "actions": decision.get("actions", []),
                "cost_usd": meta.get("total_cost_usd"), "turns": meta.get("num_turns")}
+        if decision.get("mirror"):
+            row["mirror"] = decision["mirror"]
         with self.journal.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     # -- reporting ---------------------------------------------------------------
     def report(self) -> str:
         prices = self.prices()
-        eq = self.book.equity(prices)
-        trades = []
-        if self.book.trades_csv.exists():
-            with self.book.trades_csv.open(encoding="utf-8") as f:
-                trades = list(csv.DictReader(f))
-        wins = sum(1 for t in trades if float(t["pnl"]) > 0)
         try:
-            btc = (self.market.price("BTC") / self.book.btc_start - 1) * 100 if self.book.btc_start else 0.0
+            btc_now = self.market.price("BTC")
         except Exception:
-            btc = 0.0
+            btc_now = None
         days = (self.clock() - self.book.started) / 86400
-        return (f"📊 AI 交易員日報（模擬第 {days:.1f} 天）\n權益 {eq:.2f} U（{(eq / self.cfg['starting_cash'] - 1) * 100:+.1f}%），"
-                f"同期 BTC {btc:+.1f}%\n已平倉 {len(trades)} 筆，賺 {wins} 筆\n\n倉位：\n{self.positions_text(prices)}")
+        out = [f"📊 AI 交易員日報（第 {days:.1f} 天）"]
+        for b in self.books:
+            eq = b.equity(prices)
+            trades = self.trades(b)
+            wins = sum(1 for t in trades if float(t["pnl"]) > 0)
+            btc = (btc_now / b.btc_start - 1) * 100 if btc_now and b.btc_start else 0.0
+            out.append(f"【{b.label}】權益 {eq:.2f} U（{(eq / b.starting_cash - 1) * 100:+.1f}%），同期 BTC {btc:+.1f}%，"
+                       f"已平倉 {len(trades)} 筆、賺 {wins} 筆")
+        out.append(f"\n{self.book.label}倉位：\n{self.positions_text(prices)}")
+        return "\n".join(out)
 
     def maybe_report(self) -> None:
         tz = ZoneInfo(self.cfg["timezone"])
@@ -635,7 +828,8 @@ class AITrader:
         self.maybe_report()
 
     def run(self) -> None:
-        self.notify(f"🤖 AI 交易員（模擬）啟動，權益 {self.book.equity(self.prices()):.2f} U")
+        prices = self.prices()
+        self.notify("🤖 AI 交易員啟動：" + "，".join(f"{b.label} {b.equity(prices):.2f} U" for b in self.books))
         while True:
             try:
                 self.step()
@@ -644,24 +838,70 @@ class AITrader:
             time.sleep(60)
 
 
-def main(cfg: dict, repo_dir: str, once: bool = False) -> int:
+def live_test(book: LiveBook, coin: str) -> int:
+    """Smallest real round trip: open, place stop + take-profit on the exchange, close."""
+    b = book.broker(coin)
+    price = float(book.ex.fetch_ticker(b.symbol)["last"])
+    m = book.ex.market(b.symbol)
+    min_cost = ((m.get("limits") or {}).get("cost") or {}).get("min") or 5
+    qty = float(book.ex.amount_to_precision(b.symbol, min_cost * 1.3 / price))
+    p = book.open(coin, "long", price, qty, price * 0.95, price * 1.05, "連線測試", time.time())
+    print(f"opened {coin} qty={p['qty']} entry={p['entry']} stop_id={p['stop_id']} tp_id={p['tp_id']} lev={p['leverage']}")
+    orders = book.ex.fetch_open_orders(b.symbol, params={"trigger": True})
+    print("open trigger orders:", [(o.get("type"), o.get("triggerPrice") or o.get("stopPrice")) for o in orders])
+    row = book.close(coin, price, "連線測試", time.time())
+    print("closed:", row)
+    left = book.ex.fetch_open_orders(b.symbol, params={"trigger": True})
+    print("trigger orders left:", len(left), "| positions:", book.exchange_positions())
+    return 0
+
+
+def main(cfg: dict, repo_dir: str, once: bool = False, live: bool = False, check: bool = False,
+         test_coin: str | None = None) -> int:
     import os
 
     from .data import make_exchange
     from .notify import Telegram
 
+    c = settings(cfg)
+    state, logs = Path(cfg.get("state_dir", "state")), Path(cfg.get("log_dir", "logs"))
+    state.mkdir(parents=True, exist_ok=True)
+    logs.mkdir(parents=True, exist_ok=True)
+    paper = Book(state / "aitrader_book.json", logs / "aitrader_trades.csv", c, c["paper_cash"])
+    books, ex = [paper], None
+    if live or check or test_coin:
+        key, secret = os.getenv("AITRADER_API_KEY"), os.getenv("AITRADER_API_SECRET")
+        if not key or not secret:
+            print("AITRADER_API_KEY / AITRADER_API_SECRET missing (/etc/cryptobot-aitrader/live.env)")
+            return 1
+        ex = make_exchange(cfg, key, secret)
+        lb = LiveBook(state / "aitrader_live_book.json", logs / "aitrader_live_trades.csv", c, c["live_cash"], ex)
+        problem = lb.check_account()
+        print(f"live account: equity {lb.equity({}):.2f} U, positions {lb.exchange_positions()}")
+        if problem:
+            print("❌", problem)
+            return 1
+        if check:
+            print("✅ account OK")
+            return 0
+        if test_coin:
+            return live_test(lb, test_coin.upper())
+        books = [lb, paper]
     token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
     claude = Path(AI_ROOT) / "home" / ".local" / "bin" / "claude"
     if not token or not claude.exists():
         print("CLAUDE_CODE_OAUTH_TOKEN or the claude binary is missing")
         return 1
-    c = {**DEFAULTS, **(cfg.get("aitrader") or {})}
     ai = TraderAI(cfg, repo_dir, str(claude), token, c["model"], int(c["max_turns"]))
     ai.install()
     tg_token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    notify = Telegram(tg_token, chat, prefix="[AI模擬] ") if tg_token and chat else None
-    trader = AITrader(cfg, make_exchange(cfg), ai, notify)
+    prefix = "[AI真倉] " if len(books) > 1 else "[AI模擬] "
+    notify = Telegram(tg_token, chat, prefix=prefix) if tg_token and chat else None
+    trader = AITrader(cfg, ex or make_exchange(cfg), ai, notify, books=books)
     if once:
+        if trader.book.live:
+            print("--once is paper only")
+            return 1
         trader.news.poll()
         trader.check_exits()
         trader.decide("手動測試")
