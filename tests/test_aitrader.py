@@ -316,6 +316,20 @@ def test_live_refuses_wrong_account(live):
     acct.pos.clear()
     acct.equity = 400
     assert "超過" in b.check_account()
+    acct.equity = 0  # USDT still in the spot wallet
+    assert "U 本位合約" in b.check_account()
+
+
+def test_live_zero_margin_is_a_clean_rejection(live):
+    b, acct = live
+    acct.equity = 0
+
+    def precision_error(side, amount, price):
+        raise RuntimeError("binance amount of SOL/USDT:USDT must be greater than minimum amount precision of 1")
+
+    b.broker("SOL").market_open = precision_error
+    with pytest.raises(LiveError, match="可用保證金 0.00"):
+        b.open("SOL", "long", 200, 0.1, 190, None, "x", T0)
 
 
 def test_decision_mirrors_to_paper_and_notifies_live_only(setup, live):

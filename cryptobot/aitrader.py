@@ -368,6 +368,9 @@ class LiveBook(Book):
     def check_account(self) -> str | None:
         """Refuse to trade an account that is not the AI's own (e.g. the main bot's keys)."""
         eq = self.equity({})
+        if eq < 10:
+            return (f"U 本位合約錢包只有 {eq:.2f} U：請把 USDT 劃轉到這個子帳戶的「U 本位合約」錢包"
+                    "（不是現貨錢包）")
         if eq > self.cfg["live_max_equity"]:
             return (f"帳戶權益 {eq:.2f} U 超過 live_max_equity {self.cfg['live_max_equity']:g} U："
                     "這可能不是 AI 專用的子帳戶，拒絕啟動")
@@ -389,11 +392,18 @@ class LiveBook(Book):
         lev = int(max(1, min(self.cfg["max_leverage"], 1 / (dist + 0.02))))
         free = b.free_margin(price)
         qty = min(qty, free * 0.9 * lev / price)
+        limits = (self.ex.market(b.symbol).get("limits") or {}).get("cost") or {}
+        too_small = LiveError(f"數量太小，低於交易所最低下單（{qty * price:.1f} U，最低 {limits.get('min')} U，"
+                              f"可用保證金 {free:.2f} U）")
         b.use_leverage(lev)
-        fill = b.market_open(side, qty, price)
+        try:
+            fill = b.market_open(side, qty, price)
+        except Exception as exc:
+            if "precision" in str(exc) or "minimum" in str(exc):  # rounds down to zero
+                raise too_small from exc
+            raise
         if fill is None or fill.amount <= 0:
-            limits = (self.ex.market(b.symbol).get("limits") or {}).get("cost") or {}
-            raise LiveError(f"數量太小，低於交易所最低下單（{qty * price:.1f} U，最低 {limits.get('min')} U）")
+            raise too_small
         try:
             stop_id = b.set_stop(side, fill.amount, stop)
         except Exception as exc:
