@@ -165,7 +165,7 @@ def test_news_urgent_triggers_early_decision(setup):
     clock.t += 25 * 60
     t.step()
     assert len(ai.prompts) == 2 and "突發新聞" in ai.prompts[1]
-    assert sent == []  # watching only: nothing pushed
+    assert len(sent) == 2 and sent[0].startswith("👀 觀望｜觀望")  # every decision is pushed
 
 
 def test_funding_charged_at_settlement(setup):
