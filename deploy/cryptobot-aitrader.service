@@ -1,0 +1,24 @@
+# AI 交易員（模擬盤）：Claude 每小時看前 50 大幣行情與新聞後決策，程式強制停損與風控上限。
+# 不使用交易所 API key，不會下真單。安裝：
+#   cp deploy/cryptobot-aitrader.service /etc/systemd/system/ && systemctl daemon-reload
+#   systemctl enable --now cryptobot-aitrader
+[Unit]
+Description=automation-crypto AI trader (paper)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/automation-crypto
+ExecStart=/usr/bin/python3 -m cryptobot ai-trader
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/cryptobot-butler/claude.env
+Restart=always
+RestartSec=30
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
