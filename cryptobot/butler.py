@@ -475,7 +475,27 @@ class Butler:
             self.tg.send(f"⚠️ 讀不到帳戶{hint}：{str(exc)[:200]}")
             return
         tz = self.cfg.get("notify", {}).get("timezone", "Asia/Taipei")
-        self.tg.send(format_status(snap, self.service_state("cryptobot"), tz))
+        self.tg.send(format_status(snap, self.service_state("cryptobot"), tz) + self.money_text(snap))
+
+    def money_text(self, snap: dict) -> str:
+        """Bot / manual / prediction split of the account result (empty when it can't be worked out)."""
+        base = float((self.cfg.get("goals") or {}).get("base_capital") or 0)
+        if base <= 0 or "equity" not in snap:
+            return ""
+        try:
+            from datetime import datetime, timezone
+
+            from .money import money_lines
+            from .report import recent_trades
+            bot_real = sum(float(r["pnl"]) for r in recent_trades(self.cfg, "live", datetime(1970, 1, 1, tzinfo=timezone.utc)))
+            bot_unreal = sum(p["unrealized"] for p in snap.get("positions", []) if p.get("owner") == "bot")
+            with self.ex_lock:
+                lines = money_lines(self.exchange, self.cfg, snap["equity"], bot_real + bot_unreal)
+            head = f"\n\n💼 損益（本金 {base:.2f} U，帳戶 {snap['equity'] - base:+.2f} U）"
+            return head + f"\n  🤖 機器人：{bot_real + bot_unreal:+.2f} U\n" + "\n".join(lines)
+        except Exception as exc:
+            log.warning("money split: %s", exc)
+            return ""
 
     def cmd_ip(self, _arg: str) -> None:
         from .runner import is_auth_error

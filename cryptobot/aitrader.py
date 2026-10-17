@@ -843,14 +843,14 @@ class AITrader:
         self._journal({**decision, "mirror": mirror} if mirror else decision, trigger, meta)
         acted = [a for a in results if a.get("ok")]
         rejected = [a for a in results if not a.get("ok")]
-        msg = [f"🧠 {decision.get('view', '')[:1200]}"]
+        # plain paragraphs, one per coin (the prompt asks for "\n\n" between them); the actions follow
+        msg = [] if acted or rejected else ["👀 觀望"]
+        msg.append(str(decision.get("view", "")).strip()[:1500])
         msg += [a["msg"] for a in acted]
         msg += [f"⛔ 沒有執行：{a.get('type')} {a.get('coin', '')} — {a['result']}" for a in rejected]
-        if not acted and not rejected:
-            msg[0] = "👀 觀望｜" + msg[0][2:]
-            if decision.get("watch"):
-                msg.append(f"等待：{str(decision['watch'])[:900]}")
-        self.notify("\n\n".join(msg))
+        if decision.get("watch"):
+            msg.append("等待：\n" + str(decision["watch"]).strip()[:900])
+        self.notify("\n\n".join(m for m in msg if m))
 
     def execute(self, a: dict, universe: list[str], book) -> dict:
         kind, coin = a.get("type"), str(a.get("coin", "")).upper()

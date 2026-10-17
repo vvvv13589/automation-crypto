@@ -81,7 +81,10 @@ def build_report(scanner, exchange, cfg: dict, mode: str, now: datetime | None =
         bot_real = sum(float(r["pnl"]) for r in recent_trades(cfg, mode, datetime(1970, 1, 1, tzinfo=timezone.utc)))
         bot_total = bot_real + bot_unreal
         lines.append(f"  🤖 機器人：{bot_total:+.2f} U（已實現 {bot_real:+.2f}、未實現 {bot_unreal:+.2f}）")
-        if base > 0:
+        if base > 0 and mode == "live":
+            from .money import money_lines
+            lines.extend(money_lines(exchange, cfg, equity, bot_total))
+        elif base > 0:
             lines.append(f"  ✋ 手動／其他：{equity - base - bot_total:+.2f} U（手動交易、轉入轉出）")
         peak = scanner.risk.peak_equity
         floor = float(cfg["risk"].get("min_equity") or 0)
