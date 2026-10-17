@@ -1138,6 +1138,55 @@ class AITrader:
             time.sleep(60)
 
 
+def status_text(cfg: dict, price, live_equity=None, now: float | None = None) -> str:
+    """Telegram /ai: the AI sub-account's positions, stops, plans and results, from the AI trader's
+    own state files (it syncs them with the exchange every minute)."""
+    c = settings(cfg)
+    state, logs = Path(cfg.get("state_dir", "state")), Path(cfg.get("log_dir", "logs"))
+    path = state / "aitrader_live_book.json"
+    if not path.exists():
+        return "🤖 AI 子帳戶還沒有資料（AI 交易員沒有用 --live 跑過）"
+    b = json.loads(path.read_text())
+    lines = [f"🤖 AI 子帳戶 {datetime.fromtimestamp(now or time.time(), TW):%m/%d %H:%M}"]
+    if live_equity is not None:
+        start = c["live_cash"]
+        day = f"｜今天 {(live_equity / b['day_start'] - 1) * 100:+.1f}%" if b.get("day_start") else ""
+        lines.append(f"💰 權益 {live_equity:.2f} U（起始 {start:g} U，{(live_equity / start - 1) * 100:+.1f}%）{day}")
+    pos = b.get("positions") or {}
+    if pos:
+        lines.append(f"📌 持倉 {len(pos)} 筆")
+        for coin, p in pos.items():
+            sgn = 1 if p["side"] == "long" else -1
+            try:
+                px = float(price(coin))
+                upnl = f" → {fmt(px)}  {(px - p['entry']) * p['qty'] * sgn:+.2f} U"
+            except Exception:
+                upnl = ""
+            at_stop = (p["stop"] - p["entry"]) * p["qty"] * sgn
+            lines.append(f"{coin} {'多' if sgn > 0 else '空'} {fmt(p['qty'])} @ {fmt(p['entry'])}{upnl}")
+            lines.append(f"    停損 {fmt(p['stop'])}（打到 {at_stop:+.2f} U）｜止盈 {fmt(p['tp']) if p.get('tp') else '—'}")
+    else:
+        lines.append("📌 目前沒有持倉")
+    plans_path = state / "aitrader_plans.json"
+    plans = json.loads(plans_path.read_text()) if plans_path.exists() else []
+    if plans:
+        lines.append(f"📎 條件單 {len(plans)} 張")
+        lines += [AITrader.plan_text(p) for p in plans]
+    csv_path = logs / "aitrader_live_trades.csv"
+    trades = list(csv.DictReader(csv_path.open(encoding="utf-8"))) if csv_path.exists() else []
+    if trades:
+        total = sum(float(t["pnl"]) for t in trades)
+        wins = sum(1 for t in trades if float(t["pnl"]) > 0)
+        lines.append(f"🧾 已平倉 {len(trades)} 筆（賺 {wins} 筆）合計 {total:+.2f} U")
+    journal = logs / "aitrader_decisions.jsonl"
+    if journal.exists():
+        last = json.loads(journal.read_text(encoding="utf-8").splitlines()[-1])
+        view = str(last.get("view", "")).split("\n\n")
+        lines.append(f"\n🕐 最後一次決策 {last['time']}")
+        lines.append("\n\n".join(view[:3])[:700])
+    return "\n".join(lines)
+
+
 def live_test(book: LiveBook, coin: str) -> int:
     """Smallest real round trip: open, place stop + take-profit on the exchange, close."""
     b = book.broker(coin)

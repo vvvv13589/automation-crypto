@@ -266,6 +266,22 @@ def test_daily_loss_limit(setup):
     assert ok
 
 
+def test_status_text_for_telegram(setup, live):
+    from cryptobot.aitrader import status_text
+    t, ex, ai, clock, sent = setup
+    lb, acct = live
+    raw = {"state_dir": str(t.plans_path.parent), "log_dir": str(t.journal.parent)}
+    lb.path = t.plans_path.parent / "aitrader_live_book.json"
+    lb.open("SOL", "short", 200, 0.1, 210, 180, "x", T0)
+    t.add_plan(plan(), ["SOL"])
+    ai.replies.append({"view": "BTC 盤整\n\nSOL 空單續抱", "actions": []})
+    t.decide("test")
+    text = status_text(raw, lambda c: 190.0, live_equity=51.0, now=T0)
+    assert "權益 51.00 U（起始 50 U，+2.0%）" in text
+    assert "SOL 空 0.1 @ 200" in text and "+1.00 U" in text and "停損 210" in text
+    assert "條件單 1 張" in text and "SOL 空單續抱" in text
+
+
 # -- full-market scan ---------------------------------------------------------------
 def bars(closes, vol=1.0):
     return [[i, c, c * 1.01, c * 0.99, c, vol] for i, c in enumerate(closes)]
