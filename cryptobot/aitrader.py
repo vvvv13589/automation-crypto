@@ -77,8 +77,11 @@ def _get(url: str, timeout: int = 15) -> bytes:
         return r.read()
 
 
-def utc(ts: float) -> str:
-    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
+TW = ZoneInfo("Asia/Taipei")  # every time the AI and the user see is Taipei time (UTC+8)
+
+
+def tw(ts: float) -> str:
+    return datetime.fromtimestamp(ts, TW).strftime("%Y-%m-%d %H:%M")
 
 
 def fmt(x: float) -> str:
@@ -135,7 +138,7 @@ class News:
     def digest(self, limit: int = 60) -> str:
         if not self.items:
             return "（暫時抓不到新聞）"
-        return "\n".join(f"{utc(i['ts'])} [{i['src']}] {i['title']}" for i in self.items[:limit])
+        return "\n".join(f"{tw(i['ts'])} [{i['src']}] {i['title']}" for i in self.items[:limit])
 
     @staticmethod
     def urgent(items: list[dict]) -> list[dict]:
@@ -389,7 +392,7 @@ class Book:
         sgn = 1 if p["side"] == "long" else -1
         net = (exit_px - p["entry"]) * p["qty"] * sgn - exit_fee - p["fees"] + p["funding"]
         risk = abs(p["entry"] - p["init_stop"]) * p["qty"]
-        row = {"coin": coin, "side": p["side"], "opened": utc(p["opened"]), "closed": utc(now),
+        row = {"coin": coin, "side": p["side"], "opened": tw(p["opened"]), "closed": tw(now),
                "entry": fmt(p["entry"]), "exit": fmt(exit_px), "qty": fmt(p["qty"]), "pnl": round(net, 2),
                "r": round(net / risk, 2) if risk else 0, "why": why, "reason": p["reason"]}
         new = not self.trades_csv.exists()
@@ -776,7 +779,7 @@ class AITrader:
             r = abs(p["entry"] - p["init_stop"]) * p["qty"]
             out.append(f"{c} {p['side']} 數量 {fmt(p['qty'])} 進場 {fmt(p['entry'])} 現價 {fmt(px)} 停損 {fmt(p['stop'])} "
                        f"止盈 {fmt(p['tp']) if p['tp'] else '無'} 未實現 {pnl:+.2f} U（{pnl / r if r else 0:+.2f}R） "
-                       f"開倉 {utc(p['opened'])} 理由：{p['reason']}")
+                       f"開倉 {tw(p['opened'])} 理由：{p['reason']}")
         return "\n".join(out)
 
     @staticmethod
@@ -802,7 +805,7 @@ class AITrader:
         eq = b.equity(prices)
         small = ("\n實盤帳戶很小：名目價值低於交易所最低下單金額的單會被拒絕（多數幣約 5 U，BTC 約 100 U、ETH 約 20 U），"
                  "倉位名目約為「權益 × 風險% ÷ 停損距離%」。" if b.live else "")
-        return f"""現在時間 {utc(self.clock())} UTC。觸發原因：{trigger}
+        return f"""現在時間 {tw(self.clock())}（台北時間 UTC+8，下面所有時間都是台北時間）。觸發原因：{trigger}
 
 【帳戶（{b.label}）】權益 {eq:.2f} U（起始 {b.starting_cash:g} U，目標 {b.starting_cash * c['target_multiple']:g} U），已用槓桿 {b.notional(prices) / eq if eq else 0:.2f} 倍
 【硬性限制（程式強制，違反的動作會被拒絕）】每筆風險 ≤ {c['max_risk_pct']:g}% 權益；總槓桿 ≤ {c['max_leverage']:g} 倍；最多 {c['max_positions']} 個倉位、一幣一倉、不加倉；停損距離 {c['min_stop_pct']}–{c['max_stop_pct']}%；停損只能收緊；權益 ≤ {b.floor:g} U 停止開新倉。{small}
@@ -913,7 +916,7 @@ class AITrader:
         return {"ok": False, "result": f"不認得的動作 {kind}"}
 
     def _journal(self, decision: dict, trigger: str, meta: dict) -> None:
-        row = {"time": utc(self.clock()), "trigger": trigger, "view": decision.get("view", ""),
+        row = {"time": tw(self.clock()), "trigger": trigger, "view": decision.get("view", ""),
                "watch": decision.get("watch", ""), "actions": decision.get("actions", []),
                "cost_usd": meta.get("total_cost_usd"), "turns": meta.get("num_turns")}
         if decision.get("mirror"):

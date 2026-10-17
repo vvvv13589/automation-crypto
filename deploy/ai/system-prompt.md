@@ -28,5 +28,5 @@
     python3 /opt/cryptobot-ai/market.py oi SOL --tf 1h --limit 24
     python3 /opt/cryptobot-ai/market.py ticker BTC ETH SOL
 
-- 時間都是 UTC，使用者在台灣（UTC+8）。
+- 時間都是台北時間（UTC+8），回答也用台北時間。
 - 為了節省用量，只抓回答問題需要的資料。K 線通常 100 根以內就夠了。

@@ -12,7 +12,7 @@ import argparse
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import ccxt
 
@@ -27,14 +27,17 @@ def coin(value: str) -> str:
     return f"{c}/USDT:USDT"
 
 
+TW = timezone(timedelta(hours=8))  # the user is in Taiwan: all times are UTC+8
+
+
 def ts(ms) -> str:
-    return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M")
+    return datetime.fromtimestamp(ms / 1000, TW).strftime("%Y-%m-%d %H:%M")
 
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
-    k = sub.add_parser("klines", help="OHLCV candles (UTC)")
+    k = sub.add_parser("klines", help="OHLCV candles (Taipei time, UTC+8)")
     k.add_argument("coin", type=coin)
     k.add_argument("--tf", choices=TIMEFRAMES, default="4h")
     k.add_argument("--limit", type=int, default=100)
@@ -59,17 +62,17 @@ def main(argv=None) -> int:
     if os.getenv("HTTPS_PROXY"):  # ccxt ignores the proxy environment variables
         ex.https_proxy = os.environ["HTTPS_PROXY"]
     if a.cmd == "klines":
-        print("time_utc,open,high,low,close,volume")
+        print("time_tw,open,high,low,close,volume")
         for t0, op, hi, lo, cl, vol in ex.fetch_ohlcv(a.coin, a.tf, limit=limit):
             print(f"{ts(t0)},{op:.6g},{hi:.6g},{lo:.6g},{cl:.6g},{vol:.6g}")
     elif a.cmd == "funding":
         now = ex.fetch_funding_rate(a.coin)
         print(f"current {now.get('fundingRate')} next {now.get('fundingDatetime')} mark {now.get('markPrice')}")
-        print("time_utc,rate")
+        print("time_tw,rate")
         for r in ex.fetch_funding_rate_history(a.coin, limit=limit):
             print(f"{ts(r['timestamp'])},{r['fundingRate']}")
     elif a.cmd == "oi":
-        print("time_utc,open_interest_contracts,open_interest_usdt")
+        print("time_tw,open_interest_contracts,open_interest_usdt")
         for r in ex.fetch_open_interest_history(a.coin, a.tf, limit=limit):
             print(f"{ts(r['timestamp'])},{r.get('openInterestAmount')},{r.get('openInterestValue')}")
     else:
