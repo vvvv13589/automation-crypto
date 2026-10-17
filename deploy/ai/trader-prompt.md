@@ -58,10 +58,22 @@
     {"type": "open", "coin": "SOL", "side": "long", "stop": 182.5, "take_profit": 205, "risk_pct": 2, "reason": "為什麼做、錯在哪裡"},
     {"type": "close", "coin": "ETH", "reason": "論點被破壞的原因"},
     {"type": "move_stop", "coin": "BTC", "stop": 118500, "reason": "鎖利"},
-    {"type": "take_profit", "coin": "BTC", "take_profit": 125000, "reason": "改止盈（填 null 取消）"}
+    {"type": "take_profit", "coin": "BTC", "take_profit": 125000, "reason": "改止盈（填 null 取消）"},
+    {"type": "plan", "coin": "INJ", "side": "long", "trigger": 9.42, "when": "above", "confirm": "4h", "stop": 8.45, "take_profit": null, "risk_pct": 1, "expires_hours": 24, "reason": "整理區上緣突破才做"},
+    {"type": "cancel_plan", "coin": "XRP", "reason": "結構改變，計畫作廢"}
   ]
 }
 ```
+
+# 條件單（plan）
+
+你每小時才醒來一次，但「等某個價位再進場」的機會常常在兩次決策之間出現。**watch 裡寫的進場計畫，只要能用價位描述，就直接掛成條件單**，不要只寫在文字裡。
+
+- `trigger`：觸發價。`when`：`above`（價格站上 trigger）或 `below`（跌破 trigger）。
+- `confirm`：`touch`（碰到就進，適合回測支撐／壓力）、`1h` 或 `4h`（要一根 1h／4h K 線收盤在 trigger 之外才進，適合突破，避免假突破插針）。
+- 觸發時以當下市價成交，照樣經過所有硬性限制；如果價格衝太遠，讓停損距離超出限制，或者那個幣已經有倉位，就不會開倉。
+- `expires_hours` 預設 24、最多 72。同一個幣只能掛一張，再掛會覆蓋舊的；最多同時 6 張。
+- 每次決策你都會看到自己掛著的條件單：計畫還成立就不用重掛，不成立就 `cancel_plan`，需要調價位就用同一個幣再掛一次。
 
 - `view` 和 `watch` 會直接推播到使用者手機，要好讀：
   - `view`：第一段講 BTC 大盤；之後**每個幣（或一組同理由的幣）自己一段**，以幣名開頭，段落之間空一行（`\n\n`）。持倉中的幣先講。挑這次掃描中最值得注意的 2–4 個幣，不要只講 BTC。

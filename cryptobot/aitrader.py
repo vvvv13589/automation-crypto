@@ -46,6 +46,9 @@ DEFAULTS = {
     "max_risk_pct": 5.0,  # loss at the stop, % of equity, per trade
     "max_leverage": 5.0,  # total open notional / equity
     "floor_frac": 0.5,  # no new positions at or below this share of the starting cash
+    "daily_loss_pct": 10.0,  # no new positions for the rest of the Taipei day after losing this much
+    "max_plans": 6,  # conditional entries waiting at the same time
+    "plan_max_hours": 72,
     "min_stop_pct": 0.3,
     "max_stop_pct": 25.0,
     "taker_fee": 0.0005,
@@ -366,11 +369,23 @@ class Book:
         self.last_check: float = s.get("last_check", clock())
         self.last_funding = s.get("last_funding")
         self.btc_start = s.get("btc_start")
+        self.day, self.day_start = s.get("day"), s.get("day_start")
 
     def save(self) -> None:
         self.path.write_text(json.dumps({"cash": self.cash, "positions": self.positions, "started": self.started,
                                          "last_check": self.last_check, "last_funding": self.last_funding,
-                                         "btc_start": self.btc_start}, indent=1))
+                                         "btc_start": self.btc_start, "day": self.day, "day_start": self.day_start},
+                                        indent=1))
+
+    def mark_day(self, now: float, equity) -> None:
+        """Equity at the start of each Taipei day (the daily loss limit's reference)."""
+        day = datetime.fromtimestamp(now, TW).strftime("%Y-%m-%d")
+        if day != self.day:
+            self.day, self.day_start = day, equity()
+            self.save()
+
+    def day_loss_pct(self, eq: float) -> float:
+        return (1 - eq / self.day_start) * 100 if self.day_start else 0.0
 
     def upnl(self, prices: dict[str, float]) -> float:
         return sum(p["qty"] * (prices.get(c, p["entry"]) - p["entry"]) * (1 if p["side"] == "long" else -1)
@@ -620,6 +635,9 @@ class Guard:
         eq = book.equity(prices)
         if eq <= book.floor:
             return False, f"權益 {eq:.1f} ≤ 底線 {book.floor:g}，停止開新倉", None
+        if book.day_loss_pct(eq) >= c["daily_loss_pct"]:
+            return False, (f"今天已虧 {book.day_loss_pct(eq):.1f}%（上限 {c['daily_loss_pct']:g}%），"
+                           "台北時間明天 00:00 前不開新倉"), None
         try:
             stop = float(a["stop"])
         except (KeyError, TypeError, ValueError):
@@ -706,6 +724,10 @@ def parse_decision(text: str) -> dict:
 
 
 # -- the loop -----------------------------------------------------------------------
+ACTION_NAMES = {"open": "開倉", "close": "平倉", "move_stop": "移動停損", "take_profit": "改止盈",
+                "plan": "條件單", "cancel_plan": "取消條件單"}
+
+
 class AITrader:
     """One AI decision per round, applied to every book: books[0] is the one the AI sees and the
     user is told about (the live account when live); the others mirror it silently (paper)."""
@@ -730,6 +752,127 @@ class AITrader:
         past = today.strftime("%H:%M") >= self.cfg["daily_report"]
         self.last_report_day = today.date() if past else today.date() - timedelta(days=1)
         self.pending_urgent: list[dict] = []
+        self.plans_path = state / "aitrader_plans.json"
+        self.plans: list[dict] = json.loads(self.plans_path.read_text()) if self.plans_path.exists() else []
+        self.universe: list[str] = []
+        self.plans_checked = clock()
+
+    # -- conditional entries ("plans") ---------------------------------------------------
+    # The AI's "wait for X, then enter" ideas, executed by code between decisions. A plan fires
+    # on a touch of the trigger price or on a 1h / 4h candle closing beyond it; the entry then
+    # goes through the same Guard as any other open, re-checked at the price of that moment.
+    TF_MS = {"1h": 3_600_000, "4h": 14_400_000}
+
+    def save_plans(self) -> None:
+        self.plans_path.write_text(json.dumps(self.plans, ensure_ascii=False, indent=1))
+
+    @staticmethod
+    def plan_text(p: dict) -> str:
+        how = {"touch": "碰到", "1h": "1h 收盤", "4h": "4h 收盤"}[p["confirm"]]
+        where = "站上" if p["when"] == "above" else "跌破"
+        tp = f"，止盈 {fmt(p['tp'])}" if p.get("tp") else ""
+        return (f"{p['coin']}：{how}{where} {fmt(p['trigger'])} 就{'做多' if p['side'] == 'long' else '做空'}，"
+                f"停損 {fmt(p['stop'])}{tp}，風險 {p['risk_pct']:g}%，有效到 {tw(p['expires'])}")
+
+    def plans_text(self) -> str:
+        return "\n".join(f"{self.plan_text(p)}（理由：{p['reason']}）" for p in self.plans) or "（沒有）"
+
+    def add_plan(self, a: dict, universe: list[str]) -> dict:
+        c = self.cfg
+        coin, side = str(a.get("coin", "")).upper(), a.get("side")
+        out = {"type": "plan", "coin": coin, "reason": str(a.get("reason", ""))[:300]}
+        try:
+            trigger, stop = float(a["trigger"]), float(a["stop"])
+        except (KeyError, TypeError, ValueError):
+            return {**out, "ok": False, "result": "條件單要有 trigger 和 stop"}
+        if coin not in universe:
+            return {**out, "ok": False, "result": f"{coin} 不在前 {c['universe']} 大"}
+        if side not in ("long", "short"):
+            return {**out, "ok": False, "result": "side 要是 long/short"}
+        try:
+            price = self.market.price(coin)
+        except Exception as exc:
+            return {**out, "ok": False, "result": f"拿不到價格：{exc}"}
+        when = a.get("when") or ("above" if trigger > price else "below")
+        confirm = a.get("confirm") or "touch"
+        if when not in ("above", "below") or confirm not in ("touch", "1h", "4h"):
+            return {**out, "ok": False, "result": "when 要是 above/below，confirm 要是 touch/1h/4h"}
+        if (when == "above") != (trigger > price):
+            return {**out, "ok": False, "result": f"現價 {fmt(price)} 已經{'在觸發價上方' if when == 'above' else '在觸發價下方'}，直接用 open"}
+        dist = (trigger - stop) / trigger * (1 if side == "long" else -1)
+        if not c["min_stop_pct"] / 100 <= dist <= c["max_stop_pct"] / 100:
+            return {**out, "ok": False, "result": f"停損離觸發價 {dist * 100:.2f}%，不在 {c['min_stop_pct']}–{c['max_stop_pct']}%"}
+        hours = min(max(float(a.get("expires_hours") or 24), 1), c["plan_max_hours"])
+        try:
+            tp = float(a["take_profit"]) if a.get("take_profit") else None
+        except (TypeError, ValueError):
+            tp = None
+        plan = {"coin": coin, "side": side, "trigger": trigger, "when": when, "confirm": confirm, "stop": stop,
+                "tp": tp, "risk_pct": min(max(float(a.get("risk_pct") or 1), 0.1), c["max_risk_pct"]),
+                "created": self.clock(), "expires": self.clock() + hours * 3600, "reason": out["reason"]}
+        replaced = any(p["coin"] == coin for p in self.plans)
+        others = [p for p in self.plans if p["coin"] != coin]
+        if len(others) >= c["max_plans"]:
+            return {**out, "ok": False, "result": f"已有 {c['max_plans']} 張條件單，先取消舊的"}
+        self.plans = others + [plan]
+        self.save_plans()
+        return {**out, "ok": True, "result": "更新條件單" if replaced else "掛條件單",
+                "msg": f"📌 {'更新' if replaced else '掛'}條件單 {self.plan_text(plan)}\n理由：{plan['reason']}"}
+
+    def cancel_plan(self, a: dict) -> dict:
+        coin = str(a.get("coin", "")).upper()
+        out = {"type": "cancel_plan", "coin": coin, "reason": str(a.get("reason", ""))[:300]}
+        if not any(p["coin"] == coin for p in self.plans):
+            return {**out, "ok": False, "result": "沒有這張條件單"}
+        self.plans = [p for p in self.plans if p["coin"] != coin]
+        self.save_plans()
+        return {**out, "ok": True, "result": "取消條件單", "msg": f"🗑 取消 {coin} 條件單\n理由：{out['reason']}"}
+
+    def plan_hit(self, p: dict, since: float) -> bool:
+        sym = f"{p['coin']}/USDT:USDT"
+        above = p["when"] == "above"
+        if p["confirm"] == "touch":
+            bars = self.ex.fetch_ohlcv(sym, "1m", since=int(max(since, p["created"]) // 60 * 60_000), limit=500)
+            return any((b[2] >= p["trigger"]) if above else (b[3] <= p["trigger"]) for b in bars
+                       if b[0] + 60_000 > p["created"] * 1000)
+        tf = self.TF_MS[p["confirm"]]
+        bars = self.ex.fetch_ohlcv(sym, p["confirm"], limit=3)
+        done = [b for b in bars if b[0] + tf <= self.clock() * 1000 and b[0] + tf > p["created"] * 1000]
+        return any((b[4] > p["trigger"]) if above else (b[4] < p["trigger"]) for b in done)
+
+    def check_plans(self) -> None:
+        now, since = self.clock(), self.plans_checked - 60
+        self.plans_checked = now
+        if not self.plans:
+            return
+        keep, changed = [], False
+        for p in self.plans:
+            if now >= p["expires"]:
+                changed = True
+                self._journal({"view": f"條件單過期：{self.plan_text(p)}", "actions": []}, "條件單過期", {})
+                continue
+            try:
+                hit = self.plan_hit(p, since)
+            except Exception as exc:
+                log.warning("plan %s: %s", p["coin"], exc)
+                hit = False
+            if not hit:
+                keep.append(p)
+                continue
+            changed = True
+            a = {"type": "open", "coin": p["coin"], "side": p["side"], "stop": p["stop"], "take_profit": p["tp"],
+                 "risk_pct": p["risk_pct"], "reason": f"條件單觸發。{p['reason']}"}
+            universe = self.universe or [p["coin"]]
+            results = [self.execute(a, universe, self.book)]
+            mirror = {b.label: [self.execute(a, universe, b)] for b in self.books[1:]}
+            self._journal({"view": f"條件單觸發：{self.plan_text(p)}", "actions": results, "mirror": mirror},
+                          "條件單觸發", {})
+            r = results[0]
+            self.notify(f"⚡ 條件單觸發：{self.plan_text(p)}\n\n"
+                        + (r["msg"] if r.get("ok") else f"⛔ 沒有執行：{r['result']}"))
+        if changed:
+            self.plans = keep
+            self.save_plans()
 
     # -- prices / stops ---------------------------------------------------------------
     def prices(self) -> dict[str, float]:
@@ -808,10 +951,13 @@ class AITrader:
         return f"""現在時間 {tw(self.clock())}（台北時間 UTC+8，下面所有時間都是台北時間）。觸發原因：{trigger}
 
 【帳戶（{b.label}）】權益 {eq:.2f} U（起始 {b.starting_cash:g} U，目標 {b.starting_cash * c['target_multiple']:g} U），已用槓桿 {b.notional(prices) / eq if eq else 0:.2f} 倍
-【硬性限制（程式強制，違反的動作會被拒絕）】每筆風險 ≤ {c['max_risk_pct']:g}% 權益；總槓桿 ≤ {c['max_leverage']:g} 倍；最多 {c['max_positions']} 個倉位、一幣一倉、不加倉；停損距離 {c['min_stop_pct']}–{c['max_stop_pct']}%；停損只能收緊；權益 ≤ {b.floor:g} U 停止開新倉。{small}
+【硬性限制（程式強制，違反的動作會被拒絕）】每筆風險 ≤ {c['max_risk_pct']:g}% 權益；總槓桿 ≤ {c['max_leverage']:g} 倍；最多 {c['max_positions']} 個倉位、一幣一倉、不加倉；停損距離 {c['min_stop_pct']}–{c['max_stop_pct']}%；停損只能收緊；權益 ≤ {b.floor:g} U 停止開新倉；當天（台北時間）虧損 ≥ {c['daily_loss_pct']:g}% 停止開新倉到隔天，今天目前 {-b.day_loss_pct(eq):+.1f}%。{small}
 
 【目前倉位】
 {self.positions_text(prices)}
+
+【你掛著的條件單（程式每分鐘檢查，觸發就照風控開倉）】
+{self.plans_text()}
 
 【你最近的決策與交易】
 {self.history_text()}
@@ -839,9 +985,13 @@ class AITrader:
             self._journal({"view": f"決策失敗：{str(exc)[:200]}", "actions": []}, trigger, {})
             self.notify(f"⚠️ 這次決策失敗（倉位的停損、止盈照常有效）：{str(exc)[:200]}")
             return
-        actions = decision.get("actions", [])[:8]
+        self.universe = universe
+        actions = decision.get("actions", [])[:10]
+        plan_acts = [a for a in actions if a.get("type") in ("plan", "cancel_plan")]
+        actions = [a for a in actions if a not in plan_acts]
         results = [self.execute(a, universe, self.book) for a in actions]
         mirror = {b.label: [self.execute(a, universe, b) for a in actions] for b in self.books[1:]}
+        results += [self.add_plan(a, universe) if a["type"] == "plan" else self.cancel_plan(a) for a in plan_acts]
         decision["actions"] = results
         self._journal({**decision, "mirror": mirror} if mirror else decision, trigger, meta)
         acted = [a for a in results if a.get("ok")]
@@ -850,7 +1000,8 @@ class AITrader:
         msg = [] if acted or rejected else ["👀 觀望"]
         msg.append(str(decision.get("view", "")).strip()[:1500])
         msg += [a["msg"] for a in acted]
-        msg += [f"⛔ 沒有執行：{a.get('type')} {a.get('coin', '')} — {a['result']}" for a in rejected]
+        msg += [f"⛔ 沒有執行：{ACTION_NAMES.get(a.get('type'), a.get('type'))} {a.get('coin', '')} — {a['result']}"
+                for a in rejected]
         if decision.get("watch"):
             msg.append("等待：\n" + str(decision["watch"]).strip()[:900])
         self.notify("\n\n".join(m for m in msg if m))
@@ -957,6 +1108,9 @@ class AITrader:
         now = self.clock()
         self.check_exits()
         self.funding()
+        for b in self.books:
+            b.mark_day(now, lambda b=b: b.equity(self.prices()))
+        self.check_plans()
         if now - self.last_news >= self.cfg["news_minutes"] * 60:
             first = self.last_news == 0
             new = self.news.poll()

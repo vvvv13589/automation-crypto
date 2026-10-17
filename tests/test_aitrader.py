@@ -193,6 +193,79 @@ def test_news_parse_and_dedupe(tmp_path):
     assert n.poll() == []
 
 
+# -- conditional entries + daily loss limit ---------------------------------------------
+def plan(**kw):
+    return {"type": "plan", "coin": "SOL", "side": "long", "trigger": 210, "confirm": "touch", "stop": 200,
+            "risk_pct": 1, "reason": "breakout", **kw}
+
+
+def test_plan_touch_opens_on_every_book(setup, tmp_path):
+    t, ex, ai, clock, sent = setup
+    mirror = Book(tmp_path / "m.json", tmp_path / "m.csv", t.cfg, 400, clock)
+    t.books.append(mirror)
+    ai.replies.append({"view": "SOL 等突破", "actions": [plan()]})
+    t.decide("test")
+    assert len(t.plans) == 1 and "掛條件單" in sent[-1] and "碰到站上 210" in sent[-1]
+    m = int(T0 * 1000)
+    ex.bars["SOL"] = [[m + 60_000, 200, 205, 199, 204, 1]]
+    clock.t += 120
+    t.check_plans()
+    assert t.plans and "SOL" not in t.book.positions  # not reached yet
+    ex.bars["SOL"].append([m + 180_000, 204, 211, 203, 210, 1])
+    ex.px["SOL"] = 210.5
+    clock.t += 120
+    t.check_plans()
+    assert t.plans == [] and "SOL" in t.book.positions and "SOL" in mirror.positions
+    assert sent[-1].startswith("⚡ 條件單觸發") and "開多 SOL" in sent[-1]
+    assert t.book.positions["SOL"]["stop"] == 200
+
+
+def test_plan_needs_a_closed_candle_beyond_the_trigger(setup):
+    t, ex, ai, clock, sent = setup
+    assert t.add_plan(plan(confirm="1h"), ["SOL"])["ok"]
+    h = 3_600_000
+    start = (int(clock.t * 1000) // h + 1) * h  # the first 1h candle that opens after the plan
+    real = ex.fetch_ohlcv
+    ex.fetch_ohlcv = lambda sym, tf, since=None, limit=100: (
+        [[start, 205, 212, 204, 209, 1], [start + h, 209, 215, 208, 214, 1]] if tf == "1h" else real(sym, tf, since, limit))
+    clock.t = start / 1000 + 1800  # first candle still open (it wicked above 210)
+    t.check_plans()
+    assert t.plans and "SOL" not in t.book.positions
+    clock.t = start / 1000 + h / 1000 + 60  # it closed at 209: still below the trigger
+    t.check_plans()
+    assert t.plans
+    clock.t = start / 1000 + 2 * h / 1000 + 60  # the next one closed at 214
+    ex.px["SOL"] = 214
+    t.check_plans()
+    assert "SOL" in t.book.positions
+
+
+def test_plan_validation_and_expiry(setup):
+    t, ex, ai, clock, sent = setup
+    assert "已經在觸發價上方" in t.add_plan(plan(trigger=190, when="above"), ["SOL"])["result"]
+    assert "停損離觸發價" in t.add_plan(plan(stop=209.9), ["SOL"])["result"]
+    assert "不在前" in t.add_plan(plan(coin="DOGE"), ["SOL"])["result"]
+    assert t.add_plan(plan(expires_hours=2), ["SOL"])["ok"]
+    assert t.add_plan(plan(trigger=212), ["SOL"])["result"] == "更新條件單" and len(t.plans) == 1
+    assert t.cancel_plan({"coin": "SOL"})["ok"] and t.plans == []
+    t.add_plan(plan(expires_hours=2), ["SOL"])
+    clock.t += 3 * 3600
+    t.check_plans()
+    assert t.plans == [] and "SOL" not in t.book.positions
+
+
+def test_daily_loss_limit(setup):
+    t, ex, ai, clock, sent = setup
+    t.book.mark_day(clock.t, lambda: 200.0)
+    t.book.cash = 179  # -10.5% today
+    ok, msg, _ = Guard(t.cfg).check_open({"coin": "SOL", "side": "long", "stop": 190}, t.book, 200, {}, ["SOL"])
+    assert not ok and "今天已虧" in msg
+    clock.t += 86400  # next Taipei day: new reference
+    t.book.mark_day(clock.t, lambda: 179.0)
+    ok, msg, _ = Guard(t.cfg).check_open({"coin": "SOL", "side": "long", "stop": 190}, t.book, 200, {}, ["SOL"])
+    assert ok
+
+
 # -- full-market scan ---------------------------------------------------------------
 def bars(closes, vol=1.0):
     return [[i, c, c * 1.01, c * 0.99, c, vol] for i, c in enumerate(closes)]
