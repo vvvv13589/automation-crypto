@@ -198,7 +198,24 @@ class Market:
         except Exception as exc:
             log.warning("oi %s: %s", coin, exc)
             d["oi"] = []
+        d["ls"] = self.fetch_ratios(sym)
         return d
+
+    def fetch_ratios(self, sym: str) -> dict:
+        """Binance public futures data: top-trader position long/short ratio (the biggest 20% of
+        accounts by margin), all-account long/short ratio, taker buy/sell volume ratio (1h)."""
+        out = {}
+        try:
+            p = {"symbol": self.ex.market(sym)["id"], "period": "1h"}
+            out["top"] = [float(r["longShortRatio"]) for r in
+                          self.ex.fapiDataGetTopLongShortPositionRatio({**p, "limit": 25})]
+            out["retail"] = [float(r["longShortRatio"]) for r in
+                             self.ex.fapiDataGetGlobalLongShortAccountRatio({**p, "limit": 25})]
+            out["taker"] = [(float(r["buyVol"]), float(r["sellVol"])) for r in
+                            self.ex.fapiDataGetTakerlongshortRatio({**p, "limit": 4})]
+        except Exception as exc:
+            log.warning("long/short ratios %s: %s", sym, exc)
+        return out
 
     def digest(self, coins: list[str]) -> str:
         """Full scan of every coin (no AI): the AI gets all rows, plus the coins the screens flag."""
@@ -224,7 +241,8 @@ class Market:
 
 
 SCAN_HEADER = ("幣種 | 價格 | 24h% | 7d% | 30d% | 7d相對BTC | 日線結構 | 4h結構 | 4h EMA50 | 距20日高/低% | "
-               "24h區間位置 | 持倉量24h% | 量能倍數 | 資金費率%/8h | ATR(4h)%")
+               "24h區間位置 | 持倉量24h% | 量能倍數 | 資金費率%/8h | ATR(4h)% | 大戶多空比(24h變化) | "
+               "散戶多空比 | 主動買賣比4h")
 
 
 def change(bars: list, n: int) -> float:
@@ -267,6 +285,13 @@ def scan_coin(d: dict, funding: float, btc7: float) -> dict | None:
         "vol_x": vol24 / vol_avg if vol_avg else None, "funding": funding * 100, "atr": atr / last * 100,
     }
     s["rs"] = s["c7"] - btc7
+    ls = d.get("ls") or {}
+    top, retail, taker = ls.get("top") or [], ls.get("retail") or [], ls.get("taker") or []
+    s["top"] = top[-1] if top else None
+    s["top_chg"] = top[-1] - top[0] if len(top) >= 2 else None
+    s["retail"] = retail[-1] if retail else None
+    sells = sum(v for _, v in taker)
+    s["taker"] = sum(b for b, _ in taker) / sells if sells else None
     flags = []
     if last > hi20:
         flags.append("站上 20 日高點")
@@ -286,6 +311,15 @@ def scan_coin(d: dict, funding: float, btc7: float) -> dict | None:
         flags.append(f"資金費率偏{'多' if s['funding'] > 0 else '空'} {s['funding']:+.3f}%")
     if abs(s["rs"]) >= 10:
         flags.append(f"7d {'強' if s['rs'] > 0 else '弱'}於 BTC {s['rs']:+.0f}%")
+    if s["top"] is not None and s["retail"] is not None:
+        if s["top"] < 1 and s["retail"] > 1.3:
+            flags.append(f"大戶偏空、散戶偏多（{s['top']:.2f} vs {s['retail']:.2f}）")
+        elif s["top"] > 1.3 and s["retail"] < 1:
+            flags.append(f"大戶偏多、散戶偏空（{s['top']:.2f} vs {s['retail']:.2f}）")
+    if s["top_chg"] is not None and s["top"] and abs(s["top_chg"]) / (s["top"] - s["top_chg"] or 1) >= 0.25:
+        flags.append(f"大戶多空比 24h {s['top'] - s['top_chg']:.2f}→{s['top']:.2f}")
+    if s["taker"] is not None and (s["taker"] >= 1.3 or s["taker"] <= 0.77):
+        flags.append(f"主動{'買' if s['taker'] > 1 else '賣'}盤強（4h 買賣比 {s['taker']:.2f}）")
     if s["d_struct"] != "盤" and s["d_struct"] == s["h4_struct"]:
         flags.append(f"日線與 4h 同步{'上升' if s['d_struct'] == '升' else '下降'}")
     s["flags"] = flags
@@ -297,7 +331,13 @@ def scan_line(c: str, s: dict) -> str:
     vx = f"{s['vol_x']:.1f}" if s["vol_x"] is not None else "?"
     return (f"{c} | {fmt(s['price'])} | {s['c24']:+.1f} | {s['c7']:+.1f} | {s['c30']:+.1f} | {s['rs']:+.1f} | "
             f"{s['d_struct']} | {s['h4_struct']} | {s['ema']:+.1f}% | {s['to_hi']:+.1f}/{s['to_lo']:+.1f} | "
-            f"{s['range_pos']:.0f}% | {oi} | {vx} | {s['funding']:+.4f} | {s['atr']:.1f}")
+            f"{s['range_pos']:.0f}% | {oi} | {vx} | {s['funding']:+.4f} | {s['atr']:.1f} | "
+            f"{ratio(s['top'])}({'+' if (s['top_chg'] or 0) >= 0 else ''}{ratio(s['top_chg'])}) | "
+            f"{ratio(s['retail'])} | {ratio(s['taker'])}")
+
+
+def ratio(x) -> str:
+    return "?" if x is None else f"{x:.2f}"
 
 
 

@@ -204,9 +204,11 @@ def test_scan_flags_breakout_with_oi_and_volume():
     h4 = bars([100 + i * 0.6 for i in range(60)])
     h1 = bars([130] * 24 + [130 + i for i in range(24)], vol=20)  # heavy last-24h volume
     oi = [100.0] * 24 + [130.0]
-    s = scan_coin({"h1": h1, "h4": h4, "d1": d1, "oi": oi}, 0.0008, btc7=1.0)
+    ls = {"top": [1.0] * 24 + [0.8], "retail": [1.5] * 25, "taker": [(150, 100)] * 4}
+    s = scan_coin({"h1": h1, "h4": h4, "d1": d1, "oi": oi, "ls": ls}, 0.0008, btc7=1.0)
     assert s["d_struct"] == "升" and s["h4_struct"] == "升"
-    for flag in ("站上 20 日高點", "持倉量 24h +30%", "價漲量增", "資金費率偏多", "日線與 4h 同步上升"):
+    for flag in ("站上 20 日高點", "持倉量 24h +30%", "價漲量增", "資金費率偏多", "日線與 4h 同步上升",
+                 "大戶偏空、散戶偏多", "主動買盤強"):
         assert any(f.startswith(flag) for f in s["flags"]), (flag, s["flags"])
     assert any(f.startswith("成交量") for f in s["flags"])
 
