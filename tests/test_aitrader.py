@@ -193,6 +193,39 @@ def test_news_parse_and_dedupe(tmp_path):
     assert n.poll() == []
 
 
+# -- full-market scan ---------------------------------------------------------------
+def bars(closes, vol=1.0):
+    return [[i, c, c * 1.01, c * 0.99, c, vol] for i, c in enumerate(closes)]
+
+
+def test_scan_flags_breakout_with_oi_and_volume():
+    from cryptobot.aitrader import scan_coin
+    d1 = bars([100 + i * 0.5 for i in range(59)] + [140])  # steady uptrend, today above the 20-day high
+    h4 = bars([100 + i * 0.6 for i in range(60)])
+    h1 = bars([130] * 24 + [130 + i for i in range(24)], vol=20)  # heavy last-24h volume
+    oi = [100.0] * 24 + [130.0]
+    s = scan_coin({"h1": h1, "h4": h4, "d1": d1, "oi": oi}, 0.0008, btc7=1.0)
+    assert s["d_struct"] == "升" and s["h4_struct"] == "升"
+    for flag in ("站上 20 日高點", "持倉量 24h +30%", "價漲量增", "資金費率偏多", "日線與 4h 同步上升"):
+        assert any(f.startswith(flag) for f in s["flags"]), (flag, s["flags"])
+    assert any(f.startswith("成交量") for f in s["flags"])
+
+
+def test_scan_quiet_coin_has_no_flags():
+    from cryptobot.aitrader import scan_coin
+    flat = bars([100 + (i % 2) * 0.1 for i in range(60)])
+    s = scan_coin({"h1": flat[-48:], "h4": flat, "d1": [[i, 100, 105, 95, 100, 24] for i in range(60)], "oi": [100.0] * 25},
+                  0.0001, btc7=0.0)
+    assert s["flags"] == [] and s["d_struct"] == "盤"
+
+
+def test_digest_lists_every_coin_and_the_flagged_ones(setup):
+    t, *_ = setup
+    text = t.market.digest(["BTC", "ETH", "SOL"])
+    rows = [l for l in text.splitlines() if l.split(" | ")[0] in ("BTC", "ETH", "SOL")]
+    assert len(rows) == 3 and "程式篩選出的訊號" in text
+
+
 # -- live book (fake broker: no exchange) ---------------------------------------------
 class FakeFill:
     def __init__(self, amount, price, fee=0.01):

@@ -183,32 +183,121 @@ class Market:
             return {}
         return {s.split("/")[0]: float(r.get("fundingRate") or 0) for s, r in rates.items()}
 
+    def fetch_coin(self, coin: str) -> dict | None:
+        """Everything the scan needs for one coin: 1h / 4h / 1d candles and 1h open interest."""
+        sym = f"{coin}/USDT:USDT"
+        try:
+            d = {"h1": self.ex.fetch_ohlcv(sym, "1h", limit=48), "h4": self.ex.fetch_ohlcv(sym, "4h", limit=60),
+                 "d1": self.ex.fetch_ohlcv(sym, "1d", limit=60)}
+        except Exception as exc:
+            log.warning("klines %s: %s", coin, exc)
+            return None
+        try:
+            d["oi"] = [float(r.get("openInterestValue") or 0)
+                       for r in self.ex.fetch_open_interest_history(sym, "1h", limit=25)]
+        except Exception as exc:
+            log.warning("oi %s: %s", coin, exc)
+            d["oi"] = []
+        return d
+
     def digest(self, coins: list[str]) -> str:
+        """Full scan of every coin (no AI): the AI gets all rows, plus the coins the screens flag."""
         fund = self.funding()
-        lines = ["幣種 | 價格 | 24h% | 7d% | 4h EMA50 位置 | 距20根4h高點% | 距20根4h低點% | ATR14(4h)% | 資金費率%/8h | 24h成交額M"]
+        raw = {c: self.fetch_coin(c) for c in coins}
+        btc = raw.get("BTC")
+        btc7 = change(btc["h4"], 42) if btc else 0.0
+        rows = []
         for c in coins:
-            sym = f"{c}/USDT:USDT"
-            try:
-                k = self.ex.fetch_ohlcv(sym, "4h", limit=60)
-            except Exception as exc:
-                log.warning("klines %s: %s", c, exc)
+            if not raw[c]:
                 continue
-            if len(k) < 50:
-                continue
-            closes = [r[4] for r in k]
-            last = closes[-1]
-            hi = max(r[2] for r in k[-20:])
-            lo = min(r[3] for r in k[-20:])
-            trs = [max(k[i][2] - k[i][3], abs(k[i][2] - k[i - 1][4]), abs(k[i][3] - k[i - 1][4]))
-                   for i in range(len(k) - 14, len(k))]
-            e50 = ema(closes, 50)
-            t = self.tickers.get(sym, {})
-            lines.append(
-                f"{c} | {fmt(last)} | {float(t.get('percentage') or 0):+.1f} | {(last / closes[-43] - 1) * 100:+.1f} | "
-                f"{'上' if last > e50 else '下'}{abs(last / e50 - 1) * 100:.1f}% | {(last / hi - 1) * 100:+.1f} | "
-                f"{(last / lo - 1) * 100:+.1f} | {sum(trs) / 14 / last * 100:.1f} | {fund.get(c, 0) * 100:+.4f} | "
-                f"{float(t.get('quoteVolume') or 0) / 1e6:.0f}")
+            s = scan_coin(raw[c], fund.get(c, 0.0), btc7)
+            if s:
+                rows.append((c, s))
+        lines = [SCAN_HEADER]
+        lines += [scan_line(c, s) for c, s in rows]
+        # trend alignment alone is common (most coins drift with BTC): list coins with an actual event
+        flagged = sorted((r for r in rows if any(not f.startswith("日線與") for f in r[1]["flags"])),
+                         key=lambda r: -len(r[1]["flags"]))
+        lines.append("\n【程式篩選出的訊號（客觀條件，不代表一定要做）】")
+        lines += [f"{c}：{'、'.join(s['flags'])}" for c, s in flagged] or ["（這小時沒有幣觸發篩選條件）"]
         return "\n".join(lines)
+
+
+SCAN_HEADER = ("幣種 | 價格 | 24h% | 7d% | 30d% | 7d相對BTC | 日線結構 | 4h結構 | 4h EMA50 | 距20日高/低% | "
+               "24h區間位置 | 持倉量24h% | 量能倍數 | 資金費率%/8h | ATR(4h)%")
+
+
+def change(bars: list, n: int) -> float:
+    """% change over the last n bars."""
+    if len(bars) <= n:
+        return 0.0
+    return (bars[-1][4] / bars[-1 - n][4] - 1) * 100
+
+
+def structure(bars: list, n: int) -> str:
+    """升 = higher high and higher low than the n bars before, 降 = both lower, else 盤."""
+    if len(bars) < 2 * n:
+        return "?"
+    rec, prev = bars[-n:], bars[-2 * n:-n]
+    h1, h0 = max(b[2] for b in rec), max(b[2] for b in prev)
+    l1, l0 = min(b[3] for b in rec), min(b[3] for b in prev)
+    return "升" if h1 > h0 and l1 > l0 else "降" if h1 < h0 and l1 < l0 else "盤"
+
+
+def scan_coin(d: dict, funding: float, btc7: float) -> dict | None:
+    h1, h4, d1, oi = d["h1"], d["h4"], d["d1"], d.get("oi") or []
+    if len(h4) < 50 or len(d1) < 21 or len(h1) < 24:
+        return None
+    last = h4[-1][4]
+    trs = [max(h4[i][2] - h4[i][3], abs(h4[i][2] - h4[i - 1][4]), abs(h4[i][3] - h4[i - 1][4]))
+           for i in range(len(h4) - 14, len(h4))]
+    atr = sum(trs) / 14
+    hi20 = max(b[2] for b in d1[-21:-1])  # 20 finished days, today excluded
+    lo20 = min(b[3] for b in d1[-21:-1])
+    day_hi, day_lo = max(b[2] for b in h1[-24:]), min(b[3] for b in h1[-24:])
+    vol24 = sum(b[5] * b[4] for b in h1[-24:])
+    vol_avg = sum(b[5] * b[4] for b in d1[-8:-1]) / 7 if len(d1) >= 8 else 0
+    s = {
+        "price": last, "c24": change(h1, 24), "c7": change(h4, 42), "c30": change(d1, 30) if len(d1) > 30 else 0.0,
+        "d_struct": structure(d1, 10), "h4_struct": structure(h4, 20),
+        "ema": (last / ema([b[4] for b in h4], 50) - 1) * 100,
+        "to_hi": (last / hi20 - 1) * 100, "to_lo": (last / lo20 - 1) * 100,
+        "range_pos": (last - day_lo) / (day_hi - day_lo) * 100 if day_hi > day_lo else 50.0,
+        "oi24": (oi[-1] / oi[0] - 1) * 100 if len(oi) >= 2 and oi[0] else None,
+        "vol_x": vol24 / vol_avg if vol_avg else None, "funding": funding * 100, "atr": atr / last * 100,
+    }
+    s["rs"] = s["c7"] - btc7
+    flags = []
+    if last > hi20:
+        flags.append("站上 20 日高點")
+    elif hi20 - last <= atr:
+        flags.append("貼近 20 日高點")
+    if last < lo20:
+        flags.append("跌破 20 日低點")
+    elif last - lo20 <= atr:
+        flags.append("貼近 20 日低點")
+    if s["oi24"] is not None and abs(s["oi24"]) >= 15:
+        flags.append(f"持倉量 24h {s['oi24']:+.0f}%")
+    if s["oi24"] is not None and s["oi24"] >= 8 and abs(s["c24"]) >= 3:
+        flags.append("價漲量增" if s["c24"] > 0 else "價跌量增")
+    if s["vol_x"] is not None and s["vol_x"] >= 2:
+        flags.append(f"成交量 {s['vol_x']:.1f} 倍")
+    if abs(s["funding"]) >= 0.05:
+        flags.append(f"資金費率偏{'多' if s['funding'] > 0 else '空'} {s['funding']:+.3f}%")
+    if abs(s["rs"]) >= 10:
+        flags.append(f"7d {'強' if s['rs'] > 0 else '弱'}於 BTC {s['rs']:+.0f}%")
+    if s["d_struct"] != "盤" and s["d_struct"] == s["h4_struct"]:
+        flags.append(f"日線與 4h 同步{'上升' if s['d_struct'] == '升' else '下降'}")
+    s["flags"] = flags
+    return s
+
+
+def scan_line(c: str, s: dict) -> str:
+    oi = f"{s['oi24']:+.1f}" if s["oi24"] is not None else "?"
+    vx = f"{s['vol_x']:.1f}" if s["vol_x"] is not None else "?"
+    return (f"{c} | {fmt(s['price'])} | {s['c24']:+.1f} | {s['c7']:+.1f} | {s['c30']:+.1f} | {s['rs']:+.1f} | "
+            f"{s['d_struct']} | {s['h4_struct']} | {s['ema']:+.1f}% | {s['to_hi']:+.1f}/{s['to_lo']:+.1f} | "
+            f"{s['range_pos']:.0f}% | {oi} | {vx} | {s['funding']:+.4f} | {s['atr']:.1f}")
 
 
 
@@ -714,13 +803,13 @@ class AITrader:
         self._journal({**decision, "mirror": mirror} if mirror else decision, trigger, meta)
         acted = [a for a in results if a.get("ok")]
         rejected = [a for a in results if not a.get("ok")]
-        msg = [f"🧠 {decision.get('view', '')[:600]}"]
+        msg = [f"🧠 {decision.get('view', '')[:1200]}"]
         msg += [a["msg"] for a in acted]
         msg += [f"⛔ 沒有執行：{a.get('type')} {a.get('coin', '')} — {a['result']}" for a in rejected]
         if not acted and not rejected:
             msg[0] = "👀 觀望｜" + msg[0][2:]
             if decision.get("watch"):
-                msg.append(f"等待：{str(decision['watch'])[:500]}")
+                msg.append(f"等待：{str(decision['watch'])[:900]}")
         self.notify("\n\n".join(msg))
 
     def execute(self, a: dict, universe: list[str], book) -> dict:
