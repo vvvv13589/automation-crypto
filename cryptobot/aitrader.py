@@ -1,4 +1,5 @@
-"""AI discretionary trader: Claude reads the top-50 market and the news and decides.
+"""AI discretionary trader: Claude reads the top-50 crypto market, the biggest TradFi perps
+(stocks, gold, oil) and the news, and decides.
 
     python3 -m cryptobot ai-trader                 # paper only (200 U simulated)
     python3 -m cryptobot ai-trader --live          # AI sub-account for real + the paper mirror
@@ -42,6 +43,9 @@ DEFAULTS = {
     "urgent_gap_minutes": 30,  # breaking news may trigger an extra decision, at most this often
     "news_minutes": 5,
     "universe": 50,
+    "tradfi": 15,  # also scan the top TradFi perps (stocks, gold, oil...) by volume; 0 = crypto only
+    "tradfi_min_volume": 50e6,  # 24 h quote volume, USDT
+    "session_buffer_minutes": 30,  # no new stock positions this close to (or after) the home market's close
     "max_positions": 4,
     "max_risk_pct": 5.0,  # loss at the stop, % of equity, per trade
     "max_leverage": 5.0,  # total open notional / equity
@@ -62,12 +66,19 @@ FEEDS = {
     "Cointelegraph": "https://cointelegraph.com/rss",
     "Decrypt": "https://decrypt.co/feed",
     "The Block": "https://www.theblock.co/rss.xml",
+    # traditional markets (stocks, gold, oil) for the TradFi perps
+    "CNBC Markets": "https://www.cnbc.com/id/20910258/device/rss/rss.html",
+    "MarketWatch": "https://feeds.content.dowjones.io/public/rss/mw_marketpulse",
+    "Investing 原物料": "https://www.investing.com/rss/news_11.rss",
+    "Investing 股市": "https://www.investing.com/rss/news_25.rss",
+    "OilPrice": "https://oilprice.com/rss/main",
 }
 BINANCE_NEWS = ("https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
                 "?type=1&pageNo=1&pageSize=10")
 URGENT = re.compile(r"hack|exploit|drain|stolen|delist|liquidat|crash|plunge|sec\b|etf|"
                     r"fed\b|fomc|rate (cut|hike)|cpi|tariff|bankrupt|halt|outage|depeg|lawsuit|ban\b|"
-                    r"approv|will list|launchpool|emergency", re.I)
+                    r"approv|will list|launchpool|emergency|opec|payroll|powell|"
+                    r"guidance cut|profit warning", re.I)
 UA = {"User-Agent": "Mozilla/5.0 (cryptobot ai-trader)"}
 
 
@@ -148,6 +159,40 @@ class News:
         return [i for i in items if URGENT.search(i["title"])]
 
 
+# -- market sessions (TradFi perps trade 24/7, but their price is only discovered while the home
+# market is open; outside it they drift on thin volume and can gap at the open). Holidays ignored.
+SESSIONS = {  # underlyingType -> (label, timezone, [(open, close)], weekdays)
+    "EQUITY": ("美股", "America/New_York", [("09:30", "16:00")]),
+    "KR_EQUITY": ("韓股", "Asia/Seoul", [("09:00", "15:30")]),
+    "HK_EQUITY": ("港股", "Asia/Hong_Kong", [("09:30", "12:00"), ("13:00", "16:00")]),
+    "CN_EQUITY": ("A股", "Asia/Shanghai", [("09:30", "11:30"), ("13:00", "15:00")]),
+}
+TRADFI_KINDS = set(SESSIONS) | {"COMMODITY"}
+
+
+def session(kind: str, now: float) -> tuple[bool, float, str]:
+    """(open, minutes until close (0 when closed), short label) for an underlying type at `now`."""
+    if kind in ("COIN", "", None):
+        return True, 1e9, ""
+    if kind == "COMMODITY":  # CME Globex: Sunday 18:00 – Friday 17:00 New York, daily break 17:00–18:00
+        t = datetime.fromtimestamp(now, ZoneInfo("America/New_York"))
+        m = t.hour * 60 + t.minute
+        wd = t.weekday()  # Monday 0 … Sunday 6
+        closed = wd == 5 or (wd == 6 and m < 18 * 60) or (wd == 4 and m >= 17 * 60) or 17 * 60 <= m < 18 * 60
+        if closed:
+            return False, 0.0, "期貨·休市"
+        return True, (17 * 60 - m) % (24 * 60) or 24 * 60, "期貨·交易中"
+    label, tzname, windows = SESSIONS.get(kind, (kind, "UTC", [("00:00", "23:59")]))
+    t = datetime.fromtimestamp(now, ZoneInfo(tzname))
+    m = t.hour * 60 + t.minute
+    if t.weekday() < 5:
+        for o, c in windows:
+            om, cm = int(o[:2]) * 60 + int(o[3:]), int(c[:2]) * 60 + int(c[3:])
+            if om <= m < cm:
+                return True, float(cm - m), f"{label}·開盤"
+    return False, 0.0, f"{label}·休市"
+
+
 # -- market -----------------------------------------------------------------------
 def ema(values: list[float], n: int) -> float:
     k, e = 2 / (n + 1), values[0]
@@ -157,25 +202,37 @@ def ema(values: list[float], n: int) -> float:
 
 
 class Market:
-    def __init__(self, ex, size: int = 50):
-        self.ex, self.size = ex, size
+    def __init__(self, ex, size: int = 50, tradfi: int = 0, tradfi_min_volume: float = 0.0, clock=time.time):
+        self.ex, self.size, self.tradfi, self.tradfi_min_volume, self.clock = ex, size, tradfi, tradfi_min_volume, clock
         self.tickers: dict = {}
+        self.kinds: dict[str, str] = {}  # base -> underlyingType ("COIN", "EQUITY", "COMMODITY", ...)
 
     def universe(self) -> list[str]:
-        """Top crypto USDT perpetuals by 24 h quote volume (no stablecoins, no stock tokens)."""
+        """Top crypto USDT perpetuals by 24 h quote volume (no stablecoins), then the top TradFi
+        perpetuals (stocks, ETFs, gold, oil; no pre-IPO or FX) above a volume floor."""
         self.tickers = self.ex.fetch_tickers()
-        rows = []
+        crypto, tradfi = [], []
         for sym, t in self.tickers.items():
             m = self.ex.markets.get(sym) or {}
             info = m.get("info") or {}
             if not (m.get("swap") and m.get("quote") == "USDT" and m.get("active", True)):
                 continue
-            if info.get("contractType", "PERPETUAL") != "PERPETUAL":
-                continue
-            if info.get("underlyingType", "COIN") != "COIN" or m.get("base") in STABLES:
-                continue
-            rows.append((float(t.get("quoteVolume") or 0), m["base"]))
-        return [b for _, b in sorted(rows, reverse=True)[: self.size]]
+            ctype, kind = info.get("contractType", "PERPETUAL"), info.get("underlyingType", "COIN")
+            vol = float(t.get("quoteVolume") or 0)
+            if ctype == "PERPETUAL" and kind == "COIN" and m.get("base") not in STABLES:
+                crypto.append((vol, m["base"], kind))
+            elif ctype == "TRADIFI_PERPETUAL" and kind in TRADFI_KINDS and vol >= self.tradfi_min_volume:
+                tradfi.append((vol, m["base"], kind))
+        rows = sorted(crypto, reverse=True)[: self.size] + sorted(tradfi, reverse=True)[: self.tradfi]
+        self.kinds = {b: k for _, b, k in rows}
+        return [b for _, b, _ in rows]
+
+    def session(self, coin: str) -> tuple[bool, float, str]:
+        kind = self.kinds.get(coin)
+        if kind is None:  # not scanned yet (e.g. a plan right after a restart): ask the market list
+            info = (self.ex.markets.get(f"{coin}/USDT:USDT") or {}).get("info") or {}
+            kind = info.get("underlyingType", "COIN")
+        return session(kind, self.clock())
 
     def price(self, coin: str) -> float:
         t = self.ex.fetch_ticker(f"{coin}/USDT:USDT")
@@ -237,7 +294,12 @@ class Market:
             if s:
                 rows.append((c, s))
         lines = [SCAN_HEADER]
-        lines += [scan_line(c, s) for c, s in rows]
+        lines += [scan_line(c, s) for c, s in rows if self.kinds.get(c, "COIN") == "COIN"]
+        trad = [(c, s) for c, s in rows if self.kinds.get(c, "COIN") != "COIN"]
+        if trad:
+            lines.append("\n【傳統市場 TradFi 永續（股票、ETF、黃金、原油；〔〕是本地市場現在的狀態，"
+                         "休市時價格只在盤後薄量漂移、開盤可能跳空；7d相對BTC 對它們參考意義不大）】")
+            lines += [scan_line(f"{c}〔{self.session(c)[2]}〕", s) for c, s in trad]
         # trend alignment alone is common (most coins drift with BTC): list coins with an actual event
         flagged = sorted((r for r in rows if any(not f.startswith("日線與") for f in r[1]["flags"])),
                          key=lambda r: -len(r[1]["flags"]))
@@ -618,14 +680,21 @@ class LiveBook(Book):
 class Guard:
     """Hard limits the AI cannot override. Returns (ok, message, normalised action)."""
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, session=None):
         self.cfg = cfg
+        self.session = session  # coin -> (open, minutes to close, label); None = always open
 
     def check_open(self, a: dict, book: Book, price: float, prices: dict, universe: list[str]):
         c = self.cfg
         coin, side = str(a.get("coin", "")).upper(), a.get("side")
         if coin not in universe:
             return False, f"{coin} 不在前 {c['universe']} 大", None
+        if self.session:
+            is_open, left, label = self.session(coin)
+            if not is_open:
+                return False, f"{coin} 本地市場休市（{label}），不開新倉（開盤跳空風險）", None
+            if left < c["session_buffer_minutes"]:
+                return False, f"{coin} 離收盤只剩 {left:.0f} 分鐘，不開新倉（隔夜跳空風險）", None
         if coin in book.positions:
             return False, f"{coin} 已有倉位（不加倉）", None
         if len(book.positions) >= c["max_positions"]:
@@ -739,13 +808,13 @@ class AITrader:
         logs.mkdir(parents=True, exist_ok=True)
         self.ex, self.ai, self.clock = ex, ai, clock
         self.notify = notify or (lambda text: None)
-        self.market = Market(ex, self.cfg["universe"])
+        self.market = Market(ex, self.cfg["universe"], self.cfg["tradfi"], self.cfg["tradfi_min_volume"], clock)
         self.books = books or [Book(state / "aitrader_book.json", logs / "aitrader_trades.csv", self.cfg,
                                     self.cfg["paper_cash"], clock)]
         self.book = self.books[0]
         self.news = News(state / "aitrader_news.json", fetch=fetch, clock=clock)
         self.journal = logs / "aitrader_decisions.jsonl"
-        self.guard = Guard(self.cfg)
+        self.guard = Guard(self.cfg, session=self.market.session)
         self.last_decision = self.last_news = 0.0
         tz = ZoneInfo(self.cfg["timezone"])
         today = datetime.fromtimestamp(clock(), tz)
@@ -951,7 +1020,7 @@ class AITrader:
         return f"""現在時間 {tw(self.clock())}（台北時間 UTC+8，下面所有時間都是台北時間）。觸發原因：{trigger}
 
 【帳戶（{b.label}）】權益 {eq:.2f} U（起始 {b.starting_cash:g} U，目標 {b.starting_cash * c['target_multiple']:g} U），已用槓桿 {b.notional(prices) / eq if eq else 0:.2f} 倍
-【硬性限制（程式強制，違反的動作會被拒絕）】每筆風險 ≤ {c['max_risk_pct']:g}% 權益；總槓桿 ≤ {c['max_leverage']:g} 倍；最多 {c['max_positions']} 個倉位、一幣一倉、不加倉；停損距離 {c['min_stop_pct']}–{c['max_stop_pct']}%；停損只能收緊；權益 ≤ {b.floor:g} U 停止開新倉；當天（台北時間）虧損 ≥ {c['daily_loss_pct']:g}% 停止開新倉到隔天，今天目前 {-b.day_loss_pct(eq):+.1f}%。{small}
+【硬性限制（程式強制，違反的動作會被拒絕）】每筆風險 ≤ {c['max_risk_pct']:g}% 權益；總槓桿 ≤ {c['max_leverage']:g} 倍；最多 {c['max_positions']} 個倉位、一幣一倉、不加倉；停損距離 {c['min_stop_pct']}–{c['max_stop_pct']}%；停損只能收緊；股票類 TradFi 只能在本地市場開盤中、離收盤 {c['session_buffer_minutes']} 分鐘以上開新倉（原物料看期貨交易時段）；權益 ≤ {b.floor:g} U 停止開新倉；當天（台北時間）虧損 ≥ {c['daily_loss_pct']:g}% 停止開新倉到隔天，今天目前 {-b.day_loss_pct(eq):+.1f}%。{small}
 
 【目前倉位】
 {self.positions_text(prices)}
@@ -962,7 +1031,7 @@ class AITrader:
 【你最近的決策與交易】
 {self.history_text()}
 
-【前 {len(universe)} 大 U 本位永續（依 24h 成交額）】
+【前 {len(universe)} 個 U 本位永續（加密前 {c['universe']} 大 + 成交額最大的 TradFi，依 24h 成交額）】
 {self.market.digest(universe)}
 
 【最近 48 小時新聞標題（新的在上）】

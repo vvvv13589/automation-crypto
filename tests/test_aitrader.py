@@ -317,6 +317,65 @@ def test_digest_lists_every_coin_and_the_flagged_ones(setup):
     assert len(rows) == 3 and "程式篩選出的訊號" in text
 
 
+def add_tradfi(ex):
+    for base, kind, px in (("XAU", "COMMODITY", 4000.0), ("NVDA", "EQUITY", 180.0), ("OPENAI", "PREMARKET", 50.0),
+                           ("USDBRL", "FX", 5.0), ("TINY", "EQUITY", 10.0)):
+        ex.px[base] = px
+        ex.markets[f"{base}/USDT:USDT"] = {"swap": True, "quote": "USDT", "base": base, "active": True,
+                                           "info": {"contractType": "TRADIFI_PERPETUAL", "underlyingType": kind}}
+    plain = ex.fetch_tickers
+    ex.fetch_tickers = lambda: {s: {**t, "quoteVolume": 1e6} if s.startswith("TINY") else t for s, t in plain().items()}
+
+
+def test_universe_adds_tradfi_after_crypto(setup):
+    t, ex, *_ = setup
+    add_tradfi(ex)
+    # crypto first, then TradFi above the volume floor; no pre-IPO, FX, or old-style stock tokens
+    assert t.market.universe() == ["BTC", "ETH", "SOL", "XAU", "NVDA"]
+    assert t.market.kinds["NVDA"] == "EQUITY" and t.market.kinds["BTC"] == "COIN"
+    t.market.tradfi = 0
+    assert t.market.universe() == ["BTC", "ETH", "SOL"]
+
+
+def test_market_sessions():
+    from datetime import datetime, timezone
+    from cryptobot.aitrader import session
+    at = lambda *a: datetime(*a, tzinfo=timezone.utc).timestamp()
+    assert session("COIN", at(2026, 10, 24, 3, 0))[0]
+    # US stocks, Tuesday 2026-10-20 (EDT): 10:00 New York is open with 6 h left, 17:00 is closed
+    assert session("EQUITY", at(2026, 10, 20, 14, 0)) == (True, 360.0, "美股·開盤")
+    assert not session("EQUITY", at(2026, 10, 20, 21, 0))[0]
+    assert not session("EQUITY", at(2026, 10, 24, 15, 0))[0]  # Saturday
+    assert session("KR_EQUITY", at(2026, 10, 20, 1, 0))[:2] == (True, 330.0)  # 10:00 Seoul
+    assert not session("HK_EQUITY", at(2026, 10, 20, 4, 30))[0]  # 12:30 Hong Kong lunch break
+    # futures: daily break 17:00–18:00 New York, closed from Friday 17:00 to Sunday 18:00
+    assert not session("COMMODITY", at(2026, 10, 20, 21, 30))[0]
+    assert session("COMMODITY", at(2026, 10, 20, 22, 30))[0]
+    assert not session("COMMODITY", at(2026, 10, 24, 12, 0))[0]
+    assert session("COMMODITY", at(2026, 10, 25, 22, 30))[0]  # Sunday 18:30 New York
+
+
+def test_guard_blocks_stocks_outside_or_near_the_end_of_their_session(setup):
+    t, *_ = setup
+    a = {"coin": "SOL", "side": "long", "stop": 190}
+    closed = Guard(t.cfg, session=lambda c: (False, 0.0, "美股·休市"))
+    ok, msg, _ = closed.check_open(a, t.book, 200, {}, ["SOL"])
+    assert not ok and "休市" in msg
+    late = Guard(t.cfg, session=lambda c: (True, 10.0, "美股·開盤"))
+    ok, msg, _ = late.check_open(a, t.book, 200, {}, ["SOL"])
+    assert not ok and "收盤" in msg
+    ok, _, _ = Guard(t.cfg, session=lambda c: (True, 120.0, "美股·開盤")).check_open(a, t.book, 200, {}, ["SOL"])
+    assert ok
+
+
+def test_digest_has_a_tradfi_section_with_the_session(setup):
+    t, ex, *_ = setup
+    add_tradfi(ex)
+    coins = t.market.universe()
+    text = t.market.digest(coins)
+    assert "傳統市場" in text and "XAU〔期貨·" in text and "NVDA〔美股·" in text
+
+
 # -- live book (fake broker: no exchange) ---------------------------------------------
 class FakeFill:
     def __init__(self, amount, price, fee=0.01):
