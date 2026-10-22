@@ -1600,7 +1600,7 @@ class Commands:
         out = []
         for u in self._updates(timeout, self.offset):
             self.offset = u["update_id"] + 1
-            m = u.get("message") or {}
+            m = u.get("message") or u.get("channel_post") or {}  # 頻道的貼文是 channel_post
             if str((m.get("chat") or {}).get("id")) == self.chat_id and m.get("text"):
                 out.append(m["text"])
         return out

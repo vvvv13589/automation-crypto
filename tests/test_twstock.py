@@ -510,9 +510,10 @@ def test_commands_only_from_own_chat_and_skip_backlog():
             return json.dumps({"result": [{"update_id": 7, "message": {"chat": {"id": -100}, "text": "/now"}}]}).encode()
         return json.dumps({"result": [
             {"update_id": 8, "message": {"chat": {"id": -100}, "text": "/now 2330"}},
+            {"update_id": 8, "channel_post": {"chat": {"id": -100}, "text": "分析一下台積電"}},
             {"update_id": 9, "message": {"chat": {"id": 555}, "text": "/now"}}]}).encode()
     c = Commands("tok", "-100", fetch)
-    assert c.poll(1) == ["/now 2330"]  # the queued /now from before the start is skipped
+    assert c.poll(1) == ["/now 2330", "分析一下台積電"]  # the queued /now from before the start is skipped
     assert "offset=8" in calls[1] and c.offset == 10
 
 
