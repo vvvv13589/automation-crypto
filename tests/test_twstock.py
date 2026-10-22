@@ -56,6 +56,12 @@ class FakeData:
     def index_bars(self, d):
         return []
 
+    def etfs(self, n):
+        return []
+
+    def etf_premium(self):
+        return {}
+
     def universe(self, n):
         return [{"code": "2330", "name": "台積電", "industry": "半導體", "cap": 2},
                 {"code": "2317", "name": "鴻海", "industry": "其他電子", "cap": 1}][:n]
@@ -139,6 +145,31 @@ def test_scan_flags():
     assert s["f5"] == pytest.approx(5000)
 
 
+def test_scan_young_etf():
+    s = scan_stock(make_bars(n=30), 1.0, [], [], None, None)
+    assert s and s["d60"] is None and s["trend"] == "-"
+
+
+def test_etf_list_filters_bonds_and_commodities(tmp_path):
+    rows = [{"Code": c, "Name": n, "TradeValue": v, "ClosingPrice": "10"} for c, n, v in (
+        ("0050", "元大台灣50", "900"), ("00631L", "元大台灣50正2", "800"), ("00985B", "群益ESG投等債0-5", "700"),
+        ("00673R", "期元大S&P原油反1", "600"), ("00635U", "期元大S&P黃金", "500"), ("00981A", "主動統一台股增長", "400"),
+        ("2330", "台積電", "9999"))]
+    d = Data(tmp_path, fetch=lambda url, **kw: json.dumps(rows).encode())
+    assert [(e["code"], e["industry"]) for e in d.etfs(5)] == [("0050", "ETF"), ("00631L", "ETF正2"),
+                                                               ("00981A", "主動ETF")]
+
+
+def test_etf_in_scan_with_premium(env):
+    adv, data, clock, msgs = env
+    data.etfs = lambda n: [{"code": "0050", "name": "元大台灣50", "industry": "ETF", "cap": 1}]
+    data.etf_premium = lambda: {"0050": 1.35}
+    data.bars["0050"] = make_bars(start=50)
+    adv.decide("盤後")
+    p = adv.ai.prompts[0]
+    assert "0050 元大台灣50|ETF|" in p and "折溢價+1.35%" in p and "前 20 大股票型 ETF" in p
+
+
 def test_open_fills_at_next_open(env):
     adv, data, clock, msgs = env
     r = adv.apply({"type": "open", "code": "2330", "side": "long", "stop": 95, "take_profit": 115, "risk_pct": 1,
@@ -185,7 +216,7 @@ def test_rejections(env):
     adv, *_ = env
     assert "只做多" in adv.apply({"type": "open", "code": "2330", "side": "short", "stop": 105})["result"]
     assert "停損距離" in adv.apply({"type": "open", "code": "2330", "side": "long", "stop": 99.5})["result"]
-    assert "不在市值前" in adv.apply({"type": "open", "code": "9999", "side": "long", "stop": 90})["result"]
+    assert "不在掃描範圍" in adv.apply({"type": "open", "code": "9999", "side": "long", "stop": 90})["result"]
     assert "沒有停損" in adv.apply({"type": "open", "code": "2330", "side": "long"})["result"]
     assert adv.apply({"type": "open", "code": "2330", "side": "long", "stop": 95, "risk_pct": 2})["ok"]
     assert "不加碼" in adv.apply({"type": "open", "code": "2330", "side": "long", "stop": 95})["result"]

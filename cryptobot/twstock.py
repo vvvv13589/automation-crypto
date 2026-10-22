@@ -42,6 +42,7 @@ DEFAULTS = {
     "premarket": "08:30",
     "postmarket": "16:30",
     "universe": 150,
+    "etfs": 20,  # 另外加成交值前幾大的股票型 ETF；0 = 不看 ETF
     "max_positions": 6,  # 持股＋等開盤成交的建議
     "max_risk_pct": 2.0,  # 打到停損虧掉的權益 %，每筆
     "max_open_risk_pct": 8.0,  # 全部倉位一起打到停損
@@ -237,6 +238,27 @@ class Data:
                              "industry": INDUSTRY.get(c.get("產業別", ""), c.get("產業別", ""))})
         rows.sort(key=lambda r: -r["cap"])
         return rows[:n]
+
+    NOT_EQUITY = re.compile(r"債|原油|黃金|白銀|黃豆|銅|美元|日圓|^期")
+
+    def etfs(self, n: int) -> list[dict]:
+        """成交值前 n 大的股票型 ETF（排除債券型 B、期貨型 U 和原物料、匯率的槓桿反向）。"""
+        day = self._cached("stock_day_all", "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", 3600 * 6)
+        rows = []
+        for r in day:
+            code, name = r.get("Code", ""), r.get("Name", "").strip()
+            if not re.fullmatch(r"00\d{2,4}[A-Z]?", code) or code[-1] in "BU" or self.NOT_EQUITY.search(name):
+                continue
+            kind = {"L": "ETF正2", "R": "ETF反1", "A": "主動ETF"}.get(code[-1], "ETF")
+            rows.append({"code": code, "name": name, "industry": kind, "cap": num(r.get("TradeValue")) or 0})
+        rows.sort(key=lambda r: -r["cap"])
+        return rows[:n]
+
+    def etf_premium(self) -> dict[str, float]:
+        """ETF 盤中即時折溢價 %（成交價對預估淨值；盤後是收盤）。"""
+        d = self.json("https://mis.twse.com.tw/stock/data/all_etf.txt")
+        return {m["a"]: num(m.get("g")) for grp in d.get("a1", []) for m in grp.get("msgArray", [])
+                if num(m.get("g")) is not None}
 
     # -- prices --
     def bars(self, symbol: str, rng: str = "1y", interval: str = "1d") -> list[dict]:
@@ -449,7 +471,7 @@ class Data:
 def scan_stock(bars: list[dict], idx20: float | None, chips: list[tuple], margin: list[tuple],
                rev: dict | None, alert: str | None) -> dict | None:
     """一檔股票的掃描數字。chips／margin：最近幾個交易日（舊到新）每天的 (外資, 投信, 自營) 股數、(融資, 融券) 張數。"""
-    if len(bars) < 61:
+    if len(bars) < 22:  # 新上市（例如主動型 ETF）不到 60 天的，60 日相關欄位留空
         return None
     c = [b["c"] for b in bars]
     v = [b["v"] for b in bars]
@@ -463,9 +485,9 @@ def scan_stock(bars: list[dict], idx20: float | None, chips: list[tuple], margin
     vol5 = sum(v[-5:]) / 1000
     s = {
         "close": close, "d1": pct(c[-1], c[-2]), "d5": pct(c[-1], c[-6]), "d20": pct(c[-1], c[-21]),
-        "d60": pct(c[-1], c[-61]),
+        "d60": pct(c[-1], c[-61]) if len(c) > 60 else None,
         "ma20": pct(close, ma20), "ma60": pct(close, ma60), "ma240": pct(close, sma(c, 240)),
-        "trend": "多頭排列" if ma5 > ma20 > ma60 else "空頭排列" if ma5 < ma20 < ma60 else "糾結",
+        "trend": "-" if ma60 is None else "多頭排列" if ma5 > ma20 > ma60 else "空頭排列" if ma5 < ma20 < ma60 else "糾結",
         "struct": structure(bars),
         "hi60": pct(close, max(b["h"] for b in prev)), "lo60": pct(close, min(b["l"] for b in prev)),
         "hi250": pct(close, max(b["h"] for b in bars[-251:-1])),
@@ -495,7 +517,7 @@ def scan_stock(bars: list[dict], idx20: float | None, chips: list[tuple], margin
         flags.append("融資增價跌")
     if (s["d1"] or 0) < -4 and (s["volx"] or 0) > 2:
         flags.append("爆量長黑")
-    if ma20 > ma60 and abs(s["ma20"]) < 1.5 and (s["volx"] or 1) < 0.8:
+    if ma60 is not None and ma20 > ma60 and abs(s["ma20"]) < 1.5 and (s["volx"] or 1) < 0.8:
         flags.append("量縮回測月線")
     if rev and (rev.get("yoy") or 0) > 30:
         flags.append("營收年增>30%")
@@ -705,6 +727,16 @@ class Advisor:
     def gather(self) -> dict:
         d = self.data
         uni = d.universe(self.cfg["universe"])
+        if self.cfg["etfs"]:
+            try:
+                uni += [e for e in d.etfs(self.cfg["etfs"]) if e["code"] not in {u["code"] for u in uni}]
+            except Exception as exc:
+                log.warning("etfs: %s", exc)
+        try:
+            premium = d.etf_premium()
+        except Exception as exc:
+            log.warning("etf premium: %s", exc)
+            premium = {}
         self.names = {u["code"]: u["name"] for u in uni}
         bars = d.many_bars([u["code"] for u in uni] + ["^TWII"])
         now = self.now()
@@ -731,6 +763,9 @@ class Advisor:
             ch = [chips[day].get(u["code"], (0, 0, 0)) for day in days if chips[day]]
             mg = [margins[day][0][u["code"]] for day in days[-7:] if u["code"] in margins[day][0]]
             s = scan_stock(b, idx20, ch, mg, rev.get(u["code"]), alerts.get(u["code"]))
+            if s and "ETF" in u["industry"]:
+                p = premium.get(u["code"])
+                s["flags"].append(f"折溢價{p:+.2f}%" if p is not None else "折溢價-")
             if s:
                 rows.append((u, s))
                 self.closes[u["code"]] = s["close"]
@@ -938,7 +973,7 @@ class Advisor:
 【國際盤】
 {self.global_text(g)}
 
-【個股掃描：市值前 {len(g['rows'])} 大上市股（{last} 收盤）】
+【掃描：市值前 {c['universe']} 大上市股＋成交值前 {c['etfs']} 大股票型 ETF，共 {len(g['rows'])} 檔（{last} 收盤）】
 {SCAN_HEADER}
 {chr(10).join(scan_line(u, s) for u, s in g['rows'])}
 
@@ -1031,7 +1066,7 @@ class Advisor:
         c, b = self.cfg, self.book
         code, side = a["code"], a["side"]
         if new and code != FUT and code not in self.names:
-            return f"{code} 不在市值前 {c['universe']} 大"
+            return f"{code} 不在掃描範圍（市值前 {c['universe']} 大個股＋前 {c['etfs']} 大股票型 ETF）"
         if code != FUT and side != "long":
             return "個股只做多（大盤看空請用台指期 TX）"
         if side not in ("long", "short"):
