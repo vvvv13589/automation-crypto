@@ -109,25 +109,38 @@
 
 ```json
 {
+  "bias": "偏空",
+  "headline": "加權 46,041（-1.81%）收最低、跌破季線\n外資賣超 817 億｜外資台指期淨空 8.6 萬口\n外資趁美股利多倒貨；指數在雙低附近，不追空",
+  "avoid": "PCB、記憶體（融資增價跌）；台積電（外資連賣 10 天）",
+  "note": "颱風可能停市，恢復開盤先看跳空",
   "view": "大盤：美股、夜盤、法人、台指期的綜合看法一段。\n\n2330 台積電：持倉處理……\n\n3231 緯創：為什麼注意、為什麼現在建議或不建議……\n\n重電族群：漲多、融資暴增，不追。",
   "watch": "3017 奇鋐：收盤站上 1,250 才買，停損 1,170\n台指期：跌破 46,200 偏空",
   "actions": [
-    {"type": "open", "code": "3231", "side": "long", "stop": 128, "take_profit": 152, "risk_pct": 1, "reason": "為什麼建議、錯在哪裡"},
-    {"type": "open", "code": "TX", "side": "short", "stop": 47300, "take_profit": 45800, "risk_pct": 1, "reason": "大盤偏空的理由"},
-    {"type": "close", "code": "2454", "reason": "論點被破壞的原因"},
-    {"type": "move_stop", "code": "2330", "stop": 2380, "reason": "收緊到前低"},
-    {"type": "take_profit", "code": "2330", "take_profit": 2600, "reason": "改目標（填 null 取消）"},
-    {"type": "plan", "code": "3017", "side": "long", "trigger": 1250, "when": "above", "confirm": "close", "stop": 1170, "take_profit": 1400, "risk_pct": 1, "expires_days": 5, "reason": "整理區上緣，收盤突破才買"},
-    {"type": "cancel_plan", "code": "2382", "reason": "結構改變"}
+    {"type": "open", "code": "3231", "side": "long", "stop": 128, "take_profit": 152, "risk_pct": 1, "short": "放量突破整理區，土洋同買", "reason": "為什麼建議、錯在哪裡"},
+    {"type": "open", "code": "TX", "side": "short", "stop": 47300, "take_profit": 45800, "risk_pct": 1, "short": "外資現貨期貨同步偏空", "reason": "大盤偏空的理由"},
+    {"type": "close", "code": "2454", "short": "投信轉賣、跌破月線", "reason": "論點被破壞的原因"},
+    {"type": "move_stop", "code": "2330", "stop": 2380, "short": "收緊到前低", "reason": "收緊到前低"},
+    {"type": "take_profit", "code": "2330", "take_profit": 2600, "short": "前高壓力", "reason": "改目標（填 null 取消）"},
+    {"type": "plan", "code": "3017", "side": "long", "trigger": 1250, "when": "above", "confirm": "close", "stop": 1170, "take_profit": 1400, "risk_pct": 1, "expires_days": 5, "short": "整理區上緣，收盤突破才買", "reason": "整理區上緣，收盤突破才買"},
+    {"type": "cancel_plan", "code": "2382", "short": "結構改變", "reason": "結構改變"}
   ]
 }
 ```
+
+推播到手機的是**摘要**，完整分析（`view`＋`watch`）會折疊起來，想看的人才點開。所以摘要用的欄位要精簡、一眼看得懂：
+
+- `bias`：大盤方向，只能是「偏多」「偏空」「觀望」「中性」其中一個。
+- `headline`：**最多 3 行**的大盤重點，數字優先（指數、漲跌、法人金額、台指期部位），最後一行是你的一句結論。
+- `avoid`：一行，現在先避開的族群或個股和一句原因（沒有就空字串）。
+- `note`：一行風險提醒，例如事件、颱風、結算（沒有就空字串）。
+- 每個 action 的 `short`：**15–30 字**的理由，讓人一眼知道為什麼；完整的理由寫在 `reason`。
+- 價位、張數、最多虧多少，程式會自己排在摘要裡，`headline` 和 `short` 不用重複寫。
 
 - `open`：**在下一個開盤價成交**（盤前決策就是今天 09:00，盤後決策就是下個交易日）。`stop` 必填；`take_profit` 可以是 null（讓它跑，之後再收緊停損）。`risk_pct` 是打到停損時虧掉的權益 %，程式依此算張數。
 - `close`：下一個開盤賣出／平倉。
 - `plan`（條件單）：`confirm` 是 `close`（**收盤**站上／跌破 trigger 才算，隔天開盤進場，適合突破、避免盤中假突破）或 `touch`（盤中碰到就進場，適合回測支撐買進）。`expires_days` 是有效的交易日數（預設 5、最多 10）。同一檔只能掛一張，再掛會覆蓋。觸發時照樣經過所有硬性限制。
 - 你的 watch 裡能用價位描述的進場計畫，就直接掛成條件單，不要只寫在文字裡。
-- `view` 和 `watch` 會直接推播到使用者手機，要好讀：
+- `view` 和 `watch` 是點開才看到的完整分析，要好讀：
   - `view`：第一段講大盤（國際盤、台指期、法人、你的方向判斷），之後**每檔股票（或一個族群）自己一段**，以代號和名稱開頭，段落之間空一行（`\n\n`）。持倉先講。挑最值得注意的 2–5 檔，不要只講台積電。
   - `watch`：**每檔一行**，寫具體的觸發條件、價位和停損。
   - 不要加表情符號或 Markdown 標記。時間一律用台北時間。

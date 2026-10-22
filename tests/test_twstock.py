@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
-from cryptobot.twstock import (FUT, TZ, Advisor, Book, Data, scan_stock, settings, streak)
+from cryptobot.twstock import (FUT, TZ, Advisor, Book, Data, plain, scan_stock, settings, streak)
 
 
 def ts(y, m, d, hh=0, mm=0):
@@ -375,11 +375,52 @@ def test_decide_end_to_end(env, tmp_path):
     for part in ("加權指數", "三大法人現貨買賣超", "台指期 11 月", "外資台指期" if False else "三大法人台指期淨未平倉",
                  "台積電ADR", "2330 台積電|半導體", "台積電法說會", "投信連買"):
         assert part in prompt, part
-    assert "🌆 盤後" in msgs[-1] and "🛒" in msgs[-1] and "⛔" in msgs[-1] and "等待" in msgs[-1]
+    assert "🌆 盤後" in msgs[-1] and "🛒" in msgs[-1] and "🚫 沒採用" in msgs[-1] and "等待" in msgs[-1]
     detail = json.loads((tmp_path / "work" / "chips" / "2330.json").read_text(encoding="utf-8"))
     assert detail["days"][-1]["外資張"] == 2000 and detail["name"] == "台積電"
     row = json.loads(adv.journal.read_text(encoding="utf-8").splitlines()[-1])
     assert row["trigger"] == "盤後" and row["actions"][0]["ok"]
+
+
+def test_summary_with_folded_analysis(env):
+    adv, data, clock, msgs = env
+    adv.ai = FakeAI({"bias": "偏空", "headline": "加權 46,041（-1.81%）跌破季線\n外資賣超 817 億",
+                     "avoid": "PCB、記憶體", "note": "颱風可能停市", "view": "大盤：很長的分析 <不是標籤>",
+                     "watch": "2886：回測 53.7",
+                     "actions": [{"type": "open", "code": "2330", "side": "long", "stop": 100, "take_profit": 125,
+                                  "risk_pct": 1, "short": "放量突破整理區", "reason": "很長的理由。第二句"},
+                                 {"type": "plan", "code": "2317", "side": "long", "trigger": 130, "when": "above",
+                                  "confirm": "close", "stop": 122, "reason": "收盤突破才買。其他"}]})
+    adv.decide("盤後")
+    m = msgs[-1]
+    summary, _, fold = m.partition("<blockquote expandable>")
+    assert summary.startswith("<b>🌆 盤後 10/21</b>｜大盤：<b>偏空</b> ↓")
+    assert "外資賣超 817 億" in summary and "⛔ 先避開：PCB、記憶體" in summary and "⚠️ 颱風可能停市" in summary
+    assert "<b>🛒 明天開盤進場</b>\n• <b>2330 台積電</b> 111.8\n  停損 <b>100</b>／目標 125｜約" in summary
+    assert "放量突破整理區" in summary and "很長的理由" not in summary  # the short reason only
+    assert "<b>📌 條件單</b>\n• <b>2317 鴻海</b>：收盤站上 130，隔天開盤買" in summary
+    assert "收盤突破才買" in summary  # no short given: first sentence of the reason
+    assert "📒 權益 100.0 萬" in summary
+    assert fold.startswith("▸ 完整分析") and "&lt;不是標籤&gt;" in fold and "等待：\n2886：回測 53.7" in fold
+
+
+def test_long_analysis_goes_to_separate_folded_messages(env):
+    adv, data, clock, msgs = env
+    adv.send_html("<b>摘要</b>", "\n".join("第 %d 段 " % i + "字" * 80 for i in range(120)))
+    assert msgs[0] == "<b>摘要</b>"
+    folds = msgs[1:]
+    assert len(folds) >= 3 and all(f.startswith("<blockquote expandable>") and f.endswith("</blockquote>") for f in folds)
+    assert all(len(plain(f)) <= 3900 for f in folds) and "▸ 完整分析" in folds[0] and "▸" not in folds[1]
+
+
+def test_html_falls_back_to_plain_text(monkeypatch):
+    import cryptobot.twstock as tws
+    sent = []
+    monkeypatch.setattr(tws, "_get", lambda url, **kw: (_ for _ in ()).throw(RuntimeError("400 can't parse entities")))
+    tg = tws.html_telegram("tok", "1", prefix="[台股AI] ")
+    monkeypatch.setattr(tg, "send", lambda text: sent.append(text) or True)
+    assert tg.html("<b>2330</b> &lt;x&gt;")
+    assert sent == ["2330 <x>"]
 
 
 def test_schedule(env):
@@ -445,7 +486,7 @@ def test_now_during_session_fills_at_live_price(env):
     assert "盤中即時" in prompt and "使用者特別想問：2330 台積電" in prompt and "2330 台積電|115|" in prompt
     p = adv.book.positions["2330"]
     assert p["entry"] == 115 and p["intraday"] and not adv.book.pending
-    assert "⚡ 即時（盤中）" in msgs[-1] and "現價 115 買進" in msgs[-1]
+    assert "⚡ 即時（盤中）" in msgs[-1] and "✅ 已用現價進場" in msgs[-1] and "<b>2330 台積電</b> 115" in msgs[-1]
     assert not adv.live_now
     # a second /now right away is refused
     adv.handle("/now")

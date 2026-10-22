@@ -716,6 +716,22 @@ def tw(ts: float) -> str:
     return datetime.fromtimestamp(ts, TZ).strftime("%m/%d %H:%M")
 
 
+def H(text) -> str:
+    return html.escape(str(text), quote=False)
+
+
+def short_reason(a: dict, limit: int = 40) -> str:
+    """推播用的一句話理由：AI 給的 short，沒有就取 reason 的第一句。"""
+    s = str(a.get("short") or "").strip()
+    if not s:
+        s = re.split(r"[。；;\n]", str(a.get("reason") or "").strip())[0]
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def plain(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
 def label(code: str, name: str = "") -> str:
     return "台指期" if code == FUT else f"{code} {name}".strip()
 
@@ -1023,6 +1039,12 @@ class Advisor:
         return (f"{label(p['code'], p.get('name', ''))}：{how}{where} {fmt(p['trigger'])}{then}，停損 {fmt(p['stop'])}"
                 f"{tp}，風險 {p['risk_pct']:g}%，有效到 {md(p['expires'])}")
 
+    def plan_short(self, p: dict) -> str:
+        act = ("做多" if p["side"] == "long" else "做空") if p["code"] == FUT else "買"
+        if p["confirm"] == "touch":
+            return f"{'回到' if p['when'] == 'below' else '漲到'} {fmt(p['trigger'])} {act}"
+        return f"收盤{'站上' if p['when'] == 'above' else '跌破'} {fmt(p['trigger'])}，隔天開盤{act}"
+
     def build_prompt(self, g: dict, kind: str, live: str = "", focus: list[str] | None = None) -> str:
         c, b = self.cfg, self.book
         eq = b.equity(self.closes)
@@ -1138,17 +1160,68 @@ class Advisor:
         results = [self.apply(a) for a in acts]
         decision["actions"] = results
         self._journal(decision, kind, meta)
+        self.send_html(*self.format_decision(kind, decision, results))
+
+    def next_open_text(self) -> str:
+        now = self.now()
+        if self.data.trading_day(now.date()) and now.strftime("%H:%M") < "09:00":
+            return "今天"
+        d = self.data.add_trading_days(now.date(), 1)
+        return "明天" if d == now.date() + timedelta(days=1) else f"{d.month}/{d.day}（週{'一二三四五六日'[d.weekday()]}）"
+
+    BIAS = {"偏多": "↑", "偏空": "↓", "觀望": "→", "中性": "→"}
+
+    def format_decision(self, kind: str, decision: dict, results: list[dict]) -> tuple[str, str]:
+        """(摘要, 完整分析)，都是 Telegram HTML。摘要給要下單的人看，完整分析折疊起來。"""
         icon = {"盤前": "🌅 盤前", "盤後": "🌆 盤後", "即時": "⚡ 即時" + ("（盤中）" if self.live_now else "")}.get(kind, f"🧪 {kind}")
         acted = [a for a in results if a.get("ok")]
         rejected = [a for a in results if not a.get("ok")]
-        msg = [icon + ("" if acted or rejected else "｜👀 觀望"), str(decision.get("view", "")).strip()[:2500]]
-        msg += [a["msg"] for a in acted]
-        msg += [f"⛔ 不採用：{ACTION_NAMES.get(a.get('type'), a.get('type'))} {a.get('code', '')} — {a['result']}"
-                for a in rejected]
+        bias = str(decision.get("bias") or "").strip()
+        head = f"<b>{icon} {self.now().month}/{self.now().day}</b>"
+        if bias:
+            head += f"｜大盤：<b>{H(bias)}</b> {self.BIAS.get(bias, '')}".rstrip()
+        if not acted:
+            head += "｜👀 觀望"
+        view = str(decision.get("view", "")).strip()
+        headline = str(decision.get("headline") or "").strip() or short_reason({"reason": view}, 120)
+        parts = [head, H(headline)]
+        when = self.next_open_text()
+        groups = [("bought", "✅ 已用現價進場"), ("buy", f"🛒 {when}開盤進場"), ("sold", "📤 已用現價出場"),
+                  ("sell", f"📤 {when}開盤出場"), ("stop", "🔒 調整停損"), ("tp", "🎯 調整目標"),
+                  ("plan", "📌 條件單"), ("cancel", "🗑 取消條件單")]
+        for key, title in groups:
+            lines = [a["line"] for a in acted if a.get("group") == key and a.get("line")]
+            if lines:
+                parts.append(f"<b>{title}</b>\n" + "\n".join(lines))
+        if decision.get("avoid"):
+            parts.append(f"⛔ 先避開：{H(str(decision['avoid']).strip())}")
+        if decision.get("note"):
+            parts.append(f"⚠️ {H(str(decision['note']).strip())}")
+        if rejected:
+            parts.append("🚫 沒採用：" + "；".join(
+                f"{H(label(a.get('code', ''), self.names.get(a.get('code', ''), '')))} {H(a['result'])}" for a in rejected))
+        parts.append(self.summary(short=True))
+        detail = view
         if decision.get("watch"):
-            msg.append("等待：\n" + str(decision["watch"]).strip()[:1200])
-        msg.append(self.summary())
-        self.say("\n\n".join(m for m in msg if m))
+            detail += "\n\n等待：\n" + str(decision["watch"]).strip()
+        return "\n\n".join(p for p in parts if p), H(detail)
+
+    def send_html(self, summary: str, detail: str = "", limit: int = 3800) -> None:
+        """摘要＋可點開的完整分析（Telegram expandable blockquote）；太長就把分析分成幾則。"""
+        send = getattr(self.notify, "html", self.notify)
+        fold = lambda t, first=True: f"<blockquote expandable>{'▸ 完整分析（點開）' + chr(10) * 2 if first else ''}{t}</blockquote>"
+        if not detail:
+            send(summary)
+            return
+        if len(plain(summary)) + len(plain(detail)) + 20 <= limit:
+            send(summary + "\n\n" + fold(detail))
+            return
+        send(summary)
+        text, first = html.unescape(detail), True
+        while text:
+            cut = len(text) if len(text) <= limit else (text.rfind("\n", 0, limit) if text.rfind("\n", 0, limit) > limit // 2 else limit)
+            send(fold(H(text[:cut]), first))
+            text, first = text[cut:].lstrip("\n"), False
 
     def _journal(self, decision: dict, trigger: str, meta: dict) -> None:
         row = {"time": f"{self.now():%Y-%m-%d %H:%M}", "trigger": trigger, **decision,
@@ -1156,12 +1229,16 @@ class Advisor:
         with self.journal.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    def summary(self) -> str:
+    def summary(self, short: bool = False) -> str:
         b = self.book
         eq = b.equity(self.closes)
         tr = b.trades()
         wins = sum(1 for t in tr if float(t["pnl"]) > 0)
         rs = sum(float(t["r"]) for t in tr)
+        if short:
+            done = f"｜已出場 {len(tr)} 筆 {rs:+.1f}R" if tr else ""
+            return (f"📒 權益 {eq / 1e4:,.1f} 萬（{(eq / b.capital - 1) * 100:+.1f}%）｜持倉 {len(b.positions)}、"
+                    f"等開盤 {len(b.pending)}、條件單 {len(b.plans)}{done}")
         return (f"📒 建議追蹤：權益 {eq:,.0f}（{(eq / b.capital - 1) * 100:+.1f}%），持倉 {len(b.positions)}、"
                 f"等開盤 {len(b.pending)}、條件單 {len(b.plans)}；已出場 {len(tr)} 筆（賺 {wins}，合計 {rs:+.1f}R）")
 
@@ -1206,7 +1283,7 @@ class Advisor:
         return {"code": code, "name": self.names.get(code, ""), "side": a.get("side", "long"),
                 "stop": num(a.get("stop")), "tp": tp,
                 "risk_pct": min(max(num(a.get("risk_pct")) or 1.0, 0.1), self.cfg["max_risk_pct"]),
-                "reason": str(a.get("reason", ""))[:300]}
+                "reason": str(a.get("reason", ""))[:300], "short": short_reason(a)}
 
     def apply(self, a: dict) -> dict:
         kind = a.get("type")
@@ -1214,6 +1291,7 @@ class Advisor:
         code, b = e["code"], self.book
         out = {"type": kind, "code": code, "reason": e["reason"]}
         name = label(code, e["name"])
+        bold, why_line = f"• <b>{H(name)}</b>", f"\n  {H(e['short'])}" if e["short"] else ""
         if kind == "open":
             if e["stop"] is None:
                 return {**out, "ok": False, "result": "沒有停損"}
@@ -1227,7 +1305,9 @@ class Advisor:
                     p = b.open(e, ref, self.clock(), b.equity(self.closes), intraday=True)
                 except ValueError as exc:
                     return {**out, "ok": False, "result": str(exc)}
-                return {**out, "ok": True, "result": "現價進場",
+                return {**out, "ok": True, "result": "現價進場", "group": "bought",
+                        "line": f"{bold} {fmt(ref)} {act + ' ' if code == FUT else ''}{qty_text(code, p['qty'])}\n"
+                                f"  停損 <b>{fmt(p['stop'])}</b>／目標 {fmt(p.get('tp'))}｜最多虧 {b.risk_at_stop(p):,.0f}{why_line}",
                         "msg": f"✅ {name}：現價 {fmt(ref)} {act} {qty_text(code, p['qty'])}{p['note']}\n"
                                f"停損 {fmt(p['stop'])}（{abs(ref - p['stop']) / ref * 100:.1f}%），目標 {fmt(p.get('tp'))}，"
                                f"打到停損約虧 {b.risk_at_stop(p):,.0f} 元\n理由：{e['reason']}"}
@@ -1235,7 +1315,9 @@ class Advisor:
             b.pending.append({"type": "open", **e, "ref": ref, "created": self.clock()})
             b.save()
             loss = b.equity(self.closes) * e["risk_pct"] / 100
-            return {**out, "ok": True, "result": "等開盤",
+            return {**out, "ok": True, "result": "等開盤", "group": "buy",
+                    "line": f"{bold} {act + ' ' if code == FUT else ''}{fmt(ref)}\n"
+                            f"  停損 <b>{fmt(e['stop'])}</b>／目標 {fmt(e['tp'])}｜約 {qty_text(code, qty)}｜最多虧 {loss:,.0f}{why_line}",
                     "msg": f"🛒 {name}：下個開盤{act}（參考 {fmt(ref)}，跳空超過 {self.cfg['max_gap_pct']:g}% 不追），"
                            f"停損 {fmt(e['stop'])}（{abs(ref - e['stop']) / ref * 100:.1f}%），目標 {fmt(e['tp'])}\n"
                            f"約 {qty_text(code, qty)}{note}，打到停損約虧 {loss:,.0f} 元（權益 {e['risk_pct']:g}%）\n理由：{e['reason']}"}
@@ -1244,13 +1326,14 @@ class Advisor:
                 return {**out, "ok": False, "result": "沒有這檔持倉"}
             if self.live_now and self.closes.get(code):
                 row = b.close(code, self.closes[code], "建議出場（盤中現價）", self.clock())
-                return {**out, "ok": True, "result": "現價出場",
+                return {**out, "ok": True, "result": "現價出場", "group": "sold",
+                        "line": f"{bold} {fmt(row['entry'])} → {fmt(row['exit'])}｜{row['pnl']:+,} 元（{row['r']:+.2f}R）{why_line}",
                         "msg": f"📤 {name}：現價 {fmt(row['exit'])} 出場，{fmt(row['entry'])} → {fmt(row['exit'])}，"
                                f"損益 {row['pnl']:+,} 元（{row['r']:+.2f}R）\n理由：{e['reason']}"}
             b.pending =[p for p in b.pending if p["code"] != code] + [{"type": "close", "code": code, "name": e["name"],
                                                                         "reason": e["reason"], "created": self.clock()}]
             b.save()
-            return {**out, "ok": True, "result": "等開盤出場",
+            return {**out, "ok": True, "result": "等開盤出場", "group": "sell", "line": f"{bold}{why_line}",
                     "msg": f"📤 {name}：下個開盤出場\n理由：{e['reason']}"}
         if kind == "move_stop":
             p = b.positions.get(code)
@@ -1264,7 +1347,8 @@ class Advisor:
                 return {**out, "ok": False, "result": f"新停損已經越過最近收盤 {fmt(ref)}"}
             old, p["stop"] = p["stop"], e["stop"]
             b.save()
-            return {**out, "ok": True, "result": "移動停損",
+            return {**out, "ok": True, "result": "移動停損", "group": "stop",
+                    "line": f"{bold} {fmt(old)} → <b>{fmt(e['stop'])}</b>{why_line}",
                     "msg": f"🔒 {name}：停損 {fmt(old)} → {fmt(e['stop'])}\n理由：{e['reason']}"}
         if kind == "take_profit":
             p = b.positions.get(code)
@@ -1272,7 +1356,8 @@ class Advisor:
                 return {**out, "ok": False, "result": "沒有這檔持倉"}
             p["tp"] = e["tp"]
             b.save()
-            return {**out, "ok": True, "result": "改目標", "msg": f"🎯 {name}：目標改為 {fmt(e['tp'])}\n理由：{e['reason']}"}
+            return {**out, "ok": True, "result": "改目標", "group": "tp",
+                    "line": f"{bold} 目標改為 {fmt(e['tp'])}{why_line}", "msg": f"🎯 {name}：目標改為 {fmt(e['tp'])}\n理由：{e['reason']}"}
         if kind == "plan":
             return self.add_plan(a, e, out)
         if kind == "cancel_plan":
@@ -1280,7 +1365,8 @@ class Advisor:
                 return {**out, "ok": False, "result": "沒有這張條件單"}
             b.plans = [p for p in b.plans if p["code"] != code]
             b.save()
-            return {**out, "ok": True, "result": "取消條件單", "msg": f"🗑 取消 {name} 條件單\n理由：{e['reason']}"}
+            return {**out, "ok": True, "result": "取消條件單", "group": "cancel", "line": f"{bold}{why_line}",
+                    "msg": f"🗑 取消 {name} 條件單\n理由：{e['reason']}"}
         return {**out, "ok": False, "result": f"不認得的動作 {kind}"}
 
     def add_plan(self, a: dict, e: dict, out: dict) -> dict:
@@ -1307,7 +1393,10 @@ class Advisor:
         replaced = len(others) != len(b.plans)
         b.plans = others + [plan]
         b.save()
-        return {**out, "ok": True, "result": "條件單",
+        return {**out, "ok": True, "result": "條件單", "group": "plan",
+                "line": f"• <b>{H(label(plan['code'], plan['name']))}</b>：{H(self.plan_short(plan))}\n"
+                        f"  停損 <b>{fmt(plan['stop'])}</b>／目標 {fmt(plan.get('tp'))}"
+                        + (f"\n  {H(e['short'])}" if e["short"] else ""),
                 "msg": f"📌 {'更新' if replaced else '掛'}條件單 {self.plan_text(plan)}\n理由：{e['reason']}"}
 
     # -- during the session --
@@ -1672,6 +1761,27 @@ def telegram_target() -> tuple[str | None, str | None]:
     return token, chat
 
 
+def html_telegram(token: str, chat_id: str, prefix: str = ""):
+    """Telegram 傳送：一般文字照舊；.html(text) 用 HTML 格式（粗體、可點開的折疊分析），失敗就改送純文字。"""
+    from .notify import Telegram
+
+    tg = Telegram(token, chat_id, prefix=prefix)
+
+    def send_html(text: str) -> bool:
+        body = json.dumps({"chat_id": chat_id, "text": H(prefix) + text, "parse_mode": "HTML",
+                           "link_preview_options": {"is_disabled": True}}).encode()
+        try:
+            r = json.loads(_get(tg.url, data=body, headers={"Content-Type": "application/json"}))
+            if r.get("ok"):
+                return True
+        except Exception as exc:
+            log.warning("telegram html: %s", str(exc)[:200])
+        return tg.send(plain(text))
+
+    tg.html = send_html
+    return tg
+
+
 MENU = [("now", "AI 用現在的行情判斷一次（可加代號：/now 2330）"),
         ("tw", "建議追蹤：持倉、條件單、戰績"),
         ("new", "開新對話"),
@@ -1715,8 +1825,6 @@ def find_chat() -> int:
 def main(cfg: dict, repo_dir: str, once: bool = False, scan: bool = False, chat: bool = False) -> int:
     import os
 
-    from .notify import Telegram
-
     if chat:
         return find_chat()
     c = settings(cfg)
@@ -1735,7 +1843,7 @@ def main(cfg: dict, repo_dir: str, once: bool = False, scan: bool = False, chat:
     ai = TWStockAI(cfg, repo_dir, str(claude), token, c["model"], int(c["max_turns"]))
     ai.install()
     tg_token, chat_id = telegram_target()
-    notify = Telegram(tg_token, chat_id, prefix="[台股AI] ") if tg_token and chat_id else None
+    notify = html_telegram(tg_token, chat_id, prefix="[台股AI] ") if tg_token and chat_id else None
     adv = Advisor(cfg, data, ai, notify)
     own = os.getenv("TWSTOCK_TELEGRAM_BOT_TOKEN")
     if own and chat_id:  # 只聽台股自己的機器人，絕不搶管家（主機器人）的訊息
