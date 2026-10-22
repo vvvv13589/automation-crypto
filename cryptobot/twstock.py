@@ -1713,24 +1713,24 @@ class Commands:
     """台股專用機器人的指令（getUpdates）。只能用在台股自己的機器人：主機器人的訊息歸管家讀。
     只接受設定的那個聊天室，其他人傳的都忽略。"""
 
-    def __init__(self, token: str, chat_id: str, fetch=_get):
+    def __init__(self, token: str, chat_id: str, fetch=_get, clock=time.time):
         self.url = f"https://api.telegram.org/bot{token}/getUpdates"
         self.chat_id, self.fetch = str(chat_id), fetch
         self.offset = None
+        self.started = clock()  # 比這更早送出的訊息是重啟前排隊的，不執行
 
     def _updates(self, timeout: int, offset) -> list[dict]:
         q = f"?timeout={timeout}" + (f"&offset={offset}" if offset is not None else "")
         return json.loads(self.fetch(self.url + q, timeout=timeout + 15)).get("result", [])
 
     def poll(self, timeout: int = 50) -> list[str]:
-        if self.offset is None:  # 啟動前就在排隊的舊指令不執行
-            old = self._updates(0, -1)
-            self.offset = old[-1]["update_id"] + 1 if old else 0
         out = []
         for u in self._updates(timeout, self.offset):
             self.offset = u["update_id"] + 1
             m = u.get("message") or u.get("channel_post") or {}  # 頻道的貼文是 channel_post
-            if str((m.get("chat") or {}).get("id")) == self.chat_id and m.get("text"):
+            # 用訊息的發送時間判斷，不是用「第一次讀到」：啟動後馬上傳的指令也要執行
+            if (str((m.get("chat") or {}).get("id")) == self.chat_id and m.get("text")
+                    and m.get("date", 0) >= self.started - 5):
                 out.append(m["text"])
         return out
 

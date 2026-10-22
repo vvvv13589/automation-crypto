@@ -586,18 +586,19 @@ def test_chat_resumes_and_restarts_after_idle(tmp_path):
 def test_commands_only_from_own_chat_and_skip_backlog():
     from cryptobot.twstock import Commands
     calls = []
+    start = 1_000_000
 
     def fetch(url, timeout=None):
         calls.append(url)
-        if "offset=-1" in url:
-            return json.dumps({"result": [{"update_id": 7, "message": {"chat": {"id": -100}, "text": "/now"}}]}).encode()
         return json.dumps({"result": [
-            {"update_id": 8, "message": {"chat": {"id": -100}, "text": "/now 2330"}},
-            {"update_id": 8, "channel_post": {"chat": {"id": -100}, "text": "分析一下台積電"}},
-            {"update_id": 9, "message": {"chat": {"id": 555}, "text": "/now"}}]}).encode()
-    c = Commands("tok", "-100", fetch)
-    assert c.poll(1) == ["/now 2330", "分析一下台積電"]  # the queued /now from before the start is skipped
-    assert "offset=8" in calls[1] and c.offset == 10
+            {"update_id": 7, "message": {"chat": {"id": -100}, "text": "/now", "date": start - 600}},  # before restart
+            {"update_id": 8, "message": {"chat": {"id": -100}, "text": "/now 2330", "date": start + 3}},
+            {"update_id": 8, "channel_post": {"chat": {"id": -100}, "text": "分析一下台積電", "date": start + 9}},
+            {"update_id": 9, "message": {"chat": {"id": 555}, "text": "/now", "date": start + 9}}]}).encode()
+    c = Commands("tok", "-100", fetch, clock=lambda: start)
+    # 10/22: a /now sent seconds after the restart was dropped as "backlog" — only older ones are skipped
+    assert c.poll(1) == ["/now 2330", "分析一下台積電"]
+    assert "offset" not in calls[0] and c.offset == 10
 
 
 def test_menu_matches_handled_commands(env):
