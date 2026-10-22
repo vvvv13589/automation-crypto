@@ -285,7 +285,8 @@ def format_status(snap: dict, bot_state: str = "", tz: str = "Asia/Taipei") -> s
              f"💰 帳戶總額 {snap['equity']:.2f} U｜可用 {snap['available']:.2f} U",
              f"📈 未實現損益 {snap['unrealized']:+.2f} U"]
     if bot_state:
-        lines.append(f"🤖 交易機器人：{'運作中' if bot_state == 'active' else f'⚠️ {bot_state}'}")
+        shown = {"active": "運作中", "inactive": "已停用"}.get(bot_state, f"⚠️ {bot_state}")
+        lines.append(f"🤖 交易機器人：{shown}")
     pos = snap["positions"]
     if not pos:
         lines.append("📌 目前沒有持倉")
@@ -478,6 +479,36 @@ class Butler:
             return
         tz = self.cfg.get("notify", {}).get("timezone", "Asia/Taipei")
         self.tg.send(format_status(snap, self.service_state("cryptobot"), tz) + self.money_text(snap))
+
+    def maybe_daily_report(self) -> bool:
+        """Daily account report at notify.daily_report (e.g. 09:00) while the trading bot is stopped
+        (a running bot sends its own). Once per local day, remembered across restarts."""
+        n = self.cfg.get("notify") or {}
+        at = n.get("daily_report") or ""
+        now = self.clock()
+        if not at or now < getattr(self, "_report_retry", 0):
+            return False
+        from zoneinfo import ZoneInfo
+        tz = n.get("timezone", "Asia/Taipei")
+        local = datetime.fromtimestamp(now, ZoneInfo(tz))
+        h, m = (int(x) for x in str(at).split(":"))
+        day = local.strftime("%Y-%m-%d")
+        if (local.hour, local.minute) < (h, m) or self._load_state().get("report_day") == day:
+            return False
+        state = self.service_state("cryptobot")
+        if state == "active":
+            return False
+        try:
+            snap = self.snapshot()
+        except Exception as exc:
+            log.warning("daily report: %s", str(exc)[:200])
+            self._report_retry = now + 600
+            return False
+        text = format_status(snap, state, tz).replace("📊 即時狀態", "📊 每日報告", 1) + self.money_text(snap)
+        self.tg.send(text)
+        self._save_state(report_day=day)
+        self.audit("daily_report", day)
+        return True
 
     def money_text(self, snap: dict) -> str:
         """Bot / manual / prediction split of the account result (empty when it can't be worked out)."""
@@ -880,6 +911,7 @@ class Butler:
             try:
                 self.poll()
                 errors = 0
+                self.maybe_daily_report()
             except Exception as exc:
                 errors += 1  # a single long-poll timeout is normal on a slow line
                 log.log(logging.INFO if errors == 1 else logging.WARNING, "poll failed (%d): %s", errors, str(exc)[:200])

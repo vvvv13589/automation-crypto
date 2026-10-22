@@ -180,6 +180,29 @@ def test_status_command_reads_only_and_answers_when_the_bot_is_down(cfg, tmp_pat
     assert "幣安拒絕 API" in tg.sent[-1] and "/ip" in tg.sent[-1]
 
 
+def test_daily_report_once_a_day_while_the_trading_bot_is_stopped(cfg, tmp_path):
+    from datetime import datetime, timezone
+    _bot_state(cfg)
+    cfg["notify"]["daily_report"] = "09:00"
+    at = lambda h, d=22: datetime(2026, 10, d, h - 8, 5, tzinfo=timezone.utc).timestamp()  # Taipei hour h
+    b, tg, _ = _butler(cfg, tmp_path)
+    b.service_state = lambda unit: "inactive"
+    b.clock = lambda: at(8)
+    assert not b.maybe_daily_report() and not tg.sent  # before 09:00
+    b.clock = lambda: at(9)
+    assert b.maybe_daily_report()
+    assert tg.sent[-1].startswith("📊 每日報告") and "交易機器人：已停用" in tg.sent[-1]
+    assert not b.maybe_daily_report()  # once a day
+    b2, tg2, _ = _butler(cfg, tmp_path)  # restart the same day: remembered
+    b2.service_state, b2.clock = (lambda unit: "inactive"), (lambda: at(15))
+    assert not b2.maybe_daily_report() and not tg2.sent
+    b2.clock = lambda: at(9, d=23)
+    b2.service_state = lambda unit: "active"  # a running trading bot sends its own report
+    assert not b2.maybe_daily_report()
+    b2.service_state = lambda unit: "inactive"
+    assert b2.maybe_daily_report() and tg2.sent
+
+
 # ------------------------------------------------------------------ access control
 def test_only_the_owner_is_answered_and_everything_is_audited(cfg, tmp_path):
     b, tg, _ = _butler(cfg, tmp_path, ai=FakeAI())
