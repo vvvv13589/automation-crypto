@@ -1184,7 +1184,10 @@ class Advisor:
             return "沒有參考價"
         lo, hi = c["future_stop_pct"] if code == FUT else c["stock_stop_pct"]
         dist = (ref - a["stop"]) / ref * 100 * (1 if side == "long" else -1)
-        if not lo <= dist <= hi:
+        if dist <= 0:
+            return f"價格 {fmt(ref)} 已經在停損 {fmt(a['stop'])} 外面"
+        # 條件單觸發時（new=False）最小距離不再卡：掛單時檢查過了，成交在更好的價位停損本來就會變近
+        if dist > hi or (new and dist < lo):
             return f"停損距離參考價 {fmt(ref)} 是 {dist:.1f}%，不在 {lo:g}–{hi:g}%"
         tp = a.get("tp")
         if tp is not None and (tp - ref) * (1 if side == "long" else -1) <= 0:
@@ -1397,29 +1400,42 @@ class Advisor:
                 keep.append(p)
                 continue
             above = p["when"] == "above"
-            hit = (qt["h"] or 0) >= p["trigger"] if above else (qt["l"] or 1e18) <= p["trigger"]
+            # 今天盤中才掛的單：今天稍早（掛單前）的高低點和開盤價都不算，只看掛單後每次檢查看到的價格
+            opened_at = datetime.fromtimestamp(p["created"], TZ)
+            fresh = opened_at.strftime("%Y%m%d") == today and opened_at.strftime("%H:%M") >= "09:00"
+            if fresh:
+                if not qt.get("z"):
+                    keep.append(p)
+                    continue
+                p["lo"] = min(p.get("lo") or qt["z"], qt["z"])
+                p["hi"] = max(p.get("hi") or qt["z"], qt["z"])
+                hit = p["hi"] >= p["trigger"] if above else p["lo"] <= p["trigger"]
+                gapped = False
+            else:
+                hit = (qt["h"] or 0) >= p["trigger"] if above else (qt["l"] or 1e18) <= p["trigger"]
+                gapped = (qt["o"] >= p["trigger"]) if above else (qt["o"] <= p["trigger"])
             if not hit:
                 keep.append(p)
                 continue
-            gapped = (qt["o"] >= p["trigger"]) if above else (qt["o"] <= p["trigger"])
             entry = qt["o"] if gapped else p["trigger"]
             name = label(p["code"], p.get("name", ""))
-            self.notify(f"⚡ 條件單觸發：{self.plan_text(p)}")
             why = self.check_entry(p, entry, new=False)
             sgn = 1 if p["side"] == "long" else -1
-            if not why and (entry / p["trigger"] - 1) * 100 * sgn > c["max_gap_pct"]:
-                why = f"開盤 {fmt(entry)} 跳過觸發價太多，不追"
-            if why:
-                self.notify(f"⏭ {name} 沒有進場：{why}")
-                continue
-            try:
-                pos = b.open(p, entry, self.clock(), b.equity(self.prices(q)), intraday=not gapped)
-            except ValueError as exc:
-                self.notify(f"⏭ {name} 沒有進場：{exc}")
+            if not why and gapped and abs(entry / p["trigger"] - 1) * 100 > c["max_gap_pct"]:
+                why = f"開盤 {fmt(entry)} 直接跳過觸發價 {abs(entry / p['trigger'] - 1) * 100:.1f}%，不追"
+            pos = None
+            if not why:
+                try:
+                    pos = b.open(p, entry, self.clock(), b.equity(self.prices(q)), intraday=not gapped)
+                except ValueError as exc:
+                    why = str(exc)
+            if not pos:
+                self.notify(f"⚡ {name} 條件單觸發，但沒有進場\n原因：{why}\n（條件：{self.plan_text(p)}）")
                 continue
             act = ("做多" if p["side"] == "long" else "做空") if p["code"] == FUT else "買進"
-            self.notify(f"✅ {name} {fmt(entry)} {act} {qty_text(p['code'], pos['qty'])}{pos['note']}\n"
-                        f"停損 {fmt(pos['stop'])}，目標 {fmt(pos.get('tp'))}，打到停損約虧 {b.risk_at_stop(pos):,.0f} 元")
+            self.notify(f"⚡ 條件單觸發 → ✅ {name} {fmt(entry)} {act} {qty_text(p['code'], pos['qty'])}{pos['note']}\n"
+                        f"停損 {fmt(pos['stop'])}，目標 {fmt(pos.get('tp'))}，打到停損約虧 {b.risk_at_stop(pos):,.0f} 元\n"
+                        f"理由：{p['reason']}")
         b.plans = keep
         b.save()
 
@@ -1437,7 +1453,8 @@ class Advisor:
                 if (close > p["trigger"]) if p["when"] == "above" else (close < p["trigger"]):
                     why = self.check_entry(p, close, new=False)
                     if why:
-                        self.notify(f"⚡ 條件單觸發：{self.plan_text(p)}\n⏭ 沒有排進場：{why}")
+                        self.notify(f"⚡ {name} 收盤 {fmt(close)} 觸發條件單，但沒有排進場\n原因：{why}\n"
+                                    f"（條件：{self.plan_text(p)}）")
                     else:
                         b.pending.append({"type": "open", **{k: p[k] for k in ("code", "name", "side", "stop", "tp",
                                                                                  "risk_pct", "reason")},

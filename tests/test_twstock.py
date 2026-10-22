@@ -330,6 +330,34 @@ def test_touch_plan_and_intraday_stop(env):
     assert "2330" not in adv.book.positions
 
 
+def test_touch_plan_made_intraday_ignores_earlier_prices(env):
+    """10/22 2412 中華電: plan set at 13:11 (price ~157) was 'triggered' by the morning's low/open."""
+    adv, data, clock, msgs = env
+    clock.t = ts(2026, 10, 22, 13, 11)
+    adv.closes["2317"] = 157.0
+    assert adv.apply({"type": "plan", "code": "2317", "side": "long", "trigger": 154, "when": "below",
+                      "confirm": "touch", "stop": 150.5, "risk_pct": 0.5})["ok"]
+    morning = q(153, 158, 152.5, 157)  # opened 153, low 152.5 — all before the plan existed
+    adv.check_touch_plans({"2317": morning}, "20261022")
+    assert adv.book.plans and not adv.book.positions and not any("觸發" in m for m in msgs)
+    clock.t = ts(2026, 10, 22, 13, 16)
+    adv.check_touch_plans({"2317": {**morning, "z": 153.9}}, "20261022")
+    p = adv.book.positions["2317"]
+    assert p["entry"] == 154 and p["intraday"]
+    assert len([m for m in msgs if "觸發" in m]) == 1 and "✅" in msgs[-1]  # one message, not two
+
+
+def test_plan_fill_closer_to_stop_is_not_refused(env):
+    adv, data, clock, msgs = env
+    adv.closes["2317"] = 157.0
+    assert adv.apply({"type": "plan", "code": "2317", "side": "long", "trigger": 154, "when": "below",
+                      "confirm": "touch", "stop": 150.5, "risk_pct": 0.5})["ok"]
+    clock.t = ts(2026, 10, 22, 9, 5)
+    adv.check_touch_plans({"2317": q(152.5, 153, 152, 152.5)}, "20261022")  # opened below the trigger
+    p = adv.book.positions["2317"]
+    assert p["entry"] == 152.5 and p["entry"] * p["qty"] <= 1e6 * 0.3 + 1  # capped by the 30% position limit
+
+
 def test_plan_trigger_on_wrong_side(env):
     adv, *_ = env
     r = adv.apply({"type": "plan", "code": "2330", "side": "long", "trigger": 98, "when": "above", "stop": 92})
