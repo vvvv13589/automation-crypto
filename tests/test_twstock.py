@@ -59,6 +59,9 @@ class FakeData:
     def etfs(self, n):
         return []
 
+    def otc_universe(self, n):
+        return []
+
     def etf_premium(self):
         return {}
 
@@ -158,6 +161,32 @@ def test_etf_list_filters_bonds_and_commodities(tmp_path):
     d = Data(tmp_path, fetch=lambda url, **kw: json.dumps(rows).encode())
     assert [(e["code"], e["industry"]) for e in d.etfs(5)] == [("0050", "ETF"), ("00631L", "ETF正2"),
                                                                ("00981A", "主動ETF")]
+
+
+def test_otc_chips_margin_and_symbols(tmp_path):
+    row = ["6488", "環球晶", "1", "2", "-682,555", "0", "0", "0", "1", "2", "-682,555", "1", "0", "22,116",
+           "1", "0", "323,838", "1", "0", "153,028", "1", "0", "476,866", "-183,573"]
+    pages = {
+        "insti": {"tables": [{"date": "115/10/21", "data": [row]}]},
+        "margin": {"tables": [{"date": "115/10/21", "fields": ["代號", "名稱", "前資餘額(張)", "資買", "資賣", "現償",
+                                                               "資餘額", "x", "x", "x", "前券餘額(張)", "券賣", "券買", "券償", "券餘額"],
+                               "data": [["6488", "環球晶", "0", "0", "0", "0", "5,000", "0", "0", "0", "0", "0", "0", "0", "300"]]}]},
+        "T86": {"stat": "OK", "fields": ["證券代號", "外陸資買賣超股數(不含外資自營商)", "投信買賣超股數", "自營商買賣超股數"],
+                "data": [["2330", "1,000", "2,000", "3,000"]]},
+        "MI_MARGN": {"stat": "沒有資料"},
+    }
+
+    def fetch(url, **kw):
+        return json.dumps(next(v for k, v in pages.items() if k in url)).encode()
+    d = Data(tmp_path, fetch=fetch, sleep=lambda s: None)
+    d.otc = {"6488"}
+    assert d.yahoo("6488") == "6488.TWO" and d.yahoo("2330") == "2330.TW" and d.yahoo("^SOX") == "^SOX"
+    ch = d.chips("20261021")
+    assert ch["6488"] == (-682_555, 22_116, 476_866) and ch["2330"] == (1000, 2000, 3000)
+    assert d.margin("20261021")[0]["6488"] == (5000, 300)
+    # TPEx answered with another day's table: not used, not cached
+    assert d.tpex("insti/x", "OTC3I_20261022", "20261022") == {}
+    assert not (tmp_path / "OTC3I_20261022.json").exists() and (tmp_path / "OTC3I_20261021.json").exists()
 
 
 def test_etf_in_scan_with_premium(env):

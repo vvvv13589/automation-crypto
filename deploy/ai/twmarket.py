@@ -53,29 +53,43 @@ def main(argv=None) -> int:
 
     if a.cmd == "klines":
         limit = max(1, min(a.limit, 500))
-        d = get(f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(a.symbol)}"
-                f"?range={TFS[a.tf]}&interval={a.tf}")
-        r = d["chart"]["result"][0]
+        tries = [a.symbol, a.symbol[:-3] + ".TWO"] if a.symbol.endswith(".TW") else [a.symbol]  # 上櫃是 .TWO
+        r = None
+        for sym in tries:
+            try:
+                d = get(f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym)}"
+                        f"?range={TFS[a.tf]}&interval={a.tf}")
+                r = d["chart"]["result"][0]
+                if r.get("timestamp"):
+                    break
+            except Exception:
+                continue
+        if not r:
+            print(f"no data for {a.symbol}")
+            return 1
         qt = r["indicators"]["quote"][0]
+        tw = a.symbol.endswith(".TW")
         rows = []
         for i, t in enumerate(r.get("timestamp") or []):
             o, h, l, c, v = (qt[x][i] for x in ("open", "high", "low", "close", "volume"))
             if None in (o, h, l, c):
                 continue
             when = datetime.fromtimestamp(t, TW).strftime("%Y-%m-%d" if a.tf in ("1d", "1wk") else "%Y-%m-%d %H:%M")
-            vol = f"{(v or 0) / 1000:.0f}" if a.symbol.endswith(".TW") else f"{v or 0:.0f}"
+            vol = f"{(v or 0) / 1000:.0f}" if tw else f"{v or 0:.0f}"
             rows.append(f"{when},{o:.6g},{h:.6g},{l:.6g},{c:.6g},{vol}")
-        print("time_tw,open,high,low,close," + ("volume_lots(張)" if a.symbol.endswith(".TW") else "volume"))
+        print("time_tw,open,high,low,close," + ("volume_lots(張)" if tw else "volume"))
         print("\n".join(rows[-limit:]))
     else:
-        codes = [c.strip() for c in a.codes if re.fullmatch(r"\d{4,6}[A-Z]?", c.strip())][:50]
+        codes = [c.strip().upper() for c in a.codes if re.fullmatch(r"\d{4,6}[A-Za-z]?", c.strip())][:25]
         if not codes:
             print("give Taiwan stock codes, e.g. 2330")
             return 1
-        d = get("https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch="
-                + "|".join(f"tse_{c}.tw" for c in codes))
+        d = get("https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch="  # 上市 tse_、上櫃 otc_ 都問
+                + "|".join(f"{ex}_{c}.tw" for c in codes for ex in ("tse", "otc")))
         print("code,name,date,time,last,open,high,low,prev_close,limit_up,limit_down,volume_lots")
         for m in d.get("msgArray", []):
+            if not m.get("c") or not m.get("n"):
+                continue  # 這個代號不在這個市場（上市／上櫃只會有一邊）
             last = m.get("z") if m.get("z") not in (None, "-") else (m.get("trade") or {}).get("z", "-")
             print(",".join(str(x) for x in (m.get("c"), m.get("n"), m.get("d"), m.get("t"), last, m.get("o"), m.get("h"),
                                             m.get("l"), m.get("y"), m.get("u"), m.get("w"), m.get("v"))))

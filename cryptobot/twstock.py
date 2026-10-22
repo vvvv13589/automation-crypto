@@ -42,6 +42,7 @@ DEFAULTS = {
     "premarket": "08:30",
     "postmarket": "16:30",
     "universe": 150,
+    "otc": 50,  # 另外加市值前幾大的上櫃股；0 = 不看上櫃
     "etfs": 20,  # 另外加成交值前幾大的股票型 ETF；0 = 不看 ETF
     "max_positions": 6,  # 持股＋等開盤成交的建議
     "max_risk_pct": 2.0,  # 打到停損虧掉的權益 %，每筆
@@ -63,7 +64,7 @@ INDUSTRY = {"01": "水泥", "02": "食品", "03": "塑膠", "04": "紡織", "05"
             "09": "造紙", "10": "鋼鐵", "11": "橡膠", "12": "汽車", "14": "建材營造", "15": "航運", "16": "觀光",
             "17": "金融", "18": "貿易百貨", "19": "綜合", "20": "其他", "21": "化學", "22": "生技醫療", "23": "油電燃氣",
             "24": "半導體", "25": "電腦週邊", "26": "光電", "27": "通信網路", "28": "電子零組件", "29": "電子通路",
-            "30": "資訊服務", "31": "其他電子", "35": "綠能環保", "36": "數位雲端", "37": "運動休閒", "38": "居家生活"}
+            "30": "資訊服務", "31": "其他電子", "32": "文化創意", "33": "農業科技", "34": "電子商務","35": "綠能環保", "36": "數位雲端", "37": "運動休閒", "38": "居家生活"}
 GLOBAL = [  # (Yahoo symbol, 名稱)
     ("^GSPC", "標普500"), ("^IXIC", "那斯達克"), ("^SOX", "費城半導體"), ("^DJI", "道瓊"),
     ("ES=F", "標普期貨"), ("NQ=F", "那指期貨"), ("TSM", "台積電ADR"), ("NVDA", "輝達"), ("AAPL", "蘋果"),
@@ -161,6 +162,59 @@ class Data:
         cache.mkdir(parents=True, exist_ok=True)
         self.last_twse = 0.0
         self._holidays: set[str] | None = None
+        f = cache / "otc_codes.json"  # 上櫃代號（Yahoo 用 .TWO、即時報價用 otc_）
+        self.otc: set[str] = set(json.loads(f.read_text())) if f.exists() else set()
+
+    def yahoo(self, code: str) -> str:
+        if not re.fullmatch(r"\d{4,6}[A-Z]?", code):
+            return code
+        return f"{code}.TWO" if code in self.otc else f"{code}.TW"
+
+    def tpex(self, path: str, name: str | None = None, day: str | None = None) -> dict:
+        """櫃買中心網站報表（日期格式 2026/10/21），過去的日子存檔快取。"""
+        f = self.cache / f"{name}.json" if name else None
+        if f and f.exists():
+            return json.loads(f.read_text(encoding="utf-8"))
+        for attempt in range(3):
+            try:
+                d = self.json("https://www.tpex.org.tw/www/zh-tw/" + path, timeout=45)
+                break
+            except Exception as exc:
+                log.warning("tpex %s: %s", path[:40], str(exc)[:100])
+                if attempt == 2:
+                    return {}
+                self.sleep(3 * (attempt + 1))
+        tables = d.get("tables") or []
+        if day and (not tables or tables[0].get("date") != f"{int(day[:4]) - 1911}/{day[4:6]}/{day[6:]}"):
+            return {}  # 那天還沒公布（或回的是別天的表）
+        if f and tables and tables[0].get("data"):
+            f.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        return d
+
+    @staticmethod
+    def slash(d: str) -> str:
+        return f"{d[:4]}/{d[4:6]}/{d[6:]}"
+
+    def otc_universe(self, n: int) -> list[dict]:
+        """市值（收盤 × 實收資本額 ÷ 10）前 n 大的上櫃普通股。"""
+        day = self._cached("otc_quotes", "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes", 3600 * 6)
+        comp = {r["SecuritiesCompanyCode"]: r for r in self._cached(
+            "otc_companies", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O", 86400 * 3)}
+        rows = []
+        for r in day:
+            code, c = r.get("SecuritiesCompanyCode", ""), comp.get(r.get("SecuritiesCompanyCode", ""))
+            if not c or not re.fullmatch(r"[1-9]\d{3}", code):
+                continue
+            px, cap = num(r.get("Close")), num(c.get("Paidin.Capital.NTDollars"))
+            if px and cap:
+                ind = c.get("SecuritiesIndustryCode", "")
+                rows.append({"code": code, "name": r["CompanyName"].strip(), "cap": px * cap / 10,
+                             "industry": INDUSTRY.get(ind, ind) + "(櫃)"})
+        rows.sort(key=lambda r: -r["cap"])
+        rows = rows[:n]
+        self.otc |= {r["code"] for r in rows}
+        (self.cache / "otc_codes.json").write_text(json.dumps(sorted(self.otc)))
+        return rows
 
     def json(self, url: str, **kw):
         return json.loads(self.fetch(url, **kw))
@@ -262,7 +316,7 @@ class Data:
 
     # -- prices --
     def bars(self, symbol: str, rng: str = "1y", interval: str = "1d") -> list[dict]:
-        sym = f"{symbol}.TW" if re.fullmatch(r"\d{4,6}[A-Z]?", symbol) else symbol
+        sym = self.yahoo(symbol)
         d = self.json(f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym)}"
                       f"?range={rng}&interval={interval}")
         r = d["chart"]["result"][0]
@@ -301,7 +355,7 @@ class Data:
         """證交所盤中即時（o 開、h 高、l 低、z 最新、y 昨收、u 漲停、w 跌停）。"""
         out = {}
         for i in range(0, len(codes), 50):
-            ch = "|".join(f"tse_{c}.tw" for c in codes[i:i + 50])
+            ch = "|".join(f"{'otc' if c in self.otc or c == 'o00' else 'tse'}_{c}.tw" for c in codes[i:i + 50])
             d = self.json("https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=" + ch)
             for m in d.get("msgArray", []):
                 z = num(m.get("z")) or num((m.get("trade") or {}).get("z"))
@@ -327,19 +381,33 @@ class Data:
     # -- chips --
     def chips(self, d: str) -> dict[str, tuple[float, float, float]]:
         """三大法人個股買賣超（股）：外資、投信、自營商。"""
+        out = {}
         t = self.twse(f"fund/T86?date={d}&selectType=ALLBUT0999&response=json", f"T86_{d}")
-        if t.get("stat") != "OK":
-            return {}
-        f = t["fields"]
-        fi, ti, di = (f.index("外陸資買賣超股數(不含外資自營商)"), f.index("投信買賣超股數"), f.index("自營商買賣超股數"))
-        return {r[0].strip(): (num(r[fi]) or 0, num(r[ti]) or 0, num(r[di]) or 0) for r in t["data"]}
+        if t.get("stat") == "OK":
+            f = t["fields"]
+            fi, ti, di = (f.index("外陸資買賣超股數(不含外資自營商)"), f.index("投信買賣超股數"), f.index("自營商買賣超股數"))
+            out = {r[0].strip(): (num(r[fi]) or 0, num(r[ti]) or 0, num(r[di]) or 0) for r in t["data"]}
+        if self.otc:
+            # 上櫃：外資(不含外資自營商)買賣超在第 4 欄、投信第 13 欄、自營商合計第 22 欄
+            o = self.tpex(f"insti/dailyTrade?type=Daily&sect=EW&date={self.slash(d)}&response=json", f"OTC3I_{d}", d)
+            for r in ((o.get("tables") or [{}])[0].get("data") or []):
+                if len(r) >= 23:
+                    out[r[0].strip()] = (num(r[4]) or 0, num(r[13]) or 0, num(r[22]) or 0)
+        return out
 
     def margin(self, d: str) -> tuple[dict[str, tuple[float, float]], float | None]:
         """個股融資、融券餘額（張）＋全市場融資金額（仟元）。"""
+        out, total = {}, None
+        if self.otc:
+            o = self.tpex(f"margin/balance?date={self.slash(d)}&response=json", f"OTCMARGN_{d}", d)
+            t = (o.get("tables") or [{}])[0]
+            f = t.get("fields") or []
+            if "資餘額" in f and "券餘額" in f:
+                mi, si = f.index("資餘額"), f.index("券餘額")
+                out.update({r[0].strip(): (num(r[mi]) or 0, num(r[si]) or 0) for r in t.get("data") or []})
         m = self.twse(f"marginTrading/MI_MARGN?date={d}&selectType=ALL&response=json", f"MARGN_{d}")
         if m.get("stat") != "OK":
-            return {}, None
-        out, total = {}, None
+            return out, None
         for t in m.get("tables", []):
             f, rows = t.get("fields") or [], t.get("data") or []
             if "項目" in f:
@@ -349,7 +417,7 @@ class Data:
             elif f[:1] == ["代號"]:
                 bal = [i for i, x in enumerate(f) if x == "今日餘額"]
                 if len(bal) >= 2:
-                    out = {r[0].strip(): (num(r[bal[0]]) or 0, num(r[bal[1]]) or 0) for r in rows}
+                    out.update({r[0].strip(): (num(r[bal[0]]) or 0, num(r[bal[1]]) or 0) for r in rows})
         return out, total
 
     def institutions(self, d: str) -> dict[str, float]:
@@ -421,7 +489,12 @@ class Data:
         return out
 
     def revenue(self) -> dict[str, dict]:
-        rows = self._cached("revenue", "https://openapi.twse.com.tw/v1/opendata/t187ap05_L", 3600 * 6)
+        rows = list(self._cached("revenue", "https://openapi.twse.com.tw/v1/opendata/t187ap05_L", 3600 * 6))
+        if self.otc:
+            try:
+                rows += self._cached("otc_revenue", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O", 3600 * 6)
+            except Exception as exc:
+                log.warning("otc revenue: %s", exc)
         return {r["公司代號"]: {"ym": r.get("資料年月", ""), "mom": num(r.get("營業收入-上月比較增減(%)")),
                                "yoy": num(r.get("營業收入-去年同月增減(%)")),
                                "cum": num(r.get("累計營業收入-前期比較增減(%)"))} for r in rows}
@@ -436,6 +509,13 @@ class Data:
                         out.setdefault(r["Code"], f"處置中{r.get('DispositionPeriod', '')}" if name == "處置" else "注意股")
             except Exception as exc:
                 log.warning("alerts %s: %s", name, exc)
+        if self.otc:
+            try:
+                for r in self.json("https://www.tpex.org.tw/openapi/v1/tpex_disposal_information"):
+                    if r.get("SecuritiesCompanyCode"):
+                        out.setdefault(r["SecuritiesCompanyCode"], f"處置中{r.get('DispositionPeriod', '')}")
+            except Exception as exc:
+                log.warning("alerts otc: %s", exc)
         return out
 
     def news(self, hours: float = 36) -> list[dict]:
@@ -727,6 +807,11 @@ class Advisor:
     def gather(self) -> dict:
         d = self.data
         uni = d.universe(self.cfg["universe"])
+        if self.cfg["otc"]:
+            try:
+                uni += d.otc_universe(self.cfg["otc"])
+            except Exception as exc:
+                log.warning("otc universe: %s", exc)
         if self.cfg["etfs"]:
             try:
                 uni += [e for e in d.etfs(self.cfg["etfs"]) if e["code"] not in {u["code"] for u in uni}]
@@ -869,11 +954,12 @@ class Advisor:
     def live_text(self, g: dict) -> str:
         """盤中即時：加權指數、台指期、150 檔的現價；同時把參考價換成現價。"""
         today = self.now().strftime("%Y%m%d")
-        q = self.data.quotes([u["code"] for u in g["uni"]] + ["t00"])
+        q = self.data.quotes([u["code"] for u in g["uni"]] + ["t00", "o00"])
         out = []
-        ix = q.get("t00")
-        if ix and ix.get("z") and ix.get("y"):
-            out.append(f"加權指數 {fmt(ix['z'])}（{sg(pct(ix['z'], ix['y']), 2)}%），開 {fmt(ix['o'])} 高 {fmt(ix['h'])} 低 {fmt(ix['l'])}")
+        for key, nm in (("t00", "加權指數"), ("o00", "櫃買指數")):
+            ix = q.get(key)
+            if ix and ix.get("z") and ix.get("y"):
+                out.append(f"{nm} {fmt(ix['z'])}（{sg(pct(ix['z'], ix['y']), 2)}%），開 {fmt(ix['o'])} 高 {fmt(ix['h'])} 低 {fmt(ix['l'])}")
         try:
             tx = self.data.tx_quote()
         except Exception as exc:
@@ -973,7 +1059,7 @@ class Advisor:
 【國際盤】
 {self.global_text(g)}
 
-【掃描：市值前 {c['universe']} 大上市股＋成交值前 {c['etfs']} 大股票型 ETF，共 {len(g['rows'])} 檔（{last} 收盤）】
+【掃描：市值前 {c['universe']} 大上市股＋前 {c['otc']} 大上櫃股（產業欄標「(櫃)」）＋成交值前 {c['etfs']} 大股票型 ETF，共 {len(g['rows'])} 檔（{last} 收盤）】
 {SCAN_HEADER}
 {chr(10).join(scan_line(u, s) for u, s in g['rows'])}
 
@@ -1066,7 +1152,7 @@ class Advisor:
         c, b = self.cfg, self.book
         code, side = a["code"], a["side"]
         if new and code != FUT and code not in self.names:
-            return f"{code} 不在掃描範圍（市值前 {c['universe']} 大個股＋前 {c['etfs']} 大股票型 ETF）"
+            return f"{code} 不在掃描範圍（上市前 {c['universe']}、上櫃前 {c['otc']}、ETF 前 {c['etfs']}）"
         if code != FUT and side != "long":
             return "個股只做多（大盤看空請用台指期 TX）"
         if side not in ("long", "short"):
