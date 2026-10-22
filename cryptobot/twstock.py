@@ -1254,11 +1254,43 @@ def status_text(cfg: dict) -> str:
     return "\n".join(lines)
 
 
-def main(cfg: dict, repo_dir: str, once: bool = False, scan: bool = False) -> int:
+def telegram_target() -> tuple[str | None, str | None]:
+    """台股專用機器人（/etc/cryptobot-twstock/telegram.env）；沒設定就用主機器人。"""
+    import os
+    token = os.getenv("TWSTOCK_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    chat = os.getenv("TWSTOCK_TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
+    return token, chat
+
+
+def find_chat() -> int:
+    """列出台股機器人最近收到訊息的聊天室（先在聊天室裡對機器人說句話）。"""
+    import os
+    token = os.getenv("TWSTOCK_TELEGRAM_BOT_TOKEN")
+    if not token:
+        print("TWSTOCK_TELEGRAM_BOT_TOKEN missing (/etc/cryptobot-twstock/telegram.env)")
+        return 1
+    d = json.loads(_get(f"https://api.telegram.org/bot{token}/getUpdates"))
+    chats = {}
+    for u in d.get("result", []):
+        m = u.get("message") or u.get("channel_post") or u.get("my_chat_member") or {}
+        ch = m.get("chat") or {}
+        if ch.get("id"):
+            chats[ch["id"]] = ch.get("title") or ch.get("username") or ch.get("first_name") or ""
+    if not chats:
+        print("沒有看到任何聊天室：把機器人加進聊天室，在裡面傳一句話（群組可傳 /start@機器人名稱），再跑一次")
+        return 1
+    for cid, name in chats.items():
+        print(f"{cid}\t{name}")
+    return 0
+
+
+def main(cfg: dict, repo_dir: str, once: bool = False, scan: bool = False, chat: bool = False) -> int:
     import os
 
     from .notify import Telegram
 
+    if chat:
+        return find_chat()
     c = settings(cfg)
     state = Path(cfg.get("state_dir", "state"))
     data = Data(state / "twstock")
@@ -1274,8 +1306,8 @@ def main(cfg: dict, repo_dir: str, once: bool = False, scan: bool = False) -> in
         return 1
     ai = TWStockAI(cfg, repo_dir, str(claude), token, c["model"], int(c["max_turns"]))
     ai.install()
-    tg_token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    notify = Telegram(tg_token, chat, prefix="[台股AI] ") if tg_token and chat else None
+    tg_token, chat_id = telegram_target()
+    notify = Telegram(tg_token, chat_id, prefix="[台股AI] ") if tg_token and chat_id else None
     adv = Advisor(cfg, data, ai, notify)
     if once:
         adv.decide("手動測試")

@@ -238,6 +238,7 @@ def main(argv=None) -> int:
     tws = sub.add_parser("tw-stock", help="Taiwan stock AI advisor: suggestions only, pre/post-market to Telegram")
     tws.add_argument("--once", action="store_true", help="one decision now (pushed to Telegram), then exit")
     tws.add_argument("--scan", action="store_true", help="print the data the AI would get, no AI call")
+    tws.add_argument("--find-chat", action="store_true", help="list chats that messaged the tw-stock Telegram bot")
     live =sub.add_parser("live", help="REAL trading with real funds")
     live.add_argument("--confirm-live", action="store_true", help="required: I accept the risk")
 
@@ -287,7 +288,7 @@ def main(argv=None) -> int:
         import os
 
         from .twstock import main as twstock_main
-        return twstock_main(cfg, os.getcwd(), once=args.once, scan=args.scan)
+        return twstock_main(cfg, os.getcwd(), once=args.once, scan=args.scan, chat=args.find_chat)
     if args.command == "status":
         import os
 

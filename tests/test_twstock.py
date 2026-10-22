@@ -330,5 +330,17 @@ def test_last_days_skip_holidays_and_open_session():
     assert Data.last_days(d, datetime(2026, 10, 27, 16, 30, tzinfo=TZ), 2) == ["20261023", "20261027"]
 
 
+def test_telegram_target_prefers_own_bot(monkeypatch):
+    from cryptobot.twstock import telegram_target
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "main")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "1")
+    monkeypatch.delenv("TWSTOCK_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TWSTOCK_TELEGRAM_CHAT_ID", raising=False)
+    assert telegram_target() == ("main", "1")
+    monkeypatch.setenv("TWSTOCK_TELEGRAM_BOT_TOKEN", "tw")
+    monkeypatch.setenv("TWSTOCK_TELEGRAM_CHAT_ID", "-100")
+    assert telegram_target() == ("tw", "-100")
+
+
 def test_settings_override():
     assert settings({"twstock": {"capital": 300000}})["capital"] == 300000

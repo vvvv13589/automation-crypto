@@ -16,6 +16,9 @@ WorkingDirectory=/root/automation-crypto
 ExecStart=/usr/bin/python3 -m cryptobot tw-stock
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/cryptobot-butler/claude.env
+# 台股專用 Telegram 機器人（root 600）：TWSTOCK_TELEGRAM_BOT_TOKEN=... / TWSTOCK_TELEGRAM_CHAT_ID=...
+# 沒有這個檔就用主機器人（.env 的 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID）
+EnvironmentFile=-/etc/cryptobot-twstock/telegram.env
 Restart=on-failure
 RestartSec=60
 KillSignal=SIGINT
