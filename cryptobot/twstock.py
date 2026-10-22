@@ -1661,6 +1661,25 @@ def telegram_target() -> tuple[str | None, str | None]:
     return token, chat
 
 
+MENU = [("now", "AI 用現在的行情判斷一次（可加代號：/now 2330）"),
+        ("ask", "問 AI 台股問題（也可以直接打字）"),
+        ("tw", "建議追蹤：持倉、條件單、戰績"),
+        ("new", "開新對話"),
+        ("help", "指令說明")]
+
+
+def set_menu(token: str, fetch=_get) -> bool:
+    """Telegram 輸入框旁的「選單」：打 / 就列出指令。"""
+    body = json.dumps({"commands": [{"command": c, "description": d} for c, d in MENU]}).encode()
+    try:
+        r = json.loads(fetch(f"https://api.telegram.org/bot{token}/setMyCommands", data=body,
+                             headers={"Content-Type": "application/json"}))
+        return bool(r.get("ok"))
+    except Exception as exc:
+        log.warning("set menu: %s", exc)
+        return False
+
+
 def find_chat() -> int:
     """列出台股機器人最近收到訊息的聊天室（先在聊天室裡對機器人說句話）。"""
     import os
@@ -1711,6 +1730,7 @@ def main(cfg: dict, repo_dir: str, once: bool = False, scan: bool = False, chat:
     own = os.getenv("TWSTOCK_TELEGRAM_BOT_TOKEN")
     if own and chat_id:  # 只聽台股自己的機器人，絕不搶管家（主機器人）的訊息
         adv.commands = Commands(own, chat_id)
+        set_menu(own)
         adv.chat = TWChat(cfg, repo_dir, str(claude), token, c["model"], int(c["max_turns"]))
     if once:
         adv.decide("手動測試")

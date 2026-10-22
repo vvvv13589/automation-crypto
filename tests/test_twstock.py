@@ -530,5 +530,21 @@ def test_commands_only_from_own_chat_and_skip_backlog():
     assert "offset=8" in calls[1] and c.offset == 10
 
 
+def test_menu_matches_handled_commands(env):
+    from cryptobot.twstock import MENU, set_menu
+    sent = {}
+
+    def fetch(url, data=None, headers=None):
+        sent["url"], sent["body"] = url, json.loads(data)
+        return b'{"ok": true}'
+    assert set_menu("tok", fetch) and sent["url"].endswith("/bottok/setMyCommands")
+    assert [c["command"] for c in sent["body"]["commands"]] == ["now", "ask", "tw", "new", "help"]
+    adv, data, clock, msgs = env
+    for cmd, _ in MENU:  # every menu entry does something (none falls through silently)
+        before = len(msgs)
+        adv.handle(f"/{cmd}") if cmd != "now" else None
+        assert cmd == "now" or len(msgs) > before, cmd
+
+
 def test_settings_override():
     assert settings({"twstock": {"capital": 300000}})["capital"] == 300000
