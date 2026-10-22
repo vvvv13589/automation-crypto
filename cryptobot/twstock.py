@@ -56,6 +56,7 @@ DEFAULTS = {
     "future_point": 10.0,
     "future_cost_points": 2.0,  # 手續費＋期交稅＋滑價，每口來回約幾點
     "check_minutes": 5,
+    "now_cooldown_seconds": 120,  # /now 防連按
 }
 INDUSTRY = {"01": "水泥", "02": "食品", "03": "塑膠", "04": "紡織", "05": "電機", "06": "電器電纜", "08": "玻璃",
             "09": "造紙", "10": "鋼鐵", "11": "橡膠", "12": "汽車", "14": "建材營造", "15": "航運", "16": "觀光",
@@ -283,7 +284,8 @@ class Data:
             for m in d.get("msgArray", []):
                 z = num(m.get("z")) or num((m.get("trade") or {}).get("z"))
                 out[m["c"]] = {"date": m.get("d"), "o": num(m.get("o")), "h": num(m.get("h")), "l": num(m.get("l")),
-                               "z": z, "y": num(m.get("y")), "u": num(m.get("u")), "w": num(m.get("w"))}
+                               "z": z, "y": num(m.get("y")), "u": num(m.get("u")), "w": num(m.get("w")),
+                               "v": num(m.get("v"))}
         return out
 
     def tx_quote(self) -> dict | None:
@@ -653,8 +655,11 @@ class Advisor:
         self.flags_path = state / "twstock_flags.json"
         self.flags: dict = json.loads(self.flags_path.read_text()) if self.flags_path.exists() else {}
         self.names: dict[str, str] = {}
-        self.closes: dict[str, float] = {}  # 最近一次決策時每檔的收盤（AI 建議的參考價）
+        self.closes: dict[str, float] = {}  # 最近一次決策時每檔的收盤（盤中即時決策時是現價）＝建議的參考價
         self.last_check = 0.0
+        self.live_now = False  # 盤中即時決策：open／close 以現價立即成交
+        self.last_now = 0.0
+        self.commands = None  # Commands：台股機器人的 /now、/tw
 
     def now(self) -> datetime:
         return datetime.fromtimestamp(self.clock(), TZ)
@@ -789,6 +794,45 @@ class Advisor:
             out.append(f"台積電 ADR 溢價（ADR×匯率÷5 對 2330 最近收盤 {fmt(tw2330[-1]['c'])}）：{sg(prem)}%")
         return "\n".join(out)
 
+    def in_session(self) -> bool:
+        now = self.now()
+        return self.data.trading_day(now.date()) and "09:00" <= now.strftime("%H:%M") < "13:25"
+
+    def live_text(self, g: dict) -> str:
+        """盤中即時：加權指數、台指期、150 檔的現價；同時把參考價換成現價。"""
+        today = self.now().strftime("%Y%m%d")
+        q = self.data.quotes([u["code"] for u in g["uni"]] + ["t00"])
+        out = []
+        ix = q.get("t00")
+        if ix and ix.get("z") and ix.get("y"):
+            out.append(f"加權指數 {fmt(ix['z'])}（{sg(pct(ix['z'], ix['y']), 2)}%），開 {fmt(ix['o'])} 高 {fmt(ix['h'])} 低 {fmt(ix['l'])}")
+        try:
+            tx = self.data.tx_quote()
+        except Exception as exc:
+            log.warning("tx quote: %s", exc)
+            tx = None
+        if tx and tx.get("z"):
+            self.closes[FUT] = tx["z"]
+            out.append(f"台指期 {tx.get('name', '')} {fmt(tx['z'])}（{sg(pct(tx['z'], tx['y']), 2)}%），"
+                       f"開 {fmt(tx['o'])} 高 {fmt(tx['h'])} 低 {fmt(tx['l'])}")
+        rows = []
+        for u in g["uni"]:
+            x = q.get(u["code"])
+            if not x or x.get("date") != today or not x.get("z"):
+                continue
+            self.closes[u["code"]] = x["z"]
+            b = g["bars"].get(u["code"]) or []
+            avg = sum(v["v"] for v in b[-20:]) / 20 / 1000 if len(b) >= 20 else None
+            chg = pct(x["z"], x["y"])
+            mark = ("漲停" if x.get("u") and x["z"] >= x["u"] else "跌停" if x.get("w") and x["z"] <= x["w"] else "")
+            ratio = f"{x['v'] / avg:.1f}x" if x.get("v") and avg else "-"
+            rows.append((chg or 0, f"{u['code']} {u['name']}|{fmt(x['z'])}|{sg(chg)}|{fmt(x['o'])}/{fmt(x['h'])}/"
+                                   f"{fmt(x['l'])}|{fmt(x.get('v'))}|{ratio}|{mark}"))
+        rows.sort(key=lambda r: -r[0])
+        out.append("代號 名稱|現價|漲跌%|開/高/低|今日累計量(張)|累計量÷20日均量|漲跌停")
+        out += [r[1] for r in rows]
+        return "\n".join(out)
+
     def positions_text(self) -> str:
         b = self.book
         out = []
@@ -825,13 +869,23 @@ class Advisor:
         return (f"{label(p['code'], p.get('name', ''))}：{how}{where} {fmt(p['trigger'])}{then}，停損 {fmt(p['stop'])}"
                 f"{tp}，風險 {p['risk_pct']:g}%，有效到 {md(p['expires'])}")
 
-    def build_prompt(self, g: dict, kind: str) -> str:
+    def build_prompt(self, g: dict, kind: str, live: str = "", focus: list[str] | None = None) -> str:
         c, b = self.cfg, self.book
         eq = b.equity(self.closes)
         news = "\n".join(f"{tw(i['ts'])} [{i['src']}] {i['title']}" for i in g["news"][:90]) or "（暫時抓不到新聞）"
         flagged = [f"{u['code']} {u['name']}：{'、'.join(s['flags'])}" for u, s in g["rows"] if s["flags"]]
         last = md(g["days"][-1]) if g["days"] else "?"
-        return f"""現在時間 {self.now():%Y-%m-%d %H:%M}（台北時間）。這次是【{kind}】決策。最近一個已收盤的交易日：{last}。
+        extra = ""
+        if kind == "即時":
+            extra += ("\n這是使用者在 Telegram 用 /now 叫你做的即時判斷。"
+                      + (f"現在是盤中：open／close 會以【盤中即時】的現價立即成交（不是等開盤），停損距離也以現價計算；"
+                         f"掃描表和籌碼是 {last} 收盤的資料，今天的法人、融資要收盤後才知道。\n\n【盤中即時】\n{live}\n"
+                         if live else "現在不是盤中：open／close 照常在下一個開盤成交。\n"))
+        if focus:
+            names = "、".join(label(x, self.names.get(x, "")) for x in focus)
+            extra += (f"\n使用者特別想問：{names}。請一定要對這幾檔給明確看法（買、等、不碰，價位和理由）；"
+                      f"不在前 {c['universe']} 大的也可以用 twmarket.py 查，但只有前 {c['universe']} 大和 TX 能下 open／plan。\n")
+        return f"""現在時間 {self.now():%Y-%m-%d %H:%M}（台北時間）。這次是【{kind}】決策。最近一個已收盤的交易日：{last}。{extra}
 
 【虛擬帳（建議追蹤）】權益 {eq:,.0f} 元（起始 {b.capital:,.0f} 元，{(eq / b.capital - 1) * 100:+.1f}%）
 【硬性限制（程式強制）】個股只做多（現股，不融資）、台指期 {FUT} 可多可空；每筆風險 ≤ {c['max_risk_pct']:g}% 權益；全部倉位一起打到停損 ≤ {c['max_open_risk_pct']:g}%；最多 {c['max_positions']} 檔（含等開盤的）；一檔一倉不加碼；股票停損距離 {c['stock_stop_pct'][0]:g}–{c['stock_stop_pct'][1]:g}%、台指期 {c['future_stop_pct'][0]:g}–{c['future_stop_pct'][1]:g}%；停損只能收緊；單檔成本 ≤ {c['max_position_pct']:g}% 權益；進場在下一個開盤價成交，開盤跳空超過 {c['max_gap_pct']:g}% 或開盤漲停就不追。
@@ -873,15 +927,23 @@ class Advisor:
             log.warning("work dir: %s", exc)
 
     # -- deciding --
-    def decide(self, kind: str) -> None:
+    def decide(self, kind: str, focus: list[str] | None = None) -> None:
+        try:
+            self._decide(kind, focus)
+        finally:
+            self.live_now = False
+
+    def _decide(self, kind: str, focus: list[str] | None) -> None:
         try:
             g = self.gather()
+            self.live_now = kind == "即時" and self.in_session()
+            live = self.live_text(g) if self.live_now else ""
         except Exception as exc:
             log.exception("gather failed")
             self.notify(f"⚠️ {kind}資料抓取失敗：{str(exc)[:200]}")
             return
         self.write_work(g)
-        prompt = self.build_prompt(g, kind)
+        prompt = self.build_prompt(g, kind, live, focus)
         try:
             decision, meta = self.ai.decide(prompt)
         except Exception as exc:
@@ -893,7 +955,7 @@ class Advisor:
         results = [self.apply(a) for a in acts]
         decision["actions"] = results
         self._journal(decision, kind, meta)
-        icon = "🌅 盤前" if kind == "盤前" else "🌆 盤後" if kind == "盤後" else f"🧪 {kind}"
+        icon = {"盤前": "🌅 盤前", "盤後": "🌆 盤後", "即時": "⚡ 即時" + ("（盤中）" if self.live_now else "")}.get(kind, f"🧪 {kind}")
         acted = [a for a in results if a.get("ok")]
         rejected = [a for a in results if not a.get("ok")]
         msg = [icon + ("" if acted or rejected else "｜👀 觀望"), str(decision.get("view", "")).strip()[:2500]]
@@ -973,10 +1035,19 @@ class Advisor:
             why = self.check_entry(e, ref)
             if why:
                 return {**out, "ok": False, "result": why}
+            act = ("做多" if e["side"] == "long" else "做空") if code == FUT else "買進"
+            if self.live_now:  # 盤中即時決策：現價成交
+                try:
+                    p = b.open(e, ref, self.clock(), b.equity(self.closes), intraday=True)
+                except ValueError as exc:
+                    return {**out, "ok": False, "result": str(exc)}
+                return {**out, "ok": True, "result": "現價進場",
+                        "msg": f"✅ {name}：現價 {fmt(ref)} {act} {qty_text(code, p['qty'])}{p['note']}\n"
+                               f"停損 {fmt(p['stop'])}（{abs(ref - p['stop']) / ref * 100:.1f}%），目標 {fmt(p.get('tp'))}，"
+                               f"打到停損約虧 {b.risk_at_stop(p):,.0f} 元\n理由：{e['reason']}"}
             qty, note = b.size(code, e["side"], ref, e["stop"], e["risk_pct"], b.equity(self.closes))
             b.pending.append({"type": "open", **e, "ref": ref, "created": self.clock()})
             b.save()
-            act = ("做多" if e["side"] == "long" else "做空") if code == FUT else "買進"
             loss = b.equity(self.closes) * e["risk_pct"] / 100
             return {**out, "ok": True, "result": "等開盤",
                     "msg": f"🛒 {name}：下個開盤{act}（參考 {fmt(ref)}，跳空超過 {self.cfg['max_gap_pct']:g}% 不追），"
@@ -985,7 +1056,12 @@ class Advisor:
         if kind == "close":
             if code not in b.positions:
                 return {**out, "ok": False, "result": "沒有這檔持倉"}
-            b.pending = [p for p in b.pending if p["code"] != code] + [{"type": "close", "code": code, "name": e["name"],
+            if self.live_now and self.closes.get(code):
+                row = b.close(code, self.closes[code], "建議出場（盤中現價）", self.clock())
+                return {**out, "ok": True, "result": "現價出場",
+                        "msg": f"📤 {name}：現價 {fmt(row['exit'])} 出場，{fmt(row['entry'])} → {fmt(row['exit'])}，"
+                               f"損益 {row['pnl']:+,} 元（{row['r']:+.2f}R）\n理由：{e['reason']}"}
+            b.pending =[p for p in b.pending if p["code"] != code] + [{"type": "close", "code": code, "name": e["name"],
                                                                         "reason": e["reason"], "created": self.clock()}]
             b.save()
             return {**out, "ok": True, "result": "等開盤出場",
@@ -1225,15 +1301,86 @@ class Advisor:
             self.set_flag("post", today)
             self.decide("盤後")
 
+    HELP = ("指令：\n/now　用現在的行情判斷一次（盤中會用即時報價，建議以現價成交）\n"
+            "/now 2330 2454　特別問這幾檔\n/tw　建議追蹤的持倉、條件單、戰績\n/help　這份說明")
+
+    def handle(self, text: str) -> None:
+        parts = text.strip().split()
+        if not parts:
+            return
+        cmd = parts[0].split("@")[0].lower()
+        if cmd in ("/now", "/n"):
+            wait = self.cfg["now_cooldown_seconds"] - (self.clock() - self.last_now)
+            if wait > 0:
+                self.notify(f"⏳ 上一次即時判斷才剛做完或還在跑，{wait / 60:.0f} 分鐘後再叫")
+                return
+            focus = []
+            for a in parts[1:]:
+                a = a.upper()
+                if a in ("TX", "台指期", "台指"):
+                    focus.append(FUT)
+                elif re.fullmatch(r"\d{4,6}[A-Z]?", a):
+                    focus.append(a)
+            self.last_now = self.clock()
+            self.notify("🔎 收到，AI 判斷中（約 3–8 分鐘）" + (f"，特別看 {' '.join(focus)}" if focus else ""))
+            self.decide("即時", focus[:8])
+            self.last_now = self.clock()
+        elif cmd in ("/tw", "/status"):
+            self.notify(self.status())
+        elif cmd in ("/help", "/start"):
+            self.notify(self.HELP)
+
+    def status(self) -> str:
+        b = self.book
+        lines = [self.summary(), "", self.positions_text()]
+        if b.plans:
+            lines += ["", "條件單："] + [self.plan_text(p) for p in b.plans]
+        return "\n".join(lines)
+
     def run(self) -> None:
         self.notify("📈 台股 AI 建議啟動：盤前 " + self.cfg["premarket"] + "、盤後 " + self.cfg["postmarket"]
-                    + "，盤中只在進場、出場、條件單觸發時通知\n" + self.summary())
+                    + "，盤中只在進場、出場、條件單觸發時通知"
+                    + ("\n隨時傳 /now 叫 AI 判斷一次（/help 看指令）" if self.commands else "") + "\n" + self.summary())
         while True:
             try:
                 self.step()
             except Exception as exc:
                 log.exception("step failed: %s", exc)
-            time.sleep(60)
+            if not self.commands:
+                time.sleep(60)
+                continue
+            try:
+                for text in self.commands.poll(50):  # long poll：有指令就馬上回來，沒有最多等 50 秒
+                    self.handle(text)
+            except Exception as exc:
+                log.warning("commands: %s", exc)
+                time.sleep(30)
+
+
+class Commands:
+    """台股專用機器人的指令（getUpdates）。只能用在台股自己的機器人：主機器人的訊息歸管家讀。
+    只接受設定的那個聊天室，其他人傳的都忽略。"""
+
+    def __init__(self, token: str, chat_id: str, fetch=_get):
+        self.url = f"https://api.telegram.org/bot{token}/getUpdates"
+        self.chat_id, self.fetch = str(chat_id), fetch
+        self.offset = None
+
+    def _updates(self, timeout: int, offset) -> list[dict]:
+        q = f"?timeout={timeout}" + (f"&offset={offset}" if offset is not None else "")
+        return json.loads(self.fetch(self.url + q, timeout=timeout + 15)).get("result", [])
+
+    def poll(self, timeout: int = 50) -> list[str]:
+        if self.offset is None:  # 啟動前就在排隊的舊指令不執行
+            old = self._updates(0, -1)
+            self.offset = old[-1]["update_id"] + 1 if old else 0
+        out = []
+        for u in self._updates(timeout, self.offset):
+            self.offset = u["update_id"] + 1
+            m = u.get("message") or {}
+            if str((m.get("chat") or {}).get("id")) == self.chat_id and m.get("text"):
+                out.append(m["text"])
+        return out
 
 
 def status_text(cfg: dict) -> str:
@@ -1309,6 +1456,9 @@ def main(cfg: dict, repo_dir: str, once: bool = False, scan: bool = False, chat:
     tg_token, chat_id = telegram_target()
     notify = Telegram(tg_token, chat_id, prefix="[台股AI] ") if tg_token and chat_id else None
     adv = Advisor(cfg, data, ai, notify)
+    own = os.getenv("TWSTOCK_TELEGRAM_BOT_TOKEN")
+    if own and chat_id:  # 只聽台股自己的機器人，絕不搶管家（主機器人）的訊息
+        adv.commands = Commands(own, chat_id)
     if once:
         adv.decide("手動測試")
         print(adv.journal.read_text(encoding="utf-8").splitlines()[-1])

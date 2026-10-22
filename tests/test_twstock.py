@@ -342,5 +342,63 @@ def test_telegram_target_prefers_own_bot(monkeypatch):
     assert telegram_target() == ("tw", "-100")
 
 
+def test_now_during_session_fills_at_live_price(env):
+    adv, data, clock, msgs = env
+    clock.t = ts(2026, 10, 22, 10, 30)
+    live = data.bars["2330"][-1]["c"]  # 111.8 last close; the live price differs
+    data.q = {"2330": {**q(112, 116, 111.5, 115), "v": 30_000.0}, "2317": {**q(124, 125, 123, 124), "v": 1.0},
+              "t00": q(40000, 40500, 39900, 40400)}
+    data.q["t00"]["y"] = 40000.0
+    data.q["2330"]["y"] = live
+    adv.ai = FakeAI({"view": "盤中轉強", "actions": [{"type": "open", "code": "2330", "side": "long", "stop": 109,
+                                                     "take_profit": 130, "risk_pct": 1, "reason": "帶量突破"}]})
+    adv.handle("/now@twbot 2330")
+    prompt = adv.ai.prompts[0]
+    assert "盤中即時" in prompt and "使用者特別想問：2330 台積電" in prompt and "2330 台積電|115|" in prompt
+    p = adv.book.positions["2330"]
+    assert p["entry"] == 115 and p["intraday"] and not adv.book.pending
+    assert "⚡ 即時（盤中）" in msgs[-1] and "現價 115 買進" in msgs[-1]
+    assert not adv.live_now
+    # a second /now right away is refused
+    adv.handle("/now")
+    assert "分鐘後再叫" in msgs[-1] and len(adv.ai.prompts) == 1
+
+
+def test_now_after_close_waits_for_next_open(env):
+    adv, data, clock, msgs = env
+    clock.t = ts(2026, 10, 22, 20, 0)
+    adv.ai = FakeAI({"view": "x", "actions": [{"type": "open", "code": "2330", "side": "long", "stop": 105,
+                                               "risk_pct": 1}]})
+    adv.handle("/now")
+    assert "盤中即時" not in adv.ai.prompts[0] and "下一個開盤" in adv.ai.prompts[0]
+    assert adv.book.pending and not adv.book.positions
+
+
+def test_status_and_help(env):
+    adv, data, clock, msgs = env
+    adv.handle("/tw")
+    assert "建議追蹤" in msgs[-1]
+    adv.handle("/help")
+    assert "/now" in msgs[-1]
+    adv.handle("隨便聊天")
+    assert len(msgs) == 2
+
+
+def test_commands_only_from_own_chat_and_skip_backlog():
+    from cryptobot.twstock import Commands
+    calls = []
+
+    def fetch(url, timeout=None):
+        calls.append(url)
+        if "offset=-1" in url:
+            return json.dumps({"result": [{"update_id": 7, "message": {"chat": {"id": -100}, "text": "/now"}}]}).encode()
+        return json.dumps({"result": [
+            {"update_id": 8, "message": {"chat": {"id": -100}, "text": "/now 2330"}},
+            {"update_id": 9, "message": {"chat": {"id": 555}, "text": "/now"}}]}).encode()
+    c = Commands("tok", "-100", fetch)
+    assert c.poll(1) == ["/now 2330"]  # the queued /now from before the start is skipped
+    assert "offset=8" in calls[1] and c.offset == 10
+
+
 def test_settings_override():
     assert settings({"twstock": {"capital": 300000}})["capital"] == 300000
