@@ -97,9 +97,9 @@
 
 個股最近 10 個交易日每天的外資、投信、自營商買賣超和融資融券餘額，用 Read 讀：
 
-    /var/lib/cryptobot-ai/work/twstock/chips.json
+    /var/lib/cryptobot-ai/work/twstock/chips/2330.json
 
-（JSON，以股票代號為 key；檔案很大，用 Read 的 offset/limit 或先搜尋代號，不要整個讀進來。）
+（每檔一個檔案，檔名是代號。）
 
 # 回覆格式
 

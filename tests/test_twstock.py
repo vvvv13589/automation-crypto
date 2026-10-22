@@ -348,8 +348,8 @@ def test_decide_end_to_end(env, tmp_path):
                  "台積電ADR", "2330 台積電|半導體", "台積電法說會", "投信連買"):
         assert part in prompt, part
     assert "🌆 盤後" in msgs[-1] and "🛒" in msgs[-1] and "⛔" in msgs[-1] and "等待" in msgs[-1]
-    detail = json.loads((tmp_path / "work" / "chips.json").read_text(encoding="utf-8"))
-    assert detail["2330"]["days"][-1]["外資張"] == 2000
+    detail = json.loads((tmp_path / "work" / "chips" / "2330.json").read_text(encoding="utf-8"))
+    assert detail["days"][-1]["外資張"] == 2000 and detail["name"] == "台積電"
     row = json.loads(adv.journal.read_text(encoding="utf-8").splitlines()[-1])
     assert row["trigger"] == "盤後" and row["actions"][0]["ok"]
 
@@ -469,6 +469,19 @@ def test_questions(env):
     assert "問題寫在" in msgs[-1]
     adv.handle("/new")
     assert adv.chat.session_id is None and not adv.book.positions
+
+
+def test_question_builds_missing_scan_first(env):
+    adv, data, clock, msgs = env
+    adv.chat = FakeChat()
+    assert not adv.scan_fresh()
+    adv.handle("記憶體股怎麼看")
+    scan = (adv.work_dir / "last_scan.txt").read_text(encoding="utf-8")
+    assert "資料整理（不是決策）" in scan and "2330 台積電|半導體" in scan
+    assert (adv.work_dir / "chips" / "2317.json").exists() and adv.scan_fresh()
+    assert not adv.ai.prompts  # no AI decision, only data
+    clock.t = ts(2026, 10, 22, 16, 0)  # a new trading day closed: stale again
+    assert not adv.scan_fresh()
 
 
 def test_long_answer_is_split(env):

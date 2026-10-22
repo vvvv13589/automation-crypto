@@ -1071,14 +1071,31 @@ class Advisor:
 """
 
     def write_work(self, g: dict) -> None:
+        """每檔一個小檔（work/twstock/chips/2330.json）：整包太大，AI 的 Read 一次讀不下。"""
         try:
-            self.work_dir.mkdir(parents=True, exist_ok=True)
-            f = self.work_dir / "chips.json"
-            f.write_text(json.dumps(g["detail"], ensure_ascii=False), encoding="utf-8")
-            self.work_dir.chmod(0o755)
-            f.chmod(0o644)
+            d = self.work_dir / "chips"
+            d.mkdir(parents=True, exist_ok=True)
+            for code, info in g["detail"].items():
+                f = d / f"{code}.json"
+                f.write_text(json.dumps({"code": code, **info}, ensure_ascii=False, indent=1), encoding="utf-8")
+                f.chmod(0o644)
+            for p in (self.work_dir, d):
+                p.chmod(0o755)
         except OSError as exc:
             log.warning("work dir: %s", exc)
+
+    def refresh_scan(self) -> None:
+        """不呼叫 AI，只把最新的掃描資料整理好給問答用。"""
+        g = self.gather()
+        self.write_work(g)
+        self.write_work_text("last_scan.txt", self.build_prompt(g, "資料整理（不是決策）"))
+        if g["days"]:
+            self.set_flag("scan_day", g["days"][-1])
+
+    def scan_fresh(self) -> bool:
+        if not (self.work_dir / "last_scan.txt").exists():
+            return False
+        return self.flags.get("scan_day") == self.data.last_days(self.now(), 1)[-1]
 
     def write_work_text(self, name: str, text: str) -> None:
         try:
@@ -1108,6 +1125,8 @@ class Advisor:
         self.write_work(g)
         prompt = self.build_prompt(g, kind, live, focus)
         self.write_work_text("last_scan.txt", prompt)  # 問答時 AI 讀這份
+        if g["days"]:
+            self.set_flag("scan_day", g["days"][-1])
         try:
             decision, meta = self.ai.decide(prompt)
         except Exception as exc:
@@ -1491,7 +1510,7 @@ class Advisor:
 這是問答，不是決策：用一般繁體中文回答，**不要輸出 JSON**，你的回答不會執行任何動作。使用者想讓你重新判斷、調整建議，請他傳 /now。
 可以用的資料：
 - 最近一次完整決策時的資料（掃描表、大盤籌碼、國際盤、新聞）：用 Read 讀 {work / 'last_scan.txt'}（很長，用 offset/limit 或先找你要的段落）
-- 個股最近 10 天法人、融資融券：{work / 'chips.json'}
+- 個股最近 10 天每天的外資、投信、自營商、融資融券：{work / 'chips'}/代號.json（例如 {work / 'chips' / '2330.json'}）
 - 即時報價、K 線：python3 /opt/cryptobot-ai/twmarket.py quote 2330 ／ klines 2330 --tf 1d --limit 120
 回答要具體、適合手機閱讀（短段落；Telegram 不顯示 Markdown，不要用 ** 粗體、# 標題或表格，小標題直接寫成一行文字）：有價位就給價位，說清楚依據；資料沒有的就說沒有，不要編數字。
 
@@ -1508,6 +1527,11 @@ class Advisor:
             self.notify("⚠️ 問答功能沒有啟動（需要台股專用機器人）")
             return
         self.notify("💬 想一下…")
+        if not self.scan_fresh():
+            try:
+                self.refresh_scan()
+            except Exception as exc:
+                log.warning("refresh scan: %s", exc)
         try:
             answer = self.chat.ask(self.ask_prompt(question[:2000]))
         except Exception as exc:
@@ -1564,6 +1588,11 @@ class Advisor:
         self.notify("📈 台股 AI 建議啟動：盤前 " + self.cfg["premarket"] + "、盤後 " + self.cfg["postmarket"]
                     + "，盤中只在進場、出場、條件單觸發時通知"
                     + ("\n隨時傳 /now 叫 AI 判斷一次，或直接打字問問題（/help 看指令）" if self.commands else "") + "\n" + self.summary())
+        if self.chat and not self.scan_fresh():
+            try:  # 問答一開始就有完整資料可讀
+                self.refresh_scan()
+            except Exception as exc:
+                log.warning("refresh scan: %s", exc)
         while True:
             try:
                 self.step()
