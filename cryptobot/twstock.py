@@ -628,10 +628,6 @@ def qty_text(code: str, qty: float) -> str:
 
 
 # -- the advisor ------------------------------------------------------------------------
-ACTION_NAMES = {"open": "進場", "close": "出場", "move_stop": "移動停損", "take_profit": "改目標",
-                "plan": "條件單", "cancel_plan": "取消條件單"}
-
-
 class TWStockAI(TraderAI):
     PROMPT = "twstock-prompt.md"
 
@@ -640,6 +636,42 @@ class TWStockAI(TraderAI):
         dest = self.tools_dir / "twmarket.py"
         shutil.copyfile(self.repo_dir / "deploy" / "ai" / "twmarket.py", dest)
         dest.chmod(0o644)
+
+
+class TWChat(TWStockAI):
+    """台股聊天室的問答：同一段對話接著問（--resume），超過 idle 沒問就開新對話。只回答、不執行任何動作。"""
+
+    def __init__(self, *a, idle_hours: float = 2, **kw):
+        super().__init__(*a, **kw)
+        self.idle = idle_hours * 3600
+
+    def command(self, prompt: str) -> list[str]:
+        cmd = super().command(prompt)
+        return cmd + ["--resume", self.session_id] if self.session_id else cmd
+
+    def ask(self, prompt: str) -> str:
+        note = ""
+        if self.session_id and self.clock() - self.last_at > self.idle:
+            self.session_id = None
+            note = f"🆕 超過 {self.idle / 3600:g} 小時沒問，開新對話\n\n"
+        resumed = self.session_id is not None
+        data = self._call(prompt)
+        if data.get("is_error") and resumed and "session" in str(data.get("result", "")).lower():
+            self.session_id = None
+            data = self._call(prompt)
+        self.last_at = self.clock()
+        if data.get("session_id"):
+            self.session_id = data["session_id"]
+        result = str(data.get("result") or "").strip()
+        if data.get("subtype") == "error_max_turns":
+            return note + (result or "⚠️ 查的步驟太多被中斷，問得更具體一點再試")
+        if data.get("is_error"):
+            return note + f"⚠️ AI 回覆失敗：{result[:300] or data.get('subtype')}"
+        return note + (result or "（AI 沒有回覆內容）")
+
+
+ACTION_NAMES = {"open": "進場", "close": "出場", "move_stop": "移動停損", "take_profit": "改目標",
+                "plan": "條件單", "cancel_plan": "取消條件單"}
 
 
 class Advisor:
@@ -660,6 +692,7 @@ class Advisor:
         self.live_now = False  # 盤中即時決策：open／close 以現價立即成交
         self.last_now = 0.0
         self.commands = None  # Commands：台股機器人的 /now、/tw
+        self.chat = None  # TWChat：問答
 
     def now(self) -> datetime:
         return datetime.fromtimestamp(self.clock(), TZ)
@@ -926,6 +959,15 @@ class Advisor:
         except OSError as exc:
             log.warning("work dir: %s", exc)
 
+    def write_work_text(self, name: str, text: str) -> None:
+        try:
+            self.work_dir.mkdir(parents=True, exist_ok=True)
+            f = self.work_dir / name
+            f.write_text(text, encoding="utf-8")
+            f.chmod(0o644)
+        except OSError as exc:
+            log.warning("work dir: %s", exc)
+
     # -- deciding --
     def decide(self, kind: str, focus: list[str] | None = None) -> None:
         try:
@@ -944,6 +986,7 @@ class Advisor:
             return
         self.write_work(g)
         prompt = self.build_prompt(g, kind, live, focus)
+        self.write_work_text("last_scan.txt", prompt)  # 問答時 AI 讀這份
         try:
             decision, meta = self.ai.decide(prompt)
         except Exception as exc:
@@ -965,7 +1008,7 @@ class Advisor:
         if decision.get("watch"):
             msg.append("等待：\n" + str(decision["watch"]).strip()[:1200])
         msg.append(self.summary())
-        self.notify("\n\n".join(m for m in msg if m))
+        self.say("\n\n".join(m for m in msg if m))
 
     def _journal(self, decision: dict, trigger: str, meta: dict) -> None:
         row = {"time": f"{self.now():%Y-%m-%d %H:%M}", "trigger": trigger, **decision,
@@ -1302,14 +1345,73 @@ class Advisor:
             self.decide("盤後")
 
     HELP = ("指令：\n/now　用現在的行情判斷一次（盤中會用即時報價，建議以現價成交）\n"
-            "/now 2330 2454　特別問這幾檔\n/tw　建議追蹤的持倉、條件單、戰績\n/help　這份說明")
+            "/now 2330 2454　特別問這幾檔\n/ask 問題　問 AI 任何台股問題（也可以直接打字，或回覆機器人的訊息）\n"
+            "/new　開新對話（忘掉前面問過的）\n/tw　建議追蹤的持倉、條件單、戰績\n/help　這份說明")
+
+    def say(self, text: str, limit: int = 3800) -> None:
+        """Telegram 一則最多 4096 字：太長就在換行處切成幾則。"""
+        while len(text) > limit:
+            cut = text.rfind("\n", 0, limit)
+            cut = cut if cut > limit // 2 else limit
+            self.notify(text[:cut])
+            text = text[cut:].lstrip("\n")
+        if text:
+            self.notify(text)
+
+    def ask_prompt(self, question: str) -> str:
+        last = {}
+        if self.journal.exists():
+            rows = self.journal.read_text(encoding="utf-8").splitlines()
+            last = json.loads(rows[-1]) if rows else {}
+        work = self.work_dir
+        return f"""使用者在台股聊天室問你（{self.now():%Y-%m-%d %H:%M} 台北時間{'，現在盤中' if self.in_session() else ''}）：
+{question}
+
+這是問答，不是決策：用一般繁體中文回答，**不要輸出 JSON**，你的回答不會執行任何動作。使用者想讓你重新判斷、調整建議，請他傳 /now。
+可以用的資料：
+- 最近一次完整決策時的資料（掃描表、大盤籌碼、國際盤、新聞）：用 Read 讀 {work / 'last_scan.txt'}（很長，用 offset/limit 或先找你要的段落）
+- 個股最近 10 天法人、融資融券：{work / 'chips.json'}
+- 即時報價、K 線：python3 /opt/cryptobot-ai/twmarket.py quote 2330 ／ klines 2330 --tf 1d --limit 120
+回答要具體、適合手機閱讀（短段落；Telegram 不顯示 Markdown，不要用 ** 粗體、# 標題或表格，小標題直接寫成一行文字）：有價位就給價位，說清楚依據；資料沒有的就說沒有，不要編數字。
+
+【建議追蹤現況】
+{self.status()}
+
+【最近一次決策】{last.get('time', '（還沒有）')} {last.get('trigger', '')}
+{str(last.get('view', ''))[:2500]}
+等待：{str(last.get('watch', '') or '（無）')[:800]}
+"""
+
+    def ask(self, question: str) -> None:
+        if not self.chat:
+            self.notify("⚠️ 問答功能沒有啟動（需要台股專用機器人）")
+            return
+        self.notify("💬 想一下…")
+        try:
+            answer = self.chat.ask(self.ask_prompt(question[:2000]))
+        except Exception as exc:
+            log.exception("ask failed")
+            answer = f"⚠️ AI 回覆失敗：{str(exc)[:200]}"
+        self.say(answer)
 
     def handle(self, text: str) -> None:
         parts = text.strip().split()
         if not parts:
             return
         cmd = parts[0].split("@")[0].lower()
-        if cmd in ("/now", "/n"):
+        if not cmd.startswith("/"):
+            self.ask(text.strip())
+        elif cmd in ("/ask", "/q"):
+            q = text.strip().split(None, 1)
+            if len(q) < 2:
+                self.notify("問題寫在 /ask 後面，例如：/ask 台積電現在可以買嗎")
+            else:
+                self.ask(q[1])
+        elif cmd == "/new":
+            if self.chat:
+                self.chat.session_id = None
+            self.notify("🆕 已開新對話")
+        elif cmd in ("/now", "/n"):
             wait = self.cfg["now_cooldown_seconds"] - (self.clock() - self.last_now)
             if wait > 0:
                 self.notify(f"⏳ 上一次即時判斷才剛做完或還在跑，{wait / 60:.0f} 分鐘後再叫")
@@ -1340,7 +1442,7 @@ class Advisor:
     def run(self) -> None:
         self.notify("📈 台股 AI 建議啟動：盤前 " + self.cfg["premarket"] + "、盤後 " + self.cfg["postmarket"]
                     + "，盤中只在進場、出場、條件單觸發時通知"
-                    + ("\n隨時傳 /now 叫 AI 判斷一次（/help 看指令）" if self.commands else "") + "\n" + self.summary())
+                    + ("\n隨時傳 /now 叫 AI 判斷一次，或直接打字問問題（/help 看指令）" if self.commands else "") + "\n" + self.summary())
         while True:
             try:
                 self.step()
@@ -1459,6 +1561,7 @@ def main(cfg: dict, repo_dir: str, once: bool = False, scan: bool = False, chat:
     own = os.getenv("TWSTOCK_TELEGRAM_BOT_TOKEN")
     if own and chat_id:  # 只聽台股自己的機器人，絕不搶管家（主機器人）的訊息
         adv.commands = Commands(own, chat_id)
+        adv.chat = TWChat(cfg, repo_dir, str(claude), token, c["model"], int(c["max_turns"]))
     if once:
         adv.decide("手動測試")
         print(adv.journal.read_text(encoding="utf-8").splitlines()[-1])

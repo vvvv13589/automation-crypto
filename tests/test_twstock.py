@@ -379,9 +379,65 @@ def test_status_and_help(env):
     adv.handle("/tw")
     assert "建議追蹤" in msgs[-1]
     adv.handle("/help")
-    assert "/now" in msgs[-1]
-    adv.handle("隨便聊天")
+    assert "/now" in msgs[-1] and "/ask" in msgs[-1]
+    adv.handle("/whatever")
     assert len(msgs) == 2
+
+
+class FakeChat:
+    def __init__(self, answer="台積電 2,380 有支撐"):
+        self.answer, self.prompts, self.session_id = answer, [], "s1"
+
+    def ask(self, prompt):
+        self.prompts.append(prompt)
+        return self.answer
+
+
+def test_questions(env):
+    adv, data, clock, msgs = env
+    adv.chat = FakeChat()
+    adv.ai = FakeAI({"view": "大盤偏弱", "watch": "2330：2,380 回測再買", "actions": []})
+    adv.decide("盤後")
+    adv.handle("台積電現在可以買嗎？")
+    p = adv.chat.prompts[-1]
+    assert "台積電現在可以買嗎？" in p and "不要輸出 JSON" in p and "大盤偏弱" in p and "2,380 回測再買" in p
+    assert "last_scan.txt" in p and (adv.work_dir / "last_scan.txt").exists()
+    assert msgs[-2] == "💬 想一下…" and msgs[-1] == "台積電 2,380 有支撐"
+    adv.handle("/ask@twbot 聯發科呢")
+    assert "聯發科呢" in adv.chat.prompts[-1]
+    adv.handle("/ask")
+    assert "問題寫在" in msgs[-1]
+    adv.handle("/new")
+    assert adv.chat.session_id is None and not adv.book.positions
+
+
+def test_long_answer_is_split(env):
+    adv, data, clock, msgs = env
+    adv.chat = FakeChat("\n".join(f"第 {i} 行" + "字" * 50 for i in range(200)))
+    adv.handle("講長一點")
+    parts = msgs[1:]
+    assert len(parts) >= 3 and all(len(m) <= 3800 for m in parts)
+    assert "".join(parts).count("第 199 行") == 1
+
+
+def test_chat_resumes_and_restarts_after_idle(tmp_path):
+    from cryptobot.twstock import TWChat
+    calls = []
+    clock = Clock(1000.0)
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+
+        class R:
+            returncode, stderr = 0, ""
+            stdout = json.dumps({"result": "ok", "session_id": f"s{len(calls)}"})
+        return R()
+    chat = TWChat({}, str(tmp_path), "claude", "tok", "opus", 10, user=None, run=run, clock=clock)
+    chat.ask("a")
+    chat.ask("b")
+    assert "--resume" not in calls[0] and calls[1][-2:] == ["--resume", "s1"]
+    clock.t += 3 * 3600
+    assert chat.ask("c").startswith("🆕") and "--resume" not in calls[2]
 
 
 def test_commands_only_from_own_chat_and_skip_backlog():
