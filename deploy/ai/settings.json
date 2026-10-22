@@ -3,6 +3,7 @@
     "defaultMode": "dontAsk",
     "allow": [
       "Bash(python3 /opt/cryptobot-ai/market.py *)",
+      "Bash(python3 /opt/cryptobot-ai/twmarket.py *)",
       "Read(//var/lib/cryptobot-ai/work/**)",
       "Read(//var/lib/cryptobot-ai/inbox/**)"
     ],
@@ -26,10 +27,18 @@
     "allowUnsandboxedCommands": false,
     "autoAllowBashIfSandboxed": false,
     "network": {
-      "allowedDomains": ["fapi.binance.com"]
+      "allowedDomains": [
+        "fapi.binance.com",
+        "query1.finance.yahoo.com",
+        "mis.twse.com.tw"
+      ]
     },
     "filesystem": {
-      "denyRead": ["/root", "/etc/cryptobot-butler", "/var/lib/cryptobot-ai/home"]
+      "denyRead": [
+        "/root",
+        "/etc/cryptobot-butler",
+        "/var/lib/cryptobot-ai/home"
+      ]
     }
   },
   "env": {

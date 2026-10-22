@@ -1,0 +1,25 @@
+# 台股 AI 建議：每個交易日盤前 08:30、盤後 16:30 由 Claude 判斷，推到 Telegram；只給建議、不下單。
+# 盤中每 5 分鐘檢查建議追蹤（虛擬帳）的進場、停損、目標和條件單。
+# 安裝：
+#   cp deploy/cryptobot-twstock.service /etc/systemd/system/ && systemctl daemon-reload
+#   systemctl enable --now cryptobot-twstock
+[Unit]
+Description=automation-crypto Taiwan stock AI advisor (suggestions only, no orders)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/automation-crypto
+ExecStart=/usr/bin/python3 -m cryptobot tw-stock
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/cryptobot-butler/claude.env
+Restart=on-failure
+RestartSec=60
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

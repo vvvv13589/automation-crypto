@@ -235,6 +235,9 @@ def main(argv=None) -> int:
     at.add_argument("--live", action="store_true", help="trade the AI sub-account for real (+ paper mirror)")
     at.add_argument("--check", action="store_true", help="read-only check of the AI sub-account key")
     at.add_argument("--live-test", metavar="COIN", help="smallest real round trip on COIN, then exit")
+    tws = sub.add_parser("tw-stock", help="Taiwan stock AI advisor: suggestions only, pre/post-market to Telegram")
+    tws.add_argument("--once", action="store_true", help="one decision now (pushed to Telegram), then exit")
+    tws.add_argument("--scan", action="store_true", help="print the data the AI would get, no AI call")
     live =sub.add_parser("live", help="REAL trading with real funds")
     live.add_argument("--confirm-live", action="store_true", help="required: I accept the risk")
 
@@ -280,6 +283,11 @@ def main(argv=None) -> int:
         from .aitrader import main as aitrader_main
         return aitrader_main(cfg, os.getcwd(), once=args.once, live=args.live, check=args.check,
                              test_coin=args.live_test)
+    if args.command == "tw-stock":
+        import os
+
+        from .twstock import main as twstock_main
+        return twstock_main(cfg, os.getcwd(), once=args.once, scan=args.scan)
     if args.command == "status":
         import os
 
