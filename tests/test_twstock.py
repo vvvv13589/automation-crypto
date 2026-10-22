@@ -467,7 +467,7 @@ def test_status_and_help(env):
     adv.handle("/tw")
     assert "建議追蹤" in msgs[-1]
     adv.handle("/help")
-    assert "/now" in msgs[-1] and "/ask" in msgs[-1]
+    assert "/now" in msgs[-1] and "/ask" not in msgs[-1] and "直接打字" in msgs[-1]
     adv.handle("/whatever")
     assert len(msgs) == 2
 
@@ -491,10 +491,11 @@ def test_questions(env):
     assert "台積電現在可以買嗎？" in p and "不要輸出 JSON" in p and "大盤偏弱" in p and "2,380 回測再買" in p
     assert "last_scan.txt" in p and (adv.work_dir / "last_scan.txt").exists()
     assert msgs[-2] == "💬 想一下…" and msgs[-1] == "台積電 2,380 有支撐"
-    adv.handle("/ask@twbot 聯發科呢")
+    adv.handle("聯發科呢")
     assert "聯發科呢" in adv.chat.prompts[-1]
-    adv.handle("/ask")
-    assert "問題寫在" in msgs[-1]
+    asked = len(adv.chat.prompts)
+    adv.handle("/ask 聯發科呢")  # removed: unknown commands are ignored
+    assert len(adv.chat.prompts) == asked
     adv.handle("/new")
     assert adv.chat.session_id is None and not adv.book.positions
 
@@ -566,7 +567,7 @@ def test_menu_matches_handled_commands(env):
         sent["url"], sent["body"] = url, json.loads(data)
         return b'{"ok": true}'
     assert set_menu("tok", fetch) and sent["url"].endswith("/bottok/setMyCommands")
-    assert [c["command"] for c in sent["body"]["commands"]] == ["now", "ask", "tw", "new", "help"]
+    assert [c["command"] for c in sent["body"]["commands"]] == ["now", "tw", "new", "help"]
     adv, data, clock, msgs = env
     for cmd, _ in MENU:  # every menu entry does something (none falls through silently)
         before = len(msgs)

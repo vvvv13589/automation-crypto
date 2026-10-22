@@ -1502,7 +1502,7 @@ class Advisor:
             self.decide("盤後")
 
     HELP = ("指令：\n/now　用現在的行情判斷一次（盤中會用即時報價，建議以現價成交）\n"
-            "/now 2330 2454　特別問這幾檔\n/ask 問題　問 AI 任何台股問題（也可以直接打字，或回覆機器人的訊息）\n"
+            "/now 2330 2454　特別問這幾檔\n直接打字　問 AI 任何台股問題\n"
             "/new　開新對話（忘掉前面問過的）\n/tw　建議追蹤的持倉、條件單、戰績\n/help　這份說明")
 
     def say(self, text: str, limit: int = 3800) -> None:
@@ -1563,12 +1563,6 @@ class Advisor:
         cmd = parts[0].split("@")[0].lower()
         if not cmd.startswith("/"):
             self.ask(text.strip())
-        elif cmd in ("/ask", "/q"):
-            q = text.strip().split(None, 1)
-            if len(q) < 2:
-                self.notify("問題寫在 /ask 後面，例如：/ask 台積電現在可以買嗎")
-            else:
-                self.ask(q[1])
         elif cmd == "/new":
             if self.chat:
                 self.chat.session_id = None
@@ -1679,7 +1673,6 @@ def telegram_target() -> tuple[str | None, str | None]:
 
 
 MENU = [("now", "AI 用現在的行情判斷一次（可加代號：/now 2330）"),
-        ("ask", "問 AI 台股問題（也可以直接打字）"),
         ("tw", "建議追蹤：持倉、條件單、戰績"),
         ("new", "開新對話"),
         ("help", "指令說明")]
