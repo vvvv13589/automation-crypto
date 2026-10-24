@@ -58,6 +58,8 @@ DEFAULTS = {
     "taker_fee": 0.0005,
     "slippage": 0.0003,
     "daily_report": "09:00",
+    "weekly_review": "Sun 10:00",  # the AI reviews the week's closed trades and rewrites its lessons; "" = off
+    "lessons_max": 10,
     "timezone": "Asia/Taipei",
 }
 STABLES = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDE", "USD1", "XUSD", "EUR"}
@@ -777,6 +779,11 @@ class TraderAI(ClaudeChat):
         data = self._call(prompt)
         return parse_decision(str(data.get("result") or "")), data
 
+    def review(self, prompt: str) -> tuple[dict, dict]:
+        """Weekly self-review: same sandbox and tools as a decision, a different JSON reply."""
+        data = self._call(prompt)
+        return parse_decision(str(data.get("result") or "")), data
+
 
 def parse_decision(text: str) -> dict:
     blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
@@ -825,6 +832,8 @@ class AITrader:
         self.plans: list[dict] = json.loads(self.plans_path.read_text()) if self.plans_path.exists() else []
         self.universe: list[str] = []
         self.plans_checked = clock()
+        self.lessons_path = state / "aitrader_lessons.json"
+        self.reviews_log = logs / "aitrader_reviews.jsonl"
 
     # -- conditional entries ("plans") ---------------------------------------------------
     # The AI's "wait for X, then enter" ideas, executed by code between decisions. A plan fires
@@ -1031,6 +1040,9 @@ class AITrader:
 【你最近的決策與交易】
 {self.history_text()}
 
+【你自己每週檢討寫下的教訓（參考，不是硬性規則；硬性限制只有上面那些）】
+{self.lessons_text()}
+
 【前 {len(universe)} 個 U 本位永續（加密前 {c['universe']} 大 + 成交額最大的 TradFi，依 24h 成交額）】
 {self.market.digest(universe)}
 
@@ -1172,6 +1184,121 @@ class AITrader:
             self.last_report_day = now.date()
             self.notify(self.report())
 
+    # -- weekly self-review --------------------------------------------------------
+    # Once a week the AI gets every trade it closed in the last 7 days with what the market did
+    # during and after it, and rewrites a short list of lessons. The lessons are shown in every
+    # later decision prompt; they never change the hard limits (Guard).
+    def lessons(self) -> dict:
+        try:
+            return json.loads(self.lessons_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"lessons": [], "updated": None}
+
+    def lessons_text(self) -> str:
+        d = self.lessons()
+        if not d.get("lessons"):
+            return "（還沒有，第一次每週檢討後才會有）"
+        return f"（{d.get('updated')} 檢討）\n" + "\n".join(f"{i}. {s}" for i, s in enumerate(d["lessons"], 1))
+
+    def excursions(self, t: dict) -> dict:
+        """What price did while the trade was open (best / worst, in R) and in the 24 h after it closed."""
+        sgn = 1 if t["side"] == "long" else -1
+        entry, exit_, qty = float(t["entry"]), float(t["exit"]), float(t["qty"])
+        r, pnl = float(t["r"] or 0), float(t["pnl"] or 0)
+        risk = abs(pnl / r) / qty if r and qty else 0.0  # price distance of 1R (initial stop)
+        ms = lambda s: int(datetime.strptime(s, "%Y-%m-%d %H:%M").replace(tzinfo=TW).timestamp() * 1000)
+        opened, closed = ms(t["opened"]), ms(t["closed"])
+        try:
+            bars = self.ex.fetch_ohlcv(f"{t['coin']}/USDT:USDT", "15m", since=opened, limit=1000)
+        except Exception as exc:
+            log.warning("review klines %s: %s", t["coin"], exc)
+            return {}
+        during = [b for b in bars if opened <= b[0] <= closed]
+        after = [b for b in bars if closed < b[0] <= closed + 86_400_000]
+        if not risk or not during:
+            return {}
+        fav = lambda b: (b[2] - entry) if sgn > 0 else (entry - b[3])  # high for a long, low for a short
+        adv = lambda b: (entry - b[3]) if sgn > 0 else (b[2] - entry)
+        out = {"best_R": round(max(fav(b) for b in during) / risk, 2),
+               "worst_R": round(-max(adv(b) for b in during) / risk, 2)}
+        if after:
+            beyond = max((b[2] - exit_) if sgn > 0 else (exit_ - b[3]) for b in after)
+            against = max((exit_ - b[3]) if sgn > 0 else (b[2] - exit_) for b in after)
+            out["after_24h_further_R"] = round(beyond / risk, 2)
+            out["after_24h_against_R"] = round(against / risk, 2)
+        return out
+
+    def review_prompt(self, trades: list[dict]) -> str:
+        c = self.cfg
+        rows = []
+        for t in trades:
+            ex = self.excursions(t)
+            rows.append(f"- {t['coin']} {t['side']} | 開 {t['opened']} → 平 {t['closed']} | 進 {t['entry']} 出 {t['exit']} | "
+                        f"{t['pnl']} U，{t['r']}R，出場：{t['why']} | 持倉中最好 {ex.get('best_R', '?')}R、最差 {ex.get('worst_R', '?')}R | "
+                        f"出場後 24h 再往有利方向 {ex.get('after_24h_further_R', '?')}R、往不利方向 {ex.get('after_24h_against_R', '?')}R\n"
+                        f"  開倉理由：{t['reason']}")
+        all_trades = self.trades(self.book)
+        wins = [float(t["r"]) for t in all_trades if float(t["pnl"]) > 0]
+        losses = [float(t["r"]) for t in all_trades if float(t["pnl"]) <= 0]
+        return f"""這不是交易決策，是【每週檢討】。現在時間 {tw(self.clock())}（台北時間）。
+
+【這 7 天平倉的 {len(trades)} 筆交易（{self.book.label}）】
+{chr(10).join(rows) or '（這週沒有平倉）'}
+
+【從開始到現在】共 {len(all_trades)} 筆，賺 {len(wins)} 筆（平均 {sum(wins) / len(wins) if wins else 0:+.2f}R），賠 {len(losses)} 筆（平均 {sum(losses) / len(losses) if losses else 0:+.2f}R）。
+
+【你目前的教訓】
+{self.lessons_text()}
+
+請做三件事：
+1. 找出這週做對和做錯的模式：哪種進場（突破追、回測接、條件單、試單）、哪種出場（停損、收緊停損、AI 平倉、止盈）賺或賠；出場後價格是否照原計畫走（太早出場）；停損是否被正常回檔掃掉。數字以上面的資料為準，可以用 market.py 查更多 K 線，但不要編造。
+2. 重寫教訓清單：最多 {c['lessons_max']} 條，每條一句具體可執行的做法，後面括號寫證據和樣本數（例如「突破追單等 1h 收盤確認再進（這週 5 筆 4 輸，確認後進場的 3 筆 2 贏）」）。樣本少於 3 筆的寫「待觀察」。舊教訓仍成立就保留，被新數據推翻就刪掉或改寫。教訓不能要求違反或放寬硬性限制。
+3. 用幾句話寫給使用者看的檢討摘要。
+
+最後一定要附上 ```json 區塊：
+{{"review": "給使用者看的摘要，繁體中文，段落之間空一行", "lessons": ["教訓 1（證據）", "教訓 2（證據）"]}}
+"""
+
+    def weekly_review(self) -> None:
+        now = self.clock()
+        week_ago = tw(now - 7 * 86400)
+        trades = [t for t in self.trades(self.book) if t["closed"] >= week_ago]
+        try:
+            d, meta = self.ai.review(self.review_prompt(trades))
+        except Exception as exc:
+            log.error("weekly review failed: %s", exc)
+            self.notify(f"⚠️ 這週的 AI 自我檢討失敗：{str(exc)[:200]}（下次決策照舊）")
+            return
+        lessons = [str(s).strip()[:300] for s in (d.get("lessons") or []) if str(s).strip()][: self.cfg["lessons_max"]]
+        if lessons:
+            self.lessons_path.write_text(json.dumps({"lessons": lessons, "updated": tw(now)}, ensure_ascii=False, indent=1),
+                                         encoding="utf-8")
+        with self.reviews_log.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"time": tw(now), "trades": len(trades), "review": d.get("review", ""), "lessons": lessons,
+                                "cost_usd": meta.get("total_cost_usd")}, ensure_ascii=False) + "\n")
+        body = str(d.get("review", "")).strip()[:2000]
+        listed = "\n".join(f"{i}. {s}" for i, s in enumerate(lessons, 1)) or "（沒有更新教訓，沿用舊的）"
+        self.notify(f"📝 AI 每週檢討（{len(trades)} 筆）\n\n{body}\n\n教訓：\n{listed}")
+
+    def maybe_review(self) -> None:
+        spec = self.cfg.get("weekly_review") or ""
+        if not spec:
+            return
+        day, at = spec.split()
+        tz = ZoneInfo(self.cfg["timezone"])
+        now = datetime.fromtimestamp(self.clock(), tz)
+        weekday = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"].index(day[:3].lower())
+        if now.weekday() != weekday or now.strftime("%H:%M") < at:
+            return
+        today = now.strftime("%Y-%m-%d")
+        if self.lessons().get("reviewed_day") == today or getattr(self, "_reviewed_day", None) == today:
+            return
+        self._reviewed_day = today
+        self.weekly_review()
+        d = self.lessons()
+        d["reviewed_day"] = today
+        self.lessons_path.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+
     # -- main loop ---------------------------------------------------------------
     def step(self) -> None:
         now = self.clock()
@@ -1195,6 +1322,7 @@ class AITrader:
             self.pending_urgent = []
             self.decide(trigger)
         self.maybe_report()
+        self.maybe_review()
 
     def run(self) -> None:
         prices = self.prices()

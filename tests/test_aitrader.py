@@ -317,6 +317,51 @@ def test_digest_lists_every_coin_and_the_flagged_ones(setup):
     assert len(rows) == 3 and "程式篩選出的訊號" in text
 
 
+def _trade_rows(book, rows):
+    import csv
+    with book.trades_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["coin", "side", "opened", "closed", "entry", "exit", "qty", "pnl", "r", "why", "reason"])
+        w.writeheader()
+        w.writerows(rows)
+
+
+def test_weekly_review_rewrites_lessons_shown_in_later_prompts(setup):
+    from datetime import datetime, timezone
+    t, ex, ai, clock, sent = setup
+    clock.t = datetime(2026, 9, 27, 2, 5, tzinfo=timezone.utc).timestamp()  # Sunday 10:05 Taipei
+    _trade_rows(t.book, [
+        {"coin": "SOL", "side": "long", "opened": "2026-09-25 10:00", "closed": "2026-09-25 14:00", "entry": "200",
+         "exit": "196", "qty": "1", "pnl": "-4", "r": "-1", "why": "停損", "reason": "突破追單"},
+        {"coin": "ETH", "side": "short", "opened": "2026-09-10 10:00", "closed": "2026-09-11 10:00", "entry": "4000",
+         "exit": "3900", "qty": "0.1", "pnl": "10", "r": "2", "why": "止盈", "reason": "old"}])
+    prompts = []
+    ai.review = lambda p: (prompts.append(p) or ({"review": "這週突破追單都輸。", "lessons": ["突破等 1h 收盤確認再進（1 筆，待觀察）"]},
+                                                 {"total_cost_usd": 0.2}))
+    t.maybe_review()
+    assert "SOL long" in prompts[0] and "old" not in prompts[0]  # only the last 7 days
+    assert "📝 AI 每週檢討（1 筆）" in sent[-1] and "突破等 1h 收盤確認" in sent[-1]
+    assert t.lessons()["lessons"] == ["突破等 1h 收盤確認再進（1 筆，待觀察）"]
+    assert "突破等 1h 收盤確認" in t.build_prompt([], {}, "test")
+    n = len(sent)
+    t.maybe_review()  # once a day
+    assert len(sent) == n
+    clock.t += 6 * 86400  # Saturday: not the review day
+    t.maybe_review()
+    assert len(sent) == n
+
+
+def test_excursions_during_and_after_a_trade(setup):
+    from datetime import datetime, timezone
+    t, ex, *_ = setup
+    ms = lambda h, m=0: int(datetime(2026, 9, 27, h - 8, m, tzinfo=timezone.utc).timestamp() * 1000)  # Taipei h:m
+    ex.fetch_ohlcv = lambda sym, tf, since=None, limit=100: [
+        [ms(10, 15), 100, 106, 99, 104, 1],   # while open: best +6, worst -1
+        [ms(13), 104, 110, 103, 108, 1]]      # after the close
+    trade = {"coin": "SOL", "side": "long", "opened": "2026-09-27 10:00", "closed": "2026-09-27 12:00",
+             "entry": "100", "exit": "104", "qty": "1", "pnl": "4", "r": "2"}  # 1R = 2
+    assert t.excursions(trade) == {"best_R": 3.0, "worst_R": -0.5, "after_24h_further_R": 3.0, "after_24h_against_R": 0.5}
+
+
 def add_tradfi(ex):
     for base, kind, px in (("XAU", "COMMODITY", 4000.0), ("NVDA", "EQUITY", 180.0), ("OPENAI", "PREMARKET", 50.0),
                            ("USDBRL", "FX", 5.0), ("TINY", "EQUITY", 10.0)):

@@ -36,6 +36,7 @@
     "filesystem": {
       "denyRead": [
         "/root",
+        "/home",
         "/etc/cryptobot-butler",
         "/var/lib/cryptobot-ai/home"
       ]
