@@ -41,6 +41,9 @@ DEFAULTS = {
     "max_turns": 25,
     "decide_minutes": 60,  # regular decision every hour
     "urgent_gap_minutes": 30,  # breaking news may trigger an extra decision, at most this often
+    "event_triggers": True,  # an open position first reaching +1R / +2R, or moving >= event_move_r in 15 min,
+    "event_gap_minutes": 15,  # wakes the AI for an extra decision (at most this often)
+    "event_move_r": 1.0,
     "news_minutes": 5,
     "universe": 50,
     "tradfi": 15,  # also scan the top TradFi perps (stocks, gold, oil...) by volume; 0 = crypto only
@@ -834,6 +837,9 @@ class AITrader:
         self.plans_checked = clock()
         self.lessons_path = state / "aitrader_lessons.json"
         self.reviews_log = logs / "aitrader_reviews.jsonl"
+        self.price_hist: dict[str, list[tuple[float, float]]] = {}  # coin -> recent (time, price), 15 min
+        self.move_alerted: dict[str, float] = {}
+        self.pending_events: list[str] = []
 
     # -- conditional entries ("plans") ---------------------------------------------------
     # The AI's "wait for X, then enter" ideas, executed by code between decisions. A plan fires
@@ -961,6 +967,39 @@ class AITrader:
             except Exception as exc:
                 log.warning("price %s: %s", c, exc)
         return out
+
+    def check_events(self) -> None:
+        """Position milestones the AI would want to act on between its hourly decisions: first time
+        at +1R / +2R (stop management), or a move of event_move_r (in R) within 15 minutes. Only
+        wakes the AI; what to do stays its decision."""
+        if not self.cfg["event_triggers"] or not self.book.positions:
+            self.price_hist.clear()
+            return
+        now, changed = self.clock(), False
+        prices = self.prices()
+        for coin, p in self.book.positions.items():
+            px = prices.get(coin)
+            risk = abs(p["entry"] - p.get("init_stop", p["stop"]))
+            if not px or not risk:
+                continue
+            sgn = 1 if p["side"] == "long" else -1
+            r = (px - p["entry"]) * sgn / risk
+            for level in (1, 2):
+                if r >= level and not p.get(f"hit_{level}R"):
+                    p[f"hit_{level}R"] = changed = True
+                    self.pending_events.append(f"{coin} 浮盈首次到 +{level}R（現價 {fmt(px)}，停損 {fmt(p['stop'])}，"
+                                               f"止盈 {fmt(p['tp']) if p.get('tp') else '無'}）")
+            hist = [(t, x) for t, x in self.price_hist.get(coin, []) if now - t <= 15 * 60] + [(now, px)]
+            self.price_hist[coin] = hist
+            move = (px - hist[0][1]) / risk
+            if abs(move) >= self.cfg["event_move_r"] and now - self.move_alerted.get(coin, 0) >= 3600:
+                self.move_alerted[coin] = now
+                self.pending_events.append(f"{coin} 15 分鐘內{'上漲' if move > 0 else '下跌'} {abs(move):.1f}R"
+                                           f"（{fmt(hist[0][1])} → {fmt(px)}，你的倉位是{'多' if sgn > 0 else '空'}單）")
+        for coin in [c for c in self.price_hist if c not in self.book.positions]:
+            del self.price_hist[coin]
+        if changed:
+            self.book.save()
 
     def check_exits(self) -> None:
         now = self.clock()
@@ -1313,13 +1352,19 @@ class AITrader:
             self.last_news = now
             if not first:
                 self.pending_urgent += self.news.urgent(new)
+        self.check_events()
         trigger = None
         if now - self.last_decision >= self.cfg["decide_minutes"] * 60:
             trigger = "定時檢查"
         elif self.pending_urgent and now - self.last_decision >= self.cfg["urgent_gap_minutes"] * 60:
             trigger = "突發新聞：" + " / ".join(i["title"] for i in self.pending_urgent[:5])
+        elif self.pending_events and now - self.last_decision >= self.cfg["event_gap_minutes"] * 60:
+            trigger = "持倉事件"
         if trigger:
-            self.pending_urgent = []
+            if self.pending_events:
+                events = " / ".join(self.pending_events[:5])
+                trigger = f"持倉事件：{events}" if trigger == "持倉事件" else f"{trigger}；持倉事件：{events}"
+            self.pending_urgent, self.pending_events = [], []
             self.decide(trigger)
         self.maybe_report()
         self.maybe_review()

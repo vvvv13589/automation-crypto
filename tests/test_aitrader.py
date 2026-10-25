@@ -350,6 +350,46 @@ def test_weekly_review_rewrites_lessons_shown_in_later_prompts(setup):
     assert len(sent) == n
 
 
+def test_position_milestones_wake_the_ai_once(setup):
+    t, ex, ai, clock, sent = setup
+    t.book.open("SOL", "long", 200, 1, 190, None, "x", clock.t)  # 1R = 10
+    t.last_decision = t.last_news = clock.t  # hourly decision not due, news already polled
+    clock.t += 20 * 60
+    ex.px["SOL"] = 211
+    ai.replies.append({"view": "考慮移停損", "actions": []})
+    t.step()
+    assert "持倉事件：SOL 浮盈首次到 +1R" in ai.prompts[-1]
+    assert t.book.positions["SOL"]["hit_1R"] and not t.book.positions["SOL"].get("hit_2R")
+    n = len(ai.prompts)
+    ex.px["SOL"] = 221
+    t.last_news = clock.t = clock.t + 5 * 60
+    t.step()  # +2R, but the last decision was only 5 minutes ago: waits
+    assert len(ai.prompts) == n
+    t.last_news = clock.t = clock.t + 11 * 60
+    ai.replies.append({"view": "", "actions": []})
+    t.step()
+    assert "SOL 浮盈首次到 +2R" in ai.prompts[-1] and "+1R" not in ai.prompts[-1].split("\n")[0]
+    n = len(ai.prompts)
+    t.last_news = clock.t = clock.t + 20 * 60
+    t.step()  # both levels already seen: nothing new
+    assert len(ai.prompts) == n
+
+
+def test_fast_move_against_a_position_wakes_the_ai(setup):
+    t, ex, ai, clock, sent = setup
+    t.cfg["event_move_r"] = 0.5
+    t.book.open("SOL", "long", 200, 1, 190, None, "x", clock.t)
+    t.last_decision, t.last_news = clock.t - 20 * 60, clock.t
+    t.step()  # first look at the price: nothing to compare with yet
+    assert not ai.prompts
+    clock.t += 5 * 60
+    t.last_news = clock.t
+    ex.px["SOL"] = 194
+    ai.replies.append({"view": "", "actions": []})
+    t.step()
+    assert "SOL 15 分鐘內下跌 0.6R" in ai.prompts[-1] and "多單" in ai.prompts[-1]
+
+
 def test_excursions_during_and_after_a_trade(setup):
     from datetime import datetime, timezone
     t, ex, *_ = setup
