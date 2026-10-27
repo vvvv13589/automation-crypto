@@ -42,8 +42,8 @@ CHOICE_SECONDS = 120  # suggested stop / take-profit levels to pick from
 
 HELP = """🤵 Telegram 管家指令
 📊 查看
-/status　帳戶總額、可用餘額、所有持倉（🤖 機器人／✋ 手動）、停損止盈、未實現損益
-/ai　AI 子帳戶：權益、持倉與停損、條件單、已平倉損益、最後一次決策
+/status　主帳戶（總額、可用、持倉🤖/✋、停損止盈、損益）＋ AI 子帳戶，一次看完
+/ai　只看 AI 子帳戶：權益、持倉與停損、條件單、已平倉損益、最後一次決策
 /ip　VM 對外 IP、幣安 API 是否接受連線、最近 24 小時有沒有 -2015 拒絕
 /scan　立刻跑一次回撤掃描（和每天 09:00 的一樣）
 /pnl　機器人與手動各自的已實現損益、勝率、盈虧比（最近 30 天；/pnl 7 看 7 天）
@@ -67,7 +67,7 @@ HELP = """🤵 Telegram 管家指令
 直接打字或傳 K 線截圖 → AI 分析（唯讀，不能下單或改任何東西）
 訊息裡貼新聞連結，管家會代為讀取網頁文字給 AI 參考（每則最多 2 個連結）"""
 
-COMMANDS = [("status", "帳戶與持倉"), ("ai", "AI 子帳戶持倉與條件單"), ("pnl", "機器人 vs 手動 已實現損益"), ("ip", "對外 IP 與 API 狀態"),
+COMMANDS = [("status", "主帳戶＋AI 子帳戶 總覽"), ("ai", "只看 AI 子帳戶持倉與條件單"), ("pnl", "機器人 vs 手動 已實現損益"), ("ip", "對外 IP 與 API 狀態"),
             ("scan", "回撤掃描"),
             ("stop", "掛／移動停損：/stop BTC 84000（不寫價格=建議）"),
             ("tp", "掛止盈：/tp BTC 80000 50%（不寫價格=建議）"),
@@ -482,7 +482,12 @@ class Butler:
             self.tg.send(f"⚠️ 讀不到帳戶{hint}：{str(exc)[:200]}")
             return
         tz = self.cfg.get("notify", {}).get("timezone", "Asia/Taipei")
-        self.tg.send(format_status(snap, self.service_state("cryptobot"), tz) + self.money_text(snap))
+        text = format_status(snap, self.service_state("cryptobot"), tz) + self.money_text(snap)
+        try:
+            text += "\n\n" + self.ai_text()
+        except Exception as exc:
+            log.warning("ai section in status: %s", exc)
+        self.tg.send(text)
 
     def maybe_daily_report(self) -> bool:
         """Daily account report at notify.daily_report (e.g. 09:00) while the trading bot is stopped
@@ -534,8 +539,8 @@ class Butler:
             log.warning("money split: %s", exc)
             return ""
 
-    def cmd_ai(self, _arg: str) -> None:
-        """The AI trader's sub-account (its own API key, read-only here)."""
+    def ai_text(self) -> str:
+        """The AI trader's sub-account view (its own API key, read-only here)."""
         from .aitrader import status_text
         equity = None
         try:
@@ -549,7 +554,10 @@ class Butler:
         def price(coin):
             with self.ex_lock:
                 return self.exchange.fetch_ticker(f"{coin}/USDT:USDT")["last"]
-        self.tg.send(status_text(self.cfg, price, equity))
+        return status_text(self.cfg, price, equity)
+
+    def cmd_ai(self, _arg: str) -> None:
+        self.tg.send(self.ai_text())
 
     def cmd_ip(self, _arg: str) -> None:
         from .runner import is_auth_error
