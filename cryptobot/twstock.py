@@ -1010,12 +1010,18 @@ class Advisor:
             px = self.closes.get(code, p["entry"])
             r = abs(p["entry"] - p["init_stop"]) * p["qty"] * b.mult(code)
             pnl = b.pnl(p, px)
-            out.append(f"{label(code, p.get('name', ''))} {'多' if p['side'] == 'long' else '空'} {qty_text(code, p['qty'])} "
-                       f"進場 {fmt(p['entry'])}（{tw(p['opened'])}）最近收盤 {fmt(px)} 停損 {fmt(p['stop'])} "
-                       f"目標 {fmt(p.get('tp'))} 未實現 {pnl:+,.0f} 元（{pnl / r if r else 0:+.2f}R） 理由：{p['reason']}")
+            head = "🟢" if p["side"] == "long" else "🔴"
+            out.append(f"{head} {label(code, p.get('name', ''))} {'多' if p['side'] == 'long' else '空'} "
+                       f"{qty_text(code, p['qty'])} 進場 {fmt(p['entry'])}（{tw(p['opened'])}）最近收盤 {fmt(px)}")
+            out.append(f"🎯 停損 {fmt(p['stop'])} 目標 {fmt(p.get('tp'))} "
+                       f"未實現 {pnl:+,.0f} 元（{pnl / r if r else 0:+.2f}R）")
+            out.append(f"💡 理由：{p['reason']}")
+            out.append("")
         for a in b.pending:
-            out.append(f"（等下一個開盤）{'進場' if a['type'] == 'open' else '出場'} {label(a['code'], a.get('name', ''))} "
+            out.append(f"⏳（等下一個開盤）{'進場' if a['type'] == 'open' else '出場'} {label(a['code'], a.get('name', ''))} "
                        f"{a.get('side', '')} 停損 {fmt(a.get('stop'))} 目標 {fmt(a.get('tp'))}")
+        while out and out[-1] == "":
+            out.pop()
         return "\n".join(out) or "（目前沒有持倉）"
 
     def history_text(self, n: int = 6) -> str:
