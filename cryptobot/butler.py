@@ -299,12 +299,16 @@ def format_status(snap: dict, bot_state: str = "", tz: str = "Asia/Taipei") -> s
         mode = {"cross": " 全倉", "isolated": " 逐倉"}.get(p.get("margin_mode") or "", "")
         lines.append(f"{'🤖' if p['owner'] == 'bot' else '✋'} {p['coin']} {side} {_px(p['amount'])}{lev}{mode}"
                      f" @ {_px(p['entry'])} → {_px(p['mark'])}  {p['unrealized']:+.2f} U")
-        lines.append(f"    停損 {_orders_line(p['orders'], 'stop')}｜止盈 {_orders_line(p['orders'], 'tp')}")
+        lines.append(f"🎯 停損 {_orders_line(p['orders'], 'stop')}｜止盈 {_orders_line(p['orders'], 'tp')}")
         if any(o["kind"] == "leftover" for o in p["orders"]):
-            lines.append(f"    ⚠️ 方向不對的殘單（不會成交，可在幣安取消）：{_orders_line(p['orders'], 'leftover')}")
+            lines.append(f"⚠️ 方向不對的殘單（不會成交，可在幣安取消）：{_orders_line(p['orders'], 'leftover')}")
         if not any(o["kind"] == "stop" for o in p["orders"]):
             missing.append(p["coin"])
+        lines.append("")
+    while lines and lines[-1] == "":
+        lines.pop()
     if missing:
+        lines.append("")
         lines.append(f"⚠️ 沒有停損單：{', '.join(missing)}")
     return "\n".join(lines)
 

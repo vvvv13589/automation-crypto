@@ -1037,9 +1037,15 @@ class AITrader:
             sgn = 1 if p["side"] == "long" else -1
             pnl = (px - p["entry"]) * p["qty"] * sgn
             r = abs(p["entry"] - p["init_stop"]) * p["qty"]
-            out.append(f"{c} {p['side']} 數量 {fmt(p['qty'])} 進場 {fmt(p['entry'])} 現價 {fmt(px)} 停損 {fmt(p['stop'])} "
-                       f"止盈 {fmt(p['tp']) if p['tp'] else '無'} 未實現 {pnl:+.2f} U（{pnl / r if r else 0:+.2f}R） "
-                       f"開倉 {tw(p['opened'])} 理由：{p['reason']}")
+            head = "🟢" if p["side"] == "long" else "🔴"
+            out.append(f"{head} {c} {'多' if p['side'] == 'long' else '空'} 數量 {fmt(p['qty'])} "
+                       f"進場 {fmt(p['entry'])}（{tw(p['opened'])}）現價 {fmt(px)}")
+            out.append(f"🎯 停損 {fmt(p['stop'])} 止盈 {fmt(p['tp']) if p['tp'] else '無'} "
+                       f"未實現 {pnl:+.2f} U（{pnl / r if r else 0:+.2f}R）")
+            out.append(f"💡 理由：{p['reason']}")
+            out.append("")
+        while out and out[-1] == "":
+            out.pop()
         return "\n".join(out)
 
     @staticmethod
