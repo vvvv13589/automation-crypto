@@ -9,10 +9,18 @@ Runs as the unprivileged AI user; it never sees an API key, so it can only read 
 """
 
 import argparse
+import glob
 import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
+
+# ccxt lives in a dedicated sandbox venv (the AI user's home is denyRead, so a
+# --user install is invisible here; /opt is readable). Version-agnostic glob so
+# the path survives a Python minor-version bump.
+for _sp in glob.glob("/opt/cryptobot-ai-venv/lib/python*/site-packages"):
+    if _sp not in sys.path:
+        sys.path.insert(0, _sp)
 
 import ccxt
 
