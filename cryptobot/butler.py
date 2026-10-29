@@ -43,6 +43,7 @@ CHOICE_SECONDS = 120  # suggested stop / take-profit levels to pick from
 HELP = """🤵 Telegram 管家指令
 📊 查看
 /status　主帳戶（總額、可用、持倉🤖/✋、停損止盈、損益）＋ AI 子帳戶、條件單、最後決策，一次看完
+/money（或 /錢）　所有帳戶加起來多少：合約、資金錢包、現貨、理財、AI 子帳戶、預測下注，和今天／7 天的變化
 /ipVM 對外 IP、幣安 API 是否接受連線、最近 24 小時有沒有 -2015 拒絕
 /scan　立刻跑一次回撤掃描（和每天 09:00 的一樣）
 /pnl　機器人與手動各自的已實現損益、勝率、盈虧比（最近 30 天；/pnl 7 看 7 天）
@@ -66,7 +67,7 @@ HELP = """🤵 Telegram 管家指令
 直接打字或傳 K 線截圖 → AI 分析（唯讀，不能下單或改任何東西）
 訊息裡貼新聞連結，管家會代為讀取網頁文字給 AI 參考（每則最多 2 個連結）"""
 
-COMMANDS = [("status", "主帳戶＋AI 子帳戶 總覽"), ("pnl", "機器人 vs 手動 已實現損益"), ("ip", "對外 IP 與 API 狀態"),
+COMMANDS = [("status", "主帳戶＋AI 子帳戶 總覽"), ("money", "所有帳戶加起來的總資產"), ("pnl", "機器人 vs 手動 已實現損益"), ("ip", "對外 IP 與 API 狀態"),
             ("scan", "回撤掃描"),
             ("stop", "掛／移動停損：/stop BTC 84000（不寫價格=建議）"),
             ("tp", "掛止盈：/tp BTC 80000 50%（不寫價格=建議）"),
@@ -433,7 +434,7 @@ class Butler:
                        "/ip": self.cmd_ip, "/scan": self.cmd_scan, "/new": self.cmd_new, "/pnl": self.cmd_pnl,
                        "/stop": self.cmd_stop, "/tp": self.cmd_tp, "/close": self.cmd_close,
                        "/pause": self.cmd_pause, "/resume": self.cmd_resume,
-                       "/restart": self.cmd_restart}.get(cmd)
+                       "/restart": self.cmd_restart, "/money": self.cmd_money, "/錢": self.cmd_money}.get(cmd)
             if handler is None:
                 self.tg.send(f"不認得 {cmd}，輸入 /help 看可用指令")
                 return
@@ -513,6 +514,10 @@ class Butler:
             self._report_retry = now + 600
             return False
         text = format_status(snap, state, tz).replace("📊 即時狀態", "📊 每日報告", 1) + self.money_text(snap)
+        try:
+            text += "\n\n" + self.holdings_text(snap)
+        except Exception as exc:
+            log.warning("holdings in daily report: %s", exc)
         self.tg.send(text)
         self._save_state(report_day=day)
         self.audit("daily_report", day)
@@ -538,17 +543,41 @@ class Butler:
             log.warning("money split: %s", exc)
             return ""
 
-    def ai_text(self) -> str:
-        """The AI trader's sub-account view (its own API key, read-only here)."""
-        from .aitrader import status_text
-        equity = None
+    def cmd_money(self, _arg: str) -> None:
+        try:
+            snap = self.snapshot()
+        except Exception as exc:
+            self.tg.send(f"⚠️ 讀不到主帳戶：{str(exc)[:200]}")
+            return
+        self.tg.send(self.holdings_text(snap))
+
+    def holdings_text(self, snap: dict) -> str:
+        from zoneinfo import ZoneInfo
+
+        from .money import holdings, holdings_text, prediction_pnl, total_changes
+        ai = self.ai_equity()
+        with self.ex_lock:
+            rows = holdings(self.exchange, snap["equity"], ai, prediction_pnl(self.exchange))
+        tz = (self.cfg.get("notify") or {}).get("timezone", "Asia/Taipei")
+        day = datetime.fromtimestamp(self.clock(), ZoneInfo(tz)).strftime("%Y-%m-%d")
+        today, week = total_changes(self.cfg, day, sum(v for _, v in rows if v))
+        return holdings_text(rows, today, week)
+
+    def ai_equity(self) -> float | None:
+        """The AI trader's sub-account equity (its own API key, read-only here)."""
         try:
             env = dict(line.strip().split("=", 1) for line in open(AITRADER_ENV) if "=" in line)
             from .data import make_exchange
             ex = make_exchange(self.cfg, env["AITRADER_API_KEY"], env["AITRADER_API_SECRET"])
-            equity = float(ex.fetch_balance()["info"]["totalMarginBalance"])
+            return float(ex.fetch_balance()["info"]["totalMarginBalance"])
         except Exception as exc:
             log.warning("ai sub-account balance: %s", exc)
+            return None
+
+    def ai_text(self) -> str:
+        """The AI trader's sub-account view (its own API key, read-only here)."""
+        from .aitrader import status_text
+        equity = self.ai_equity()
 
         def price(coin):
             with self.ex_lock:

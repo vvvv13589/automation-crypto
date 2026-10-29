@@ -23,6 +23,8 @@ log = logging.getLogger(__name__)
 PREDICT = "https://api.binance.com/sapi/v1/w3w/wallet/prediction"
 INTO_SPOT = ("UMFUTURE_MAIN", "FUNDING_MAIN", "CMFUTURE_MAIN", "MARGIN_MAIN")
 OUT_OF_SPOT = ("MAIN_UMFUTURE", "MAIN_FUNDING", "MAIN_CMFUTURE", "MAIN_MARGIN")
+MAX_REBATE_RISE = 20.0  # an unexplained rise bigger than this is a transfer the history missed, not a rebate
+STABLES = ("USDT", "USDC", "FDUSD")
 
 
 def spot_flows(ex, since_ms: int) -> float:
@@ -59,7 +61,8 @@ def prediction_claims(ex, since_ms: int, get=None) -> float:
 def rebates(ex, cfg: dict, now_ms: int | None = None, spot=None, flows=None) -> float:
     """Total rebates received: every rise of the spot USDT balance that no transfer, deposit or
     withdrawal explains (the spot wallet is not traded). Running total in state/rebates.json; the
-    first run counts the spot USDT already there."""
+    first run counts the spot USDT already there. Rebates arrive in small amounts, so a rise above
+    MAX_REBATE_RISE is logged and skipped: only rises are added, one missed transfer would stay forever."""
     now_ms = now_ms or int(time.time() * 1000)
     path = Path(cfg.get("state_dir", "state")) / "rebates.json"
     if spot is None:
@@ -71,12 +74,67 @@ def rebates(ex, cfg: dict, now_ms: int | None = None, spot=None, flows=None) -> 
     else:
         out = spot_flows(ex, st["since"]) if flows is None else flows
         rise = spot - st["spot"] + out
-        if rise > 0.001:
+        if rise > MAX_REBATE_RISE:
+            log.warning("rebates: spot rose %.2f U with no matching transfer, not counted as a rebate", rise)
+        elif rise > 0.001:
             st["total"] += rise
     st.update(spot=spot, since=now_ms)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(st))
     return st["total"]
+
+
+def holdings(ex, futures: float, ai: float | None, predict: dict | None) -> list[tuple[str, float | None]]:
+    """Every place the money sits, in U: (label, amount; None when it could not be read).
+    Wallets count stablecoins only; prediction bets count at their current price."""
+    def stables(rows, asset="asset", *amounts):
+        return sum(float(r.get(a) or 0) for r in rows if r.get(asset) in STABLES for a in amounts)
+
+    out: list[tuple[str, float | None]] = [("主帳戶·合約", futures)]
+    for label, read in [
+        ("主帳戶·資金錢包", lambda: stables(ex.sapiPostAssetGetFundingAsset({}), "asset", "free", "locked", "freeze")),
+        ("主帳戶·現貨", lambda: stables(ex.privateGetAccount()["balances"], "asset", "free", "locked")),
+        ("主帳戶·理財", lambda: stables(ex.sapiGetSimpleEarnFlexiblePosition({"size": 100}).get("rows") or [], "asset", "totalAmount")
+         + stables(ex.sapiGetSimpleEarnLockedPosition({"size": 100}).get("rows") or [], "asset", "amount")),
+    ]:
+        try:
+            out.append((label, read()))
+        except Exception as exc:
+            log.warning("holdings %s: %s", label, exc)
+            out.append((label, None))
+    out.append(("AI 子帳戶", ai))
+    out.append(("預測下注（持倉市值）", None if predict is None else predict["open_cost"] + predict["unrealized"]))
+    return out
+
+
+def total_changes(cfg: dict, day: str, total: float, days: int = 14) -> tuple[float | None, float | None]:
+    """(change since the day's first reading, change over 7 days). The first reading of each day is
+    kept in state/money_total.json; deposits and withdrawals show up as changes too."""
+    from datetime import date, timedelta
+    path = Path(cfg.get("state_dir", "state")) / "money_total.json"
+    seen = json.loads(path.read_text()) if path.exists() else {}
+    seen.setdefault(day, total)
+    oldest = (date.fromisoformat(day) - timedelta(days=days)).isoformat()
+    seen = {d: v for d, v in seen.items() if d >= oldest}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(seen))
+    week_ago = (date.fromisoformat(day) - timedelta(days=7)).isoformat()
+    past = [d for d in seen if d <= week_ago]
+    return total - seen[day], (total - seen[max(past)]) if past else None
+
+
+def holdings_text(rows: list[tuple[str, float | None]], today: float | None, week: float | None) -> str:
+    total = sum(v for _, v in rows if v)
+    lines = [f"💰 全部資產 {total:.2f} U"]
+    if today is not None:
+        lines[0] += f"（今天 {today:+.2f}" + (f"、7 天 {week:+.2f}" if week is not None else "") + "）"
+    for label, v in rows:
+        if v is None:
+            lines.append(f"  • {label}：讀取失敗，未計入")
+        elif abs(v) >= 0.01:
+            lines.append(f"  • {label}：{v:.2f} U")
+    lines.append("  （只算穩定幣；轉入轉出幣安也會算進漲跌）")
+    return "\n".join(lines)
 
 
 def transfers_after_base(income: list[dict], base: float) -> float:

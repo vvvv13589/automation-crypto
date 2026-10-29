@@ -47,6 +47,40 @@ def test_rebates_count_unexplained_rises_of_the_spot_wallet(tmp_path):
     assert rebates(None, cfg, now_ms=3, spot=0.14, flows=10.0) == 10.14  # moved 10 to futures: not income
     assert rebates(None, cfg, now_ms=4, spot=50.14, flows=-50.0) == 10.14  # a deposit: not income
     assert rebates(None, cfg, now_ms=5, spot=0.0, flows=50.0 - 0.14) == 10.14  # spent / moved: never negative
+    assert rebates(None, cfg, now_ms=6, spot=100.0, flows=0.0) == 10.14  # 100 U with no transfer found: skipped
+    assert round(rebates(None, cfg, now_ms=7, spot=100.91, flows=0.0), 2) == 11.05  # but later small rebates still count
+
+
+class FakeWallets:
+    def sapiPostAssetGetFundingAsset(self, _p):
+        return [{"asset": "USDT", "free": "200", "locked": "0", "freeze": "0"}, {"asset": "BTTC", "free": "59.9"}]
+
+    def privateGetAccount(self):
+        return {"balances": [{"asset": "USDT", "free": "1.5", "locked": "0"}]}
+
+    def sapiGetSimpleEarnFlexiblePosition(self, _p):
+        raise RuntimeError("no permission")
+
+    def sapiGetSimpleEarnLockedPosition(self, _p):
+        return {"rows": []}
+
+
+def test_holdings_add_every_wallet_and_flag_unreadable_ones():
+    from cryptobot.money import holdings, holdings_text
+    rows = holdings(FakeWallets(), 157.44, 96.87, {"open_cost": 10.0, "unrealized": 1.72})
+    assert dict(rows) == {"主帳戶·合約": 157.44, "主帳戶·資金錢包": 200.0, "主帳戶·現貨": 1.5, "主帳戶·理財": None,
+                          "AI 子帳戶": 96.87, "預測下注（持倉市值）": 11.72}
+    text = holdings_text(rows, today=3.0, week=None)
+    assert text.startswith("💰 全部資產 467.53 U（今天 +3.00）")
+    assert "主帳戶·理財：讀取失敗，未計入" in text
+
+
+def test_total_changes_keep_the_first_reading_of_each_day(tmp_path):
+    from cryptobot.money import total_changes
+    cfg = {"state_dir": str(tmp_path)}
+    assert total_changes(cfg, "2026-10-22", 400.0) == (0.0, None)
+    assert total_changes(cfg, "2026-10-29", 460.0) == (0.0, 60.0)
+    assert total_changes(cfg, "2026-10-29", 466.0) == (6.0, 66.0)
 
 
 def test_rebate_line(tmp_path):
