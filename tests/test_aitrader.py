@@ -440,17 +440,17 @@ def test_market_sessions():
     assert session("COMMODITY", at(2026, 10, 25, 22, 30))[0]  # Sunday 18:30 New York
 
 
-def test_guard_blocks_stocks_outside_or_near_the_end_of_their_session(setup):
+def test_guard_leaves_market_hours_to_the_ai(setup):
     t, *_ = setup
     a = {"coin": "SOL", "side": "long", "stop": 190}
-    closed = Guard(t.cfg, session=lambda c: (False, 0.0, "美股·休市"))
-    ok, msg, _ = closed.check_open(a, t.book, 200, {}, ["SOL"])
-    assert not ok and "休市" in msg
-    late = Guard(t.cfg, session=lambda c: (True, 10.0, "美股·開盤"))
-    ok, msg, _ = late.check_open(a, t.book, 200, {}, ["SOL"])
-    assert not ok and "收盤" in msg
-    ok, _, _ = Guard(t.cfg, session=lambda c: (True, 120.0, "美股·開盤")).check_open(a, t.book, 200, {}, ["SOL"])
+    ok, _, _ = Guard(t.cfg).check_open(a, t.book, 200, {}, ["SOL"])
     assert ok
+    t.market.session = lambda c: (True, 45.0, "美股·開盤")
+    assert t.market.session_tag("NVDA") == "美股·開盤，45 分鐘後收盤"
+    t.market.session = lambda c: (True, 300.0, "美股·開盤")
+    assert t.market.session_tag("NVDA") == "美股·開盤"
+    t.market.session = lambda c: (False, 0.0, "美股·休市")
+    assert t.market.session_tag("NVDA") == "美股·休市"
 
 
 def test_digest_has_a_tradfi_section_with_the_session(setup):

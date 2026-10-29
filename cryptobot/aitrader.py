@@ -48,7 +48,6 @@ DEFAULTS = {
     "universe": 50,
     "tradfi": 15,  # also scan the top TradFi perps (stocks, gold, oil...) by volume; 0 = crypto only
     "tradfi_min_volume": 50e6,  # 24 h quote volume, USDT
-    "session_buffer_minutes": 30,  # no new stock positions this close to (or after) the home market's close
     "max_positions": 4,
     "max_risk_pct": 5.0,  # loss at the stop, % of equity, per trade
     "max_leverage": 5.0,  # total open notional / equity
@@ -232,6 +231,11 @@ class Market:
         self.kinds = {b: k for _, b, k in rows}
         return [b for _, b, _ in rows]
 
+    def session_tag(self, coin: str) -> str:
+        """Session label for the scan; warns when the home market closes within 2 h."""
+        is_open, left, label = self.session(coin)
+        return f"{label}，{left:.0f} 分鐘後收盤" if is_open and left < 120 else label
+
     def session(self, coin: str) -> tuple[bool, float, str]:
         kind = self.kinds.get(coin)
         if kind is None:  # not scanned yet (e.g. a plan right after a restart): ask the market list
@@ -304,7 +308,7 @@ class Market:
         if trad:
             lines.append("\n【傳統市場 TradFi 永續（股票、ETF、黃金、原油；〔〕是本地市場現在的狀態，"
                          "休市時價格只在盤後薄量漂移、開盤可能跳空；7d相對BTC 對它們參考意義不大）】")
-            lines += [scan_line(f"{c}〔{self.session(c)[2]}〕", s) for c, s in trad]
+            lines += [scan_line(f"{c}〔{self.session_tag(c)}〕", s) for c, s in trad]
         # trend alignment alone is common (most coins drift with BTC): list coins with an actual event
         flagged = sorted((r for r in rows if any(not f.startswith("日線與") for f in r[1]["flags"])),
                          key=lambda r: -len(r[1]["flags"]))
@@ -685,21 +689,14 @@ class LiveBook(Book):
 class Guard:
     """Hard limits the AI cannot override. Returns (ok, message, normalised action)."""
 
-    def __init__(self, cfg: dict, session=None):
+    def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.session = session  # coin -> (open, minutes to close, label); None = always open
 
     def check_open(self, a: dict, book: Book, price: float, prices: dict, universe: list[str]):
         c = self.cfg
         coin, side = str(a.get("coin", "")).upper(), a.get("side")
         if coin not in universe:
             return False, f"{coin} 不在前 {c['universe']} 大", None
-        if self.session:
-            is_open, left, label = self.session(coin)
-            if not is_open:
-                return False, f"{coin} 本地市場休市（{label}），不開新倉（開盤跳空風險）", None
-            if left < c["session_buffer_minutes"]:
-                return False, f"{coin} 離收盤只剩 {left:.0f} 分鐘，不開新倉（隔夜跳空風險）", None
         if coin in book.positions:
             return False, f"{coin} 已有倉位（不加倉）", None
         if len(book.positions) >= c["max_positions"]:
@@ -824,7 +821,7 @@ class AITrader:
         self.book = self.books[0]
         self.news = News(state / "aitrader_news.json", fetch=fetch, clock=clock)
         self.journal = logs / "aitrader_decisions.jsonl"
-        self.guard = Guard(self.cfg, session=self.market.session)
+        self.guard = Guard(self.cfg)
         self.last_decision = self.last_news = 0.0
         tz = ZoneInfo(self.cfg["timezone"])
         today = datetime.fromtimestamp(clock(), tz)
@@ -1074,7 +1071,7 @@ class AITrader:
         return f"""現在時間 {tw(self.clock())}（台北時間 UTC+8，下面所有時間都是台北時間）。觸發原因：{trigger}
 
 【帳戶（{b.label}）】權益 {eq:.2f} U（起始 {b.starting_cash:g} U，目標 {b.starting_cash * c['target_multiple']:g} U），已用槓桿 {b.notional(prices) / eq if eq else 0:.2f} 倍
-【硬性限制（程式強制，違反的動作會被拒絕）】每筆風險 ≤ {c['max_risk_pct']:g}% 權益；總槓桿 ≤ {c['max_leverage']:g} 倍；最多 {c['max_positions']} 個倉位、一幣一倉、不加倉；停損距離 {c['min_stop_pct']}–{c['max_stop_pct']}%；停損只能收緊；股票類 TradFi 只能在本地市場開盤中、離收盤 {c['session_buffer_minutes']} 分鐘以上開新倉（原物料看期貨交易時段）；權益 ≤ {b.floor:g} U 停止開新倉；當天（台北時間）虧損 ≥ {c['daily_loss_pct']:g}% 停止開新倉到隔天，今天目前 {-b.day_loss_pct(eq):+.1f}%。{small}
+【硬性限制（程式強制，違反的動作會被拒絕）】每筆風險 ≤ {c['max_risk_pct']:g}% 權益；總槓桿 ≤ {c['max_leverage']:g} 倍；最多 {c['max_positions']} 個倉位、一幣一倉、不加倉；停損距離 {c['min_stop_pct']}–{c['max_stop_pct']}%；停損只能收緊；權益 ≤ {b.floor:g} U 停止開新倉；當天（台北時間）虧損 ≥ {c['daily_loss_pct']:g}% 停止開新倉到隔天，今天目前 {-b.day_loss_pct(eq):+.1f}%。{small}
 
 【目前倉位】
 {self.positions_text(prices)}
