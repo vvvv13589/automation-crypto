@@ -3,7 +3,7 @@
 The futures wallet's own history mixes manual trading with transfers (to the Binance prediction
 wallet and back, to the AI trader's sub-account). Transfers are not profit or loss, so they are
 taken out first; the prediction bets' result comes from the prediction wallet itself.
-Referral commission rebates are paid into the spot wallet, outside the futures history.
+Referral rebates are paid through Binance Pay, outside the futures history.
 Read-only: only signed GET requests.
 """
 
@@ -21,67 +21,25 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 PREDICT = "https://api.binance.com/sapi/v1/w3w/wallet/prediction"
-INTO_SPOT = ("UMFUTURE_MAIN", "FUNDING_MAIN", "CMFUTURE_MAIN", "MARGIN_MAIN")
-OUT_OF_SPOT = ("MAIN_UMFUTURE", "MAIN_FUNDING", "MAIN_CMFUTURE", "MAIN_MARGIN")
-MAX_REBATE_RISE = 20.0  # an unexplained rise bigger than this is a transfer the history missed, not a rebate
+REBATE_PAY_TYPES = ("SEND_MULTIPLE_V2",)  # referral rebates arrive as Binance Pay batch payouts (red packets are CRYPTO_BOX)
 STABLES = ("USDT", "USDC", "FDUSD")
 
 
-def spot_flows(ex, since_ms: int) -> float:
-    """USDT that left the spot wallet since `since_ms` through transfers or withdrawals, minus what
-    arrived through transfers or deposits (positive = net out)."""
-    net = 0.0
-    for kind, sign in [(t, -1) for t in INTO_SPOT] + [(t, 1) for t in OUT_OF_SPOT]:
-        rows = ex.sapiGetAssetTransfer({"type": kind, "startTime": since_ms, "size": 100}).get("rows") or []
-        net += sign * sum(float(r["amount"]) for r in rows if r.get("asset") == "USDT" and r.get("status") == "CONFIRMED")
-    for d in ex.sapiGetCapitalDepositHisrec({"coin": "USDT", "startTime": since_ms}) or []:
-        if int(d.get("status", 0)) in (1, 6):  # success / credited
-            net -= float(d["amount"])
-    for w in ex.sapiGetCapitalWithdrawHistory({"coin": "USDT", "startTime": since_ms}) or []:
-        if int(w.get("status", 0)) == 6:  # completed
-            net += float(w["amount"]) + float(w.get("transactionFee") or 0)
-    return net - prediction_claims(ex, since_ms)  # winning bets are paid into the spot wallet too
-
-
-def prediction_claims(ex, since_ms: int, get=None) -> float:
-    """USDT claimed from winning prediction bets since `since_ms` (it lands in the spot wallet)."""
-    get = get or (lambda path, **p: _signed_get(ex, PREDICT + path, **p))
-    total = 0.0
-    for w in get("/wallet/list").get("wallets") or []:
-        offset = 0
-        while True:
-            page = get("/position/settled-history", walletAddress=w["walletAddress"], limit=100, offset=offset).get("positions") or []
-            total += sum(float(p.get("claimAmount") or 0) for p in page if int(p.get("settledDate") or 0) >= since_ms)
-            if len(page) < 100:
-                break
-            offset += 100
-    return total
-
-
-def rebates(ex, cfg: dict, now_ms: int | None = None, spot=None, flows=None) -> float:
-    """Total rebates received: every rise of the spot USDT balance that no transfer, deposit or
-    withdrawal explains (the spot wallet is not traded). Running total in state/rebates.json; the
-    first run counts the spot USDT already there. Rebates arrive in small amounts, so a rise above
-    MAX_REBATE_RISE is logged and skipped: only rises are added, one missed transfer would stay forever."""
-    now_ms = now_ms or int(time.time() * 1000)
+def rebates(ex, cfg: dict, rows: list[dict] | None = None) -> float:
+    """Total referral rebates received: incoming Binance Pay batch payouts in stablecoins. Each payout
+    is remembered in state/rebates.json by its transaction id, so the total outlives the Pay history."""
     path = Path(cfg.get("state_dir", "state")) / "rebates.json"
-    if spot is None:
-        bal = ex.privateGetAccount()["balances"]
-        spot = sum(float(b["free"]) + float(b["locked"]) for b in bal if b["asset"] == "USDT")
-    st = json.loads(path.read_text()) if path.exists() else None
-    if st is None:
-        st = {"total": spot}
-    else:
-        out = spot_flows(ex, st["since"]) if flows is None else flows
-        rise = spot - st["spot"] + out
-        if rise > MAX_REBATE_RISE:
-            log.warning("rebates: spot rose %.2f U with no matching transfer, not counted as a rebate", rise)
-        elif rise > 0.001:
-            st["total"] += rise
-    st.update(spot=spot, since=now_ms)
+    st = json.loads(path.read_text()) if path.exists() else {}
+    payouts = st.get("payouts") or {}
+    if rows is None:
+        rows = ex.sapiGetPayTransactions({"limit": 100}).get("data") or []
+    for r in rows:
+        amount = float(r.get("amount") or 0)
+        if r.get("orderType") in REBATE_PAY_TYPES and r.get("currency") in STABLES and amount > 0:
+            payouts[str(r.get("transactionId") or r.get("orderId"))] = amount
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(st))
-    return st["total"]
+    path.write_text(json.dumps({"payouts": payouts}))
+    return sum(payouts.values())
 
 
 def holdings(ex, futures: float, ai: float | None, predict: dict | None) -> list[tuple[str, float | None]]:
@@ -221,7 +179,7 @@ def money_lines(ex, cfg: dict, equity: float, bot_total: float, income=None, pre
         except Exception as exc:
             log.warning("rebates: %s", exc)
     if rebate:
-        lines.append(f"  🎁 返傭：{rebate:+.2f} U（累計，發到現貨錢包）")
+        lines.append(f"  🎁 返傭：{rebate:+.2f} U（累計，幣安 Pay 批量入帳，不含紅包）")
     if moved:
         lines.append(f"  💸 資金{'轉出' if moved < 0 else '轉入'} {abs(moved):.2f} U（預測錢包、AI 子帳戶等，不算盈虧）")
     return lines

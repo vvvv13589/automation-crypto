@@ -39,16 +39,16 @@ def test_lines_add_up_to_the_account():
     assert "資金轉出 59.35 U" in lines[2]
 
 
-def test_rebates_count_unexplained_rises_of_the_spot_wallet(tmp_path):
+def test_rebates_are_pay_batch_payouts_not_red_packets(tmp_path):
     from cryptobot.money import rebates
     cfg = {"state_dir": str(tmp_path)}
-    assert rebates(None, cfg, now_ms=1, spot=6.14) == 6.14            # first run: what is there
-    assert rebates(None, cfg, now_ms=2, spot=10.14, flows=0.0) == 10.14  # +4 rebate
-    assert rebates(None, cfg, now_ms=3, spot=0.14, flows=10.0) == 10.14  # moved 10 to futures: not income
-    assert rebates(None, cfg, now_ms=4, spot=50.14, flows=-50.0) == 10.14  # a deposit: not income
-    assert rebates(None, cfg, now_ms=5, spot=0.0, flows=50.0 - 0.14) == 10.14  # spent / moved: never negative
-    assert rebates(None, cfg, now_ms=6, spot=100.0, flows=0.0) == 10.14  # 100 U with no transfer found: skipped
-    assert round(rebates(None, cfg, now_ms=7, spot=100.91, flows=0.0), 2) == 11.05  # but later small rebates still count
+    rows = [{"transactionId": "1", "orderType": "SEND_MULTIPLE_V2", "currency": "USDT", "amount": "6.14"},
+            {"transactionId": "2", "orderType": "CRYPTO_BOX", "currency": "USDT", "amount": "0.002"},
+            {"transactionId": "3", "orderType": "CRYPTO_BOX", "currency": "BTTC", "amount": "59.9"}]
+    assert rebates(None, cfg, rows=rows) == 6.14
+    assert rebates(None, cfg, rows=rows) == 6.14  # the same payout is not counted twice
+    later = [{"transactionId": "4", "orderType": "SEND_MULTIPLE_V2", "currency": "USDT", "amount": "3"}]
+    assert rebates(None, cfg, rows=later) == 9.14  # older payouts stay after they leave the Pay history
 
 
 class FakeWallets:
@@ -87,11 +87,3 @@ def test_rebate_line(tmp_path):
     cfg = {"goals": {"base_capital": 315.67}}
     lines = money_lines(None, cfg, equity=260.0, bot_total=-89.77, income=INCOME, predict=None, rebate=6.14)
     assert any(line.startswith("  🎁 返傭：+6.14 U") for line in lines)
-
-def test_prediction_claims_since():
-    from cryptobot.money import prediction_claims
-    pages = {"/wallet/list": {"wallets": [{"walletAddress": "0xabc"}]},
-             "/position/settled-history": {"positions": [
-                 {"claimAmount": "33.79", "settledDate": 2000}, {"claimAmount": None, "settledDate": 2500},
-                 {"claimAmount": "14.78", "settledDate": 1000}]}}
-    assert prediction_claims(None, 1500, get=lambda path, **kw: pages[path]) == 33.79
