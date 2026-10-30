@@ -83,6 +83,45 @@ def test_total_changes_keep_the_first_reading_of_each_day(tmp_path):
     assert total_changes(cfg, "2026-10-29", 466.0) == (6.0, 66.0)
 
 
+def test_external_flows_count_money_moved_since_the_start(tmp_path):
+    from cryptobot.money import external_flows, flows_text
+    cfg = {"state_dir": str(tmp_path)}
+    found = {"提領": [], "入金": [], "Pay": [], "P2P": []}
+    first = external_flows(None, cfg, 474.0, now_ms=1_000, read=lambda ex, since: found)
+    assert (first["start_total"], first["net_out"], first["pnl"]) == (474.0, 0.0, 0.0)
+    found = {"提領": [("w1", -200.5)], "入金": [], "Pay": [("p9", 10.0)], "P2P": None}
+    f = external_flows(None, cfg, 290.0, now_ms=9_999, read=lambda ex, since: found)
+    assert f["start"] == 1_000 and round(f["net_out"], 2) == 190.5 and round(f["pnl"], 2) == 6.5
+    found = {"提領": [], "入金": [], "Pay": [], "P2P": []}  # Binance's window moved on; the record is kept
+    assert round(external_flows(None, cfg, 290.0, read=lambda ex, since: found)["net_out"], 2) == 190.5
+    text = flows_text(f)
+    assert "真實損益 +6.50 U" in text and "📤 淨轉出 190.50 U" in text and "P2P 紀錄讀取失敗" in text
+
+
+class FakeFlows:
+    def sapiGetCapitalWithdrawHistory(self, _p):
+        return [{"id": "a", "coin": "USDT", "amount": "200", "transactionFee": "0.5", "status": 6},
+                {"id": "b", "coin": "USDT", "amount": "50", "transactionFee": "0", "status": 1}]  # cancelled
+
+    def sapiGetCapitalDepositHisrec(self, _p):
+        return [{"id": "c", "coin": "BTC", "amount": "0.1", "status": 1}]
+
+    def sapiGetPayTransactions(self, _p):
+        return {"data": [{"transactionId": "r", "orderType": "SEND_MULTIPLE_V2", "currency": "USDT", "amount": "6", "transactionTime": 5},
+                         {"transactionId": "k", "orderType": "CRYPTO_BOX", "currency": "USDT", "amount": "0.1", "transactionTime": 5},
+                         {"transactionId": "s", "orderType": "C2C", "currency": "USDT", "amount": "-30", "transactionTime": 5}]}
+
+    def sapiGetC2cOrderMatchListUserOrderHistory(self, p):
+        if p["tradeType"] == "SELL":
+            return {"data": [{"orderNumber": "x", "asset": "USDT", "amount": "20", "orderStatus": "COMPLETED"}]}
+        return {"data": [{"orderNumber": "y", "asset": "USDT", "amount": "20", "orderStatus": "CANCELLED"}]}
+
+
+def test_flow_rows_skip_rebates_red_packets_and_unfinished_orders():
+    from cryptobot.money import _flow_rows
+    assert _flow_rows(FakeFlows(), 0) == {"提領": [("wa", -200.5)], "入金": [], "Pay": [("ps", -30.0)], "P2P": [("cx", -20.0)]}
+
+
 def test_rebate_line(tmp_path):
     cfg = {"goals": {"base_capital": 315.67}}
     lines = money_lines(None, cfg, equity=260.0, bot_total=-89.77, income=INCOME, predict=None, rebate=6.14)

@@ -81,6 +81,73 @@ def total_changes(cfg: dict, day: str, total: float, days: int = 14) -> tuple[fl
     return total - seen[day], (total - seen[max(past)]) if past else None
 
 
+def _flow_rows(ex, since: int) -> dict[str, list[tuple[str, float]]]:
+    """Money in (+) and out (-) of Binance since `since` (ms), by source: (record id, U)."""
+    def withdrawals():
+        return [(f"w{r['id']}", -(float(r["amount"]) + float(r.get("transactionFee") or 0)))
+                for r in ex.sapiGetCapitalWithdrawHistory({"startTime": since})
+                if r.get("coin") in STABLES and int(r.get("status", -1)) in (2, 4, 6)]  # awaiting / processing / done
+
+    def deposits():
+        return [(f"d{r['id']}", float(r["amount"])) for r in ex.sapiGetCapitalDepositHisrec({"startTime": since})
+                if r.get("coin") in STABLES and int(r.get("status", -1)) in (1, 6)]
+
+    def pay():  # rebates and red packets are income, not money moved
+        return [(f"p{r.get('transactionId') or r.get('orderId')}", float(r["amount"]))
+                for r in ex.sapiGetPayTransactions({"startTime": since, "limit": 100}).get("data") or []
+                if r.get("currency") in STABLES and int(r.get("transactionTime") or 0) >= since
+                and r.get("orderType") not in REBATE_PAY_TYPES + ("CRYPTO_BOX",)]
+
+    def p2p():
+        out = []
+        for side, sign in (("SELL", -1), ("BUY", 1)):
+            rows = ex.sapiGetC2cOrderMatchListUserOrderHistory({"tradeType": side, "startTimestamp": since}).get("data") or []
+            out += [(f"c{r['orderNumber']}", sign * float(r["amount"])) for r in rows
+                    if r.get("asset") in STABLES and r.get("orderStatus") == "COMPLETED"]
+        return out
+
+    found = {}
+    for name, read in (("提領", withdrawals), ("入金", deposits), ("Pay", pay), ("P2P", p2p)):
+        try:
+            found[name] = read()
+        except Exception as exc:
+            log.warning("flows %s: %s", name, exc)
+            found[name] = None
+    return found
+
+
+def external_flows(ex, cfg: dict, total: float, now_ms: int | None = None, read=_flow_rows) -> dict:
+    """Net money moved out of Binance since the first call, whose total is the starting point.
+    Every record is remembered in state/money_flows.json, so it outlives Binance's history windows."""
+    path = Path(cfg.get("state_dir", "state")) / "money_flows.json"
+    st = json.loads(path.read_text()) if path.exists() else {}
+    if not st:
+        st = {"start": now_ms or int(time.time() * 1000), "start_total": total, "flows": {}}
+    failed = []
+    for name, rows in read(ex, st["start"]).items():
+        if rows is None:
+            failed.append(name)
+        for rid, amount in rows or []:
+            st["flows"][rid] = amount
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(st))
+    net_out = -sum(st["flows"].values())
+    return {"start": st["start"], "start_total": st["start_total"], "net_out": net_out,
+            "pnl": total - st["start_total"] + net_out, "failed": failed}
+
+
+def flows_text(f: dict, tz: str = "Asia/Taipei") -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    day = datetime.fromtimestamp(f["start"] / 1000, ZoneInfo(tz)).strftime("%m/%d")
+    moved = f"📤 淨轉出 {f['net_out']:.2f} U" if f["net_out"] >= 0 else f"📥 淨轉入 {-f['net_out']:.2f} U"
+    lines = [f"📈 自 {day}（起點 {f['start_total']:.2f} U）真實損益 {f['pnl']:+.2f} U",
+             f"  {moved}（提領、入金、Pay、P2P；不算盈虧）"]
+    if f["failed"]:
+        lines.append(f"  ⚠️ {'、'.join(f['failed'])} 紀錄讀取失敗，這次沒算進去")
+    return "\n".join(lines)
+
+
 def holdings_text(rows: list[tuple[str, float | None]], today: float | None, week: float | None) -> str:
     total = sum(v for _, v in rows if v)
     lines = [f"💰 全部資產 {total:.2f} U"]
@@ -91,7 +158,7 @@ def holdings_text(rows: list[tuple[str, float | None]], today: float | None, wee
             lines.append(f"  • {label}：讀取失敗，未計入")
         elif abs(v) >= 0.01:
             lines.append(f"  • {label}：{v:.2f} U")
-    lines.append("  （只算穩定幣；轉入轉出幣安也會算進漲跌）")
+    lines.append("  （只算穩定幣；今天、7 天的漲跌含轉入轉出，真實損益看下面）")
     return "\n".join(lines)
 
 

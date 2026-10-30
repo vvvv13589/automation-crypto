@@ -554,14 +554,22 @@ class Butler:
     def holdings_text(self, snap: dict) -> str:
         from zoneinfo import ZoneInfo
 
-        from .money import holdings, holdings_text, prediction_pnl, total_changes
+        from .money import external_flows, flows_text, holdings, holdings_text, prediction_pnl, total_changes
         ai = self.ai_equity()
         with self.ex_lock:
             rows = holdings(self.exchange, snap["equity"], ai, prediction_pnl(self.exchange))
         tz = (self.cfg.get("notify") or {}).get("timezone", "Asia/Taipei")
         day = datetime.fromtimestamp(self.clock(), ZoneInfo(tz)).strftime("%Y-%m-%d")
-        today, week = total_changes(self.cfg, day, sum(v for _, v in rows if v))
-        return holdings_text(rows, today, week)
+        total = sum(v for _, v in rows if v)
+        today, week = total_changes(self.cfg, day, total)
+        text = holdings_text(rows, today, week)
+        if all(v is not None for _, v in rows):  # a wallet missing from the total would look like a loss
+            try:
+                with self.ex_lock:
+                    text += "\n" + flows_text(external_flows(self.exchange, self.cfg, total), tz)
+            except Exception as exc:
+                log.warning("flows: %s", exc)
+        return text
 
     def ai_equity(self) -> float | None:
         """The AI trader's sub-account equity (its own API key, read-only here)."""
