@@ -5,7 +5,8 @@ import json
 
 import pytest
 
-from cryptobot.aitrader import DEFAULTS, AITrader, Book, Guard, LiveBook, LiveError, News, parse_decision
+from cryptobot.aitrader import (DEFAULTS, AITrader, Book, Guard, LiveBook, LiveError, News, ScaleBook,
+                                parse_decision)
 from cryptobot.config import DEFAULTS as CFG
 
 T0 = 1_789_999_980.0  # 2026-09-21 13:33 UTC, minute aligned
@@ -615,3 +616,71 @@ def test_decision_mirrors_to_paper_and_notifies_live_only(setup, live):
     assert len(sent) == 1 and "開多 SOL" in sent[0]
     row = json.loads(t.journal.read_text(encoding="utf-8").splitlines()[-1])
     assert row["mirror"]["模擬"][0]["ok"]
+
+
+# -- scale-in paper book ----------------------------------------------------------------
+def bar(i, o, h, l):  # the i-th minute after T0
+    return [int(T0 * 1000) + i * 60_000, o, h, l, o, 1]
+
+
+def scale_book(tmp_path):
+    return ScaleBook(tmp_path / "s.json", tmp_path / "s.csv", {**DEFAULTS}, 200, clock=lambda: T0)
+
+
+def test_scale_open_splits_risk_over_two_legs(tmp_path):
+    b = scale_book(tmp_path)
+    # single entry would be 1 SOL over a 10-point stop = 10 U at risk
+    p = b.open("SOL", "long", 200, 1, 190, None, "x", T0)
+    assert p["risk_amt"] == pytest.approx(10) and p["add_px"] == 195  # no add_at: halfway to the stop
+    assert p["qty"] == pytest.approx(10 / 15) and p["add_qty"] == pytest.approx(10 / 15)
+    p = b.open("ETH", "short", 100, 1, 110, None, "x", T0, add_at=108)  # the AI's level
+    assert p["add_px"] == 108 and p["qty"] == pytest.approx(10 / 12)
+    p = b.open("BTC", "long", 100, 1, 90, None, "x", T0, add_at=101)  # on the wrong side: ignored
+    assert p["add_px"] == 95
+
+
+def test_scale_both_legs_then_stop_is_one_planned_r(tmp_path):
+    b = scale_book(tmp_path)
+    b.open("SOL", "long", 200, 1, 190, None, "x", T0)
+    assert b._walk("SOL", b.positions["SOL"], [bar(1, 199, 199, 195)], T0 + 120) is None
+    p = b.positions["SOL"]
+    assert p["qty"] == pytest.approx(20 / 15) and p["entry"] == pytest.approx(197.53, abs=0.01)
+    row, icon = b._walk("SOL", p, [bar(2, 194, 194, 189)], T0 + 180)
+    assert icon == "🛑" and row["r"] == pytest.approx(-1.0, abs=0.05)
+
+
+def test_scale_ignores_ai_stops_until_2r_then_breakeven(tmp_path):
+    b = scale_book(tmp_path)
+    b.open("SOL", "long", 200, 1, 190, None, "x", T0)
+    with pytest.raises(LiveError, match="2R"):
+        b.move_stop("SOL", 195, T0)
+    p = b.positions["SOL"]
+    b._walk("SOL", p, [bar(1, 210, 221, 209)], T0 + 120)  # +2R from the first entry
+    assert p["armed"] and p["add_px"] is None and p["stop"] == pytest.approx(p["entry"])
+    b.move_stop("SOL", 212, T0 + 180)
+    assert p["stop"] == 212
+
+
+def test_scale_takes_half_at_tp_and_trails_the_rest(tmp_path):
+    b = scale_book(tmp_path)
+    b.open("SOL", "long", 200, 1, 190, 220, "x", T0)
+    p = b.positions["SOL"]
+    b._walk("SOL", p, [bar(1, 210, 225, 209)], T0 + 120)
+    assert p["half_done"] and p["tp"] is None and p["qty"] == pytest.approx(10 / 30)
+    assert p["realized"] > 6 and p["stop"] == pytest.approx(225 - p["r_unit"])
+    row, icon = b._walk("SOL", p, [bar(2, 218, 218, 214)], T0 + 180)
+    assert icon == "🛑" and row["r"] == pytest.approx(1.15, abs=0.05)
+
+
+def test_decision_passes_add_at_to_the_scale_mirror_only(setup, tmp_path):
+    t, ex, ai, clock, sent = setup
+    mirror = ScaleBook(tmp_path / "m.json", tmp_path / "m.csv", t.cfg, 200, clock)
+    t.books.append(mirror)
+    ai.replies.append({"view": "", "actions": [
+        {"type": "open", "coin": "SOL", "side": "long", "stop": 190, "add_at": 192, "risk_pct": 2, "reason": "x"},
+        {"type": "move_stop", "coin": "SOL", "stop": 195, "reason": "鎖利"}]})
+    t.decide("test")
+    assert "add_px" not in t.book.positions["SOL"] and t.book.positions["SOL"]["stop"] == 195
+    assert mirror.positions["SOL"]["add_px"] == 192 and mirror.positions["SOL"]["stop"] == 190
+    row = json.loads(t.journal.read_text(encoding="utf-8").splitlines()[-1])
+    assert [a["ok"] for a in row["mirror"]["分批模擬"]] == [True, False]

@@ -2,7 +2,7 @@
 (stocks, gold, oil) and the news, and decides.
 
     python3 -m cryptobot ai-trader                 # paper only (200 U simulated)
-    python3 -m cryptobot ai-trader --live          # AI sub-account for real + the paper mirror
+    python3 -m cryptobot ai-trader --live          # AI sub-account for real + the scale-in paper mirror
     python3 -m cryptobot ai-trader --check         # read-only: is the live key the AI sub-account?
     python3 -m cryptobot ai-trader --live-test DOGE # smallest real round trip: open, stop, tp, close
     python3 -m cryptobot ai-trader --once          # one paper decision now, then exit
@@ -476,8 +476,8 @@ class Book:
 
     def _record(self, coin: str, p: dict, exit_px: float, exit_fee: float, why: str, now: float) -> dict:
         sgn = 1 if p["side"] == "long" else -1
-        net = (exit_px - p["entry"]) * p["qty"] * sgn - exit_fee - p["fees"] + p["funding"]
-        risk = abs(p["entry"] - p["init_stop"]) * p["qty"]
+        net = (exit_px - p["entry"]) * p["qty"] * sgn - exit_fee - p["fees"] + p["funding"] + p.get("realized", 0.0)
+        risk = p.get("risk_amt") or abs(p["entry"] - p["init_stop"]) * p["qty"]
         row = {"coin": coin, "side": p["side"], "opened": tw(p["opened"]), "closed": tw(now),
                "entry": fmt(p["entry"]), "exit": fmt(exit_px), "qty": fmt(p["qty"]), "pnl": round(net, 2),
                "r": round(net / risk, 2) if risk else 0, "why": why, "reason": p["reason"]}
@@ -533,20 +533,111 @@ class Book:
             except Exception as exc:
                 log.warning("1m %s: %s", coin, exc)
                 continue
-            long = p["side"] == "long"
-            for _, o, h, l, _c, _v in bars:
-                stop_hit = (l <= p["stop"]) if long else (h >= p["stop"])
-                tp_hit = p["tp"] is not None and ((h >= p["tp"]) if long else (l <= p["tp"]))
-                if stop_hit:  # worst case first when both are inside one candle
-                    gap = (o < p["stop"]) if long else (o > p["stop"])
-                    closed.append((self.close(coin, o if gap else p["stop"], "停損", now), "🛑"))
-                    break
-                if tp_hit:
-                    closed.append((self.close(coin, p["tp"], "止盈", now, slip=False), "🎯"))
-                    break
+            hit = self._walk(coin, p, bars, now)
+            if hit:
+                closed.append(hit)
         self.last_check = now
         self.save()
         return closed
+
+    def _walk(self, coin: str, p: dict, bars: list, now: float) -> tuple[dict, str] | None:
+        """Replay 1m candles against the position; close it at the first stop / take-profit hit."""
+        long = p["side"] == "long"
+        for _, o, h, l, _c, _v in bars:
+            stop_hit = (l <= p["stop"]) if long else (h >= p["stop"])
+            tp_hit = p["tp"] is not None and ((h >= p["tp"]) if long else (l <= p["tp"]))
+            if stop_hit:  # worst case first when both are inside one candle
+                gap = (o < p["stop"]) if long else (o > p["stop"])
+                return self.close(coin, o if gap else p["stop"], "停損", now), "🛑"
+            if tp_hit:
+                return self.close(coin, p["tp"], "止盈", now, slip=False), "🎯"
+        return None
+
+
+class ScaleBook(Book):
+    """Paper book running the same AI decisions with a different execution, to compare against the
+    live single-entry book. Every open is split into two equal legs: one at market, one resting at
+    the AI's `add_at` (a higher-timeframe level; halfway to the stop if it gives none), sized so both
+    legs together lose the AI's risk_pct at the stop. Exits are looser: the AI's stop moves are
+    ignored until the trade first reaches +2R (the stop then goes to breakeven at least and the
+    second leg is cancelled); at the take-profit only half closes, the rest trails 1R behind the
+    best price. R is against the planned risk (both legs), so a trade the AI closes before the second
+    leg fills counts for less than its single-entry twin, and so does a winner that never dipped.
+    Positions opened before this book existed (no "scale" key) keep the plain Book behaviour."""
+
+    label = "分批模擬"
+    scales = True
+
+    def open(self, coin, side, price, qty, stop, tp, reason, now, add_at=None) -> dict:
+        long = side == "long"
+        valid = add_at is not None and ((stop < add_at < price) if long else (price < add_at < stop))
+        add = add_at if valid else (price + stop) / 2
+        risk_amt = qty * abs(price - stop)
+        leg = risk_amt / (abs(price - stop) + abs(add - stop))
+        p = super().open(coin, side, price, leg, stop, tp, reason, now)
+        p.update(scale=True, risk_amt=risk_amt, first_entry=p["entry"], r_unit=abs(p["entry"] - stop),
+                 add_px=add, add_qty=leg, realized=0.0)
+        self.save()
+        return p
+
+    def move_stop(self, coin, stop, now) -> None:
+        p = self.positions[coin]
+        if p.get("scale") and not p.get("armed"):
+            raise LiveError("分批模擬：+2R 之前不跟著移停損")
+        super().move_stop(coin, stop, now)
+
+    def _add(self, p: dict, px: float) -> None:
+        q = p.pop("add_qty")
+        p["add_px"] = None
+        fee = px * q * self.cfg["taker_fee"]
+        self.cash -= fee
+        p["entry"] = (p["entry"] * p["qty"] + px * q) / (p["qty"] + q)
+        p["qty"] += q
+        p["fees"] += fee
+
+    def _arm(self, p: dict) -> None:
+        """First time at +2R: no more adding, stop to breakeven at least, AI stop moves allowed."""
+        p.update(armed=True, add_px=None)
+        p.pop("add_qty", None)
+        p["stop"] = max(p["stop"], p["entry"]) if p["side"] == "long" else min(p["stop"], p["entry"])
+
+    def _take_half(self, p: dict) -> None:
+        sgn = 1 if p["side"] == "long" else -1
+        q = p["qty"] / 2
+        fee = p["tp"] * q * self.cfg["taker_fee"]
+        gross = (p["tp"] - p["entry"]) * q * sgn
+        self.cash += gross - fee
+        p["realized"] += gross - fee
+        p["qty"] -= q
+        p.update(tp=None, half_done=True)
+        self._arm(p)
+
+    def _walk(self, coin, p, bars, now):
+        if not p.get("scale"):
+            return super()._walk(coin, p, bars, now)
+        long = p["side"] == "long"
+        sgn = 1 if long else -1
+        for t0, o, h, l, _c, _v in bars:
+            before = (p["stop"], p.get("add_px"), p.get("armed"), p.get("half_done"))
+            if p.get("add_px") is not None and ((l <= p["add_px"]) if long else (h >= p["add_px"])):
+                self._add(p, min(o, p["add_px"]) if long else max(o, p["add_px"]))  # gap: limit fills at the open
+            if (l <= p["stop"]) if long else (h >= p["stop"]):  # worst case first
+                gap = (o < p["stop"]) if long else (o > p["stop"])
+                return self.close(coin, o if gap else p["stop"], "停損", now), "🛑"
+            best = h if long else l
+            if not p.get("armed") and (best - p["first_entry"]) * sgn >= 2 * p["r_unit"]:
+                self._arm(p)
+            if p["tp"] is not None and ((h >= p["tp"]) if long else (l <= p["tp"])):
+                if p.get("half_done"):  # the AI set a new take-profit for the rest
+                    return self.close(coin, p["tp"], "止盈", now, slip=False), "🎯"
+                self._take_half(p)
+            if p.get("half_done"):
+                trail = best - p["r_unit"] * sgn
+                p["stop"] = max(p["stop"], trail) if long else min(p["stop"], trail)
+            if (p["stop"], p.get("add_px"), p.get("armed"), p.get("half_done")) != before:
+                # the next check re-reads the last minute; this one must not be replayed with the new state
+                p["since"] = max(p.get("since", p["opened"]), t0 / 1000 + 60)
+        return None
 
 
 class LiveBook(Book):
@@ -725,6 +816,10 @@ class Guard:
             tp = None
         if tp is not None and (tp - price) * (1 if side == "long" else -1) <= 0:
             tp = None
+        try:  # second-leg price, used only by the scale-in paper book (checked there)
+            add_at = float(a["add_at"]) if a.get("add_at") not in (None, "", 0) else None
+        except (TypeError, ValueError):
+            add_at = None
         risk_pct = min(max(float(a.get("risk_pct") or 1), 0.1), c["max_risk_pct"])
         qty = eq * risk_pct / 100 / (price * dist)
         room = c["max_leverage"] * eq - book.notional(prices)
@@ -734,7 +829,7 @@ class Guard:
                 return False, f"總槓桿已滿 {c['max_leverage']:g} 倍", None
             qty = room / price
             note = f"（受 {c['max_leverage']:g} 倍總槓桿限制縮小）"
-        return True, note, {"coin": coin, "side": side, "stop": stop, "tp": tp, "qty": qty,
+        return True, note, {"coin": coin, "side": side, "stop": stop, "tp": tp, "qty": qty, "add_at": add_at,
                             "risk_pct": qty * price * dist / eq * 100, "reason": str(a.get("reason", ""))[:300]}
 
     @staticmethod
@@ -888,8 +983,12 @@ class AITrader:
             tp = float(a["take_profit"]) if a.get("take_profit") else None
         except (TypeError, ValueError):
             tp = None
+        try:
+            add_at = float(a["add_at"]) if a.get("add_at") else None
+        except (TypeError, ValueError):
+            add_at = None
         plan = {"coin": coin, "side": side, "trigger": trigger, "when": when, "confirm": confirm, "stop": stop,
-                "tp": tp, "risk_pct": min(max(float(a.get("risk_pct") or 1), 0.1), c["max_risk_pct"]),
+                "tp": tp, "add_at": add_at, "risk_pct": min(max(float(a.get("risk_pct") or 1), 0.1), c["max_risk_pct"]),
                 "created": self.clock(), "expires": self.clock() + hours * 3600, "reason": out["reason"]}
         replaced = any(p["coin"] == coin for p in self.plans)
         others = [p for p in self.plans if p["coin"] != coin]
@@ -942,7 +1041,7 @@ class AITrader:
                 continue
             changed = True
             a = {"type": "open", "coin": p["coin"], "side": p["side"], "stop": p["stop"], "take_profit": p["tp"],
-                 "risk_pct": p["risk_pct"], "reason": f"條件單觸發。{p['reason']}"}
+                 "add_at": p.get("add_at"), "risk_pct": p["risk_pct"], "reason": f"條件單觸發。{p['reason']}"}
             universe = self.universe or [p["coin"]]
             results = [self.execute(a, universe, self.book)]
             mirror = {b.label: [self.execute(a, universe, b)] for b in self.books[1:]}
@@ -1151,7 +1250,8 @@ class AITrader:
             ok, note, n = self.guard.check_open(a, book, price, prices, universe)
             if not ok:
                 return {"ok": False, "result": note}
-            p = book.open(coin, n["side"], price, n["qty"], n["stop"], n["tp"], n["reason"], now)
+            extra = {"add_at": n["add_at"]} if getattr(book, "scales", False) else {}
+            p = book.open(coin, n["side"], price, n["qty"], n["stop"], n["tp"], n["reason"], now, **extra)
             eq = book.equity(prices)
             loss = abs(p["entry"] - p["stop"]) * p["qty"]
             return {"ok": True, "result": f"開倉 {loss / eq * 100:.2f}%{note}",
@@ -1480,7 +1580,9 @@ def main(cfg: dict, repo_dir: str, once: bool = False, live: bool = False, check
             return 0
         if test_coin:
             return live_test(lb, test_coin.upper())
-        books = [lb, paper]
+        # the paper side tests scale-in entries + looser exits on the same decisions (from 2026-11-03)
+        scale = ScaleBook(state / "aitrader_scale_book.json", logs / "aitrader_scale_trades.csv", c, c["paper_cash"])
+        books = [lb, scale]
     token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
     claude = Path(AI_ROOT) / "home" / ".local" / "bin" / "claude"
     if not token or not claude.exists():

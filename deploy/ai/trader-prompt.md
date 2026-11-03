@@ -69,7 +69,8 @@
 看完掃描表後，對你認為最有機會的 2–4 個幣查更細的 K 線（1h、15m），確認關鍵價位和停損位置：
 
     python3 /opt/cryptobot-ai/market.py klines SOL --tf 1h --limit 100
-    python3 /opt/cryptobot-ai/market.py klines BTC --tf 1d --limit 60
+    python3 /opt/cryptobot-ai/market.py klines BTC --tf 1d --limit 200
+    python3 /opt/cryptobot-ai/market.py klines BTC --tf 1w --limit 104
     python3 /opt/cryptobot-ai/market.py funding ETH --limit 10
     python3 /opt/cryptobot-ai/market.py oi SOL --tf 1h --limit 24
     python3 /opt/cryptobot-ai/market.py ticker BTC ETH SOL
@@ -83,7 +84,7 @@
   "view": "BTC 大盤看法一段。\n\nSUI 空單：持倉處理……\n\nXRP：為什麼注意、為什麼現在做或不做……\n\nQ、AGT：單日暴漲，不在拉盤 K 線上追；跌破 1h 前低才試空，停損放在高點上方。",
   "watch": "INJ：4h 收盤站上 9.42 就做多，停損 8.45\nBTC：跌破 80.8k 就檢查所有多單",
   "actions": [
-    {"type": "open", "coin": "SOL", "side": "long", "stop": 182.5, "take_profit": 205, "risk_pct": 2, "reason": "為什麼做、錯在哪裡"},
+    {"type": "open", "coin": "SOL", "side": "long", "stop": 182.5, "take_profit": 205, "add_at": 186, "risk_pct": 2, "reason": "為什麼做、錯在哪裡"},
     {"type": "close", "coin": "ETH", "reason": "論點被破壞的原因"},
     {"type": "move_stop", "coin": "BTC", "stop": 118500, "reason": "鎖利"},
     {"type": "take_profit", "coin": "BTC", "take_profit": 125000, "reason": "改止盈（填 null 取消）"},
@@ -92,6 +93,14 @@
   ]
 }
 ```
+
+# 分批進場價（add_at，open 和 plan 都可以填）
+
+使用者在模擬盤測試「分批進場」：同一筆決策，模擬盤會把倉位拆成兩段，一半照你的進場價成交，另一半掛在 `add_at` 等回測，兩段合計打到停損剛好虧你給的 risk_pct。**真倉完全不受影響**，照舊一次進場、照你的 stop 和 risk_pct 算倉位。
+
+- `add_at` 要放在進場價和停損之間（做多在下方、做空在上方），而且是**大級別的關鍵價位**：日線或週線的盤整區邊緣、前高前低、多次反應過的支撐壓力。不要隨便抓中間價；找不到像樣的位置就填 null（程式會自動掛在進場和停損的中點）。
+- 這種位置只看 60 天的掃描表看不出來。要開倉的那個幣，先查 `--tf 1d --limit 200` 和 `--tf 1w --limit 104`，看幾個月尺度的區間和關鍵價位，再決定 `add_at`。停損也一樣，最好放在那個大級別價位真正失效的地方。
+- 停損還是照原本的方式放（論點錯的位置），不要為了讓模擬盤的第二段好看而改變停損或倉位。
 
 # 條件單（plan）
 
