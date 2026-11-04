@@ -1,5 +1,6 @@
 # AI 交易員：Claude 每小時看前 50 大幣行情與新聞後決策，程式強制停損與風控上限。
-# --live：AI 專用子帳戶真倉（停損、止盈掛在交易所）＋ 200 U 模擬盤跟單比較。
+# 2026-11-04 起只跑模擬盤（鎖單模擬 + 分批模擬，各 200 U）；真倉停用。
+# 恢復真倉就在 ExecStart 加回 --live：AI 專用子帳戶（停損、止盈掛在交易所）＋ 分批模擬跟單比較。
 # 子帳戶 API key 放 /etc/cryptobot-aitrader/live.env（root 600）：
 #   AITRADER_API_KEY=...
 #   AITRADER_API_SECRET=...
@@ -7,7 +8,7 @@
 #   cp deploy/cryptobot-aitrader.service /etc/systemd/system/ && systemctl daemon-reload
 #   systemctl enable --now cryptobot-aitrader
 [Unit]
-Description=automation-crypto AI trader (AI sub-account + paper mirror)
+Description=automation-crypto AI trader (paper: locked exits + scale-in mirror)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -16,7 +17,7 @@ StartLimitIntervalSec=0
 Type=simple
 User=root
 WorkingDirectory=/root/automation-crypto
-ExecStart=/usr/bin/python3 -m cryptobot ai-trader --live
+ExecStart=/usr/bin/python3 -m cryptobot ai-trader
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/cryptobot-butler/claude.env
 EnvironmentFile=/etc/cryptobot-aitrader/live.env

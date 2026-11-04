@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from cryptobot.aitrader import (DEFAULTS, AITrader, Book, Guard, LiveBook, LiveError, News, ScaleBook,
+from cryptobot.aitrader import (DEFAULTS, AITrader, Book, Guard, LiveBook, LiveError, LockedBook, News, ScaleBook,
                                 parse_decision)
 from cryptobot.config import DEFAULTS as CFG
 
@@ -670,6 +670,59 @@ def test_scale_takes_half_at_tp_and_trails_the_rest(tmp_path):
     assert p["realized"] > 6 and p["stop"] == pytest.approx(225 - p["r_unit"])
     row, icon = b._walk("SOL", p, [bar(2, 218, 218, 214)], T0 + 180)
     assert icon == "🛑" and row["r"] == pytest.approx(1.15, abs=0.05)
+
+
+def test_scale_locks_ai_close_and_tp_until_2r(tmp_path):
+    b = scale_book(tmp_path)
+    b.open("SOL", "long", 200, 1, 190, 230, "x", T0)
+    with pytest.raises(LiveError, match="2R"):
+        b.close("SOL", 199, "AI 平倉", T0)
+    with pytest.raises(LiveError, match="2R"):
+        b.set_tp("SOL", 210)
+
+
+# -- locked-exit paper book ---------------------------------------------------------------
+def locked_book(tmp_path):
+    return LockedBook(tmp_path / "l.json", tmp_path / "l.csv", {**DEFAULTS}, 200, clock=lambda: T0)
+
+
+def test_locked_rejects_ai_exits_until_2r(tmp_path):
+    b = locked_book(tmp_path)
+    b.open("SOL", "long", 200, 1, 190, 230, "x", T0)
+    for act in (lambda: b.move_stop("SOL", 195, T0), lambda: b.set_tp("SOL", 210),
+                lambda: b.close("SOL", 205, "AI 平倉", T0)):
+        with pytest.raises(LiveError, match="2R"):
+            act()
+    assert b.positions["SOL"]["stop"] == 190 and b.positions["SOL"]["tp"] == 230
+
+
+def test_locked_stop_and_tp_still_fire(tmp_path):
+    b = locked_book(tmp_path)
+    b.open("SOL", "long", 200, 1, 190, 215, "x", T0)
+    row, icon = b._walk("SOL", b.positions["SOL"], [bar(1, 201, 216, 199)], T0 + 120)
+    assert icon == "🎯" and row["why"] == "止盈"
+    b.open("ETH", "short", 100, 1, 110, None, "x", T0)
+    row, icon = b._walk("ETH", b.positions["ETH"], [bar(1, 101, 111, 99)], T0 + 120)
+    assert icon == "🛑" and row["r"] == pytest.approx(-1.0, abs=0.05)
+
+
+def test_locked_arms_at_2r_then_breakeven_and_ai_may_manage(tmp_path):
+    b = locked_book(tmp_path)
+    b.open("SOL", "long", 200, 1, 190, None, "x", T0)
+    p = b.positions["SOL"]
+    assert b._walk("SOL", p, [bar(1, 210, 221, 209)], T0 + 120) is None
+    assert p["armed"] and p["stop"] == pytest.approx(p["entry"])
+    b.move_stop("SOL", 212, T0 + 180)
+    assert p["stop"] == 212
+    row = b.close("SOL", 215, "AI 平倉", T0 + 240)
+    assert row["r"] > 1
+
+
+def test_locked_after_arming_the_rest_of_the_replay_uses_the_new_stop(tmp_path):
+    b = locked_book(tmp_path)
+    b.open("SOL", "long", 200, 1, 190, None, "x", T0)
+    row, icon = b._walk("SOL", b.positions["SOL"], [bar(1, 210, 221, 209), bar(2, 205, 205, 199)], T0 + 180)
+    assert icon == "🛑" and row["r"] == pytest.approx(0, abs=0.05)
 
 
 def test_decision_passes_add_at_to_the_scale_mirror_only(setup, tmp_path):
