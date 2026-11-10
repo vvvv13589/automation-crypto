@@ -290,6 +290,17 @@ def test_close_at_next_open(env):
     assert float(t["exit"]) == 103 and float(t["pnl"]) > 0
 
 
+def test_close_or_cancel_plan_drops_pending_open(env):
+    adv, *_ = env
+    adv.apply({"type": "open", "code": FUT, "side": "short", "stop": 47300, "risk_pct": 1})
+    adv.apply({"type": "open", "code": "2330", "side": "long", "stop": 95, "risk_pct": 1})
+    r = adv.apply({"type": "close", "code": "TX", "reason": "跌太深，報酬風險比不到 1"})
+    assert r["ok"] and r["result"] == "取消等開盤的建議"
+    assert adv.apply({"type": "cancel_plan", "code": "2330"})["ok"]
+    assert not adv.book.pending
+    assert not adv.apply({"type": "close", "code": "2330"})["ok"]
+
+
 def test_close_confirm_plan(env):
     adv, data, clock, msgs = env
     r = adv.apply({"type": "plan", "code": "2330", "side": "long", "trigger": 105, "when": "above", "confirm": "close",

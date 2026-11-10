@@ -1291,6 +1291,17 @@ class Advisor:
                 "risk_pct": min(max(num(a.get("risk_pct")) or 1.0, 0.1), self.cfg["max_risk_pct"]),
                 "reason": str(a.get("reason", ""))[:300], "short": short_reason(a)}
 
+    def cancel_pending_open(self, code: str, name: str, e: dict, out: dict) -> dict | None:
+        """還在等開盤成交的建議：出場／取消條件單都當成撤掉它。"""
+        b = self.book
+        if not any(p["code"] == code and p["type"] == "open" for p in b.pending):
+            return None
+        b.pending = [p for p in b.pending if not (p["code"] == code and p["type"] == "open")]
+        b.save()
+        return {**out, "ok": True, "result": "取消等開盤的建議", "group": "cancel",
+                "line": f"• <b>{H(name)}</b>" + (f"\n  {H(e['short'])}" if e["short"] else ""),
+                "msg": f"🗑 取消 {name} 等開盤的建議\n理由：{e['reason']}"}
+
     def apply(self, a: dict) -> dict:
         kind = a.get("type")
         e = self.parse_entry(a)
@@ -1329,7 +1340,7 @@ class Advisor:
                            f"約 {qty_text(code, qty)}{note}，打到停損約虧 {loss:,.0f} 元（權益 {e['risk_pct']:g}%）\n理由：{e['reason']}"}
         if kind == "close":
             if code not in b.positions:
-                return {**out, "ok": False, "result": "沒有這檔持倉"}
+                return self.cancel_pending_open(code, name, e, out) or {**out, "ok": False, "result": "沒有這檔持倉"}
             if self.live_now and self.closes.get(code):
                 row = b.close(code, self.closes[code], "建議出場（盤中現價）", self.clock())
                 return {**out, "ok": True, "result": "現價出場", "group": "sold",
@@ -1368,7 +1379,7 @@ class Advisor:
             return self.add_plan(a, e, out)
         if kind == "cancel_plan":
             if not any(p["code"] == code for p in b.plans):
-                return {**out, "ok": False, "result": "沒有這張條件單"}
+                return self.cancel_pending_open(code, name, e, out) or {**out, "ok": False, "result": "沒有這張條件單"}
             b.plans = [p for p in b.plans if p["code"] != code]
             b.save()
             return {**out, "ok": True, "result": "取消條件單", "group": "cancel", "line": f"{bold}{why_line}",
