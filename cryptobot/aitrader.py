@@ -554,72 +554,14 @@ class Book:
         return None
 
 
-class LockedBook(Book):
-    """Paper book that takes the AI's entries as given but locks its exits until the trade first
-    reaches +2R: no stop moves, no take-profit changes, no manual close. Replaying the 42 live trades
-    (2026-11-04) showed the AI's own exit management cost about 4R (-5.59R actual vs -1.55R with the
-    original stop / take-profit untouched), so live was stopped and this is the main paper book.
-    At +2R the stop goes to breakeven at least and the AI may manage the trade again.
-    Positions opened before this book existed (no "lock" key) keep the plain Book behaviour."""
-
-    label = "鎖單模擬"
-
-    def open(self, coin, side, price, qty, stop, tp, reason, now) -> dict:
-        p = super().open(coin, side, price, qty, stop, tp, reason, now)
-        p.update(lock=True, first_entry=p["entry"], r_unit=abs(p["entry"] - stop))
-        self.save()
-        return p
-
-    def _check_unlocked(self, coin: str) -> None:
-        p = self.positions[coin]
-        if p.get("lock") and not p.get("armed"):
-            raise LiveError(f"{self.label}：+2R 之前不能移停損、改止盈或平倉")
-
-    def close(self, coin, price, why, now, slip=True) -> dict:
-        if why == "AI 平倉":
-            self._check_unlocked(coin)
-        return super().close(coin, price, why, now, slip)
-
-    def move_stop(self, coin, stop, now) -> None:
-        self._check_unlocked(coin)
-        super().move_stop(coin, stop, now)
-
-    def set_tp(self, coin, tp) -> None:
-        self._check_unlocked(coin)
-        super().set_tp(coin, tp)
-
-    def _arm(self, p: dict) -> None:
-        """First time at +2R: stop to breakeven at least, the AI may manage the trade again."""
-        p["armed"] = True
-        p["stop"] = max(p["stop"], p["entry"]) if p["side"] == "long" else min(p["stop"], p["entry"])
-
-    def _walk(self, coin, p, bars, now):
-        if not p.get("lock") or p.get("armed"):
-            return super()._walk(coin, p, bars, now)
-        long = p["side"] == "long"
-        for t0, o, h, l, _c, _v in bars:
-            if p.get("armed"):  # armed earlier in this replay: plain stop / take-profit from here on
-                return super()._walk(coin, p, [b for b in bars if b[0] >= t0], now)
-            if (l <= p["stop"]) if long else (h >= p["stop"]):  # worst case first
-                gap = (o < p["stop"]) if long else (o > p["stop"])
-                return self.close(coin, o if gap else p["stop"], "停損", now), "🛑"
-            if p["tp"] is not None and ((h >= p["tp"]) if long else (l <= p["tp"])):
-                return self.close(coin, p["tp"], "止盈", now, slip=False), "🎯"
-            if ((h if long else l) - p["first_entry"]) * (1 if long else -1) >= 2 * p["r_unit"]:
-                self._arm(p)
-                # the next check re-reads the last minute; this one must not be replayed with the new stop
-                p["since"] = max(p.get("since", p["opened"]), t0 / 1000 + 60)
-        return None
-
-
-class ScaleBook(LockedBook):
+class ScaleBook(Book):
     """Paper book running the same AI decisions with a different execution, to compare against the
     single-entry book. Every open is split into two equal legs: one at market, one resting at
     the AI's `add_at` (a higher-timeframe level; halfway to the stop if it gives none), sized so both
-    legs together lose the AI's risk_pct at the stop. Exits are locked as in LockedBook until the
-    trade first reaches +2R (the stop then goes to breakeven at least and the second leg is
-    cancelled); at the take-profit only half closes, the rest trails 1R behind the
-    best price. R is against the planned risk (both legs), so a trade the AI closes before the second
+    legs together lose the AI's risk_pct at the stop. Once the trade first reaches +2R the second
+    leg is cancelled; at the take-profit only half closes, the rest trails 1R behind the
+    best price. The AI manages its exits freely (an exit lock until +2R ran 2026-11-04..11-11;
+    the user wanted that as advice only). R is against the planned risk (both legs), so a trade the AI closes before the second
     leg fills counts for less than its single-entry twin, and so does a winner that never dipped.
     Positions opened before this book existed (no "scale" key) keep the plain Book behaviour."""
 
@@ -648,8 +590,8 @@ class ScaleBook(LockedBook):
         p["fees"] += fee
 
     def _arm(self, p: dict) -> None:
-        """First time at +2R: also no more adding."""
-        super()._arm(p)
+        """First time at +2R: no more adding."""
+        p["armed"] = True
         p["add_px"] = None
         p.pop("add_qty", None)
 
@@ -1613,8 +1555,8 @@ def main(cfg: dict, repo_dir: str, once: bool = False, live: bool = False, check
     state, logs = Path(cfg.get("state_dir", "state")), Path(cfg.get("log_dir", "logs"))
     state.mkdir(parents=True, exist_ok=True)
     logs.mkdir(parents=True, exist_ok=True)
-    # live stopped 2026-11-04: the paper books test locked exits, single entry vs scale-in
-    locked = LockedBook(state / "aitrader_locked_book.json", logs / "aitrader_locked_trades.csv", c, c["paper_cash"])
+    # live stopped 2026-11-04: paper only, single entry vs scale-in (file names from the exit-lock trial)
+    locked = Book(state / "aitrader_locked_book.json", logs / "aitrader_locked_trades.csv", c, c["paper_cash"])
     scale = ScaleBook(state / "aitrader_scale_book.json", logs / "aitrader_scale_trades.csv", c, c["paper_cash"])
     books, ex = [locked, scale], None
     if live or check or test_coin:
