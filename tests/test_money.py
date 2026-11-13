@@ -1,5 +1,7 @@
 """Money split: transfers are not profit; prediction bets come from the prediction wallet."""
 
+import pytest
+
 from cryptobot.money import money_lines, prediction_pnl, transfers_after_base
 
 
@@ -56,10 +58,14 @@ class FakeWallets:
         return [{"asset": "USDT", "free": "200", "locked": "0", "freeze": "0"}, {"asset": "BTTC", "free": "59.9"}]
 
     def privateGetAccount(self):
-        return {"balances": [{"asset": "USDT", "free": "1.5", "locked": "0"}]}
+        return {"balances": [{"asset": "USDT", "free": "1.5", "locked": "0"}, {"asset": "LDDOGE", "free": "1000"},
+                             {"asset": "SOL", "free": "0.5", "locked": "0.5"}]}
 
     def sapiGetSimpleEarnFlexiblePosition(self, _p):
         raise RuntimeError("no permission")
+
+    def publicGetTickerPrice(self):
+        return [{"symbol": "SOLUSDT", "price": "150"}, {"symbol": "DOGEUSDT", "price": "0.07"}]
 
     def sapiGetSimpleEarnLockedPosition(self, _p):
         return {"rows": []}
@@ -68,11 +74,23 @@ class FakeWallets:
 def test_holdings_add_every_wallet_and_flag_unreadable_ones():
     from cryptobot.money import holdings, holdings_text
     rows = holdings(FakeWallets(), 157.44, 96.87, {"open_cost": 10.0, "unrealized": 1.72})
-    assert dict(rows) == {"主帳戶·合約": 157.44, "主帳戶·資金錢包": 200.0, "主帳戶·現貨": 1.5, "主帳戶·理財": None,
+    assert dict(rows) == {"主帳戶·合約": 157.44, "主帳戶·資金錢包": 200.0, "主帳戶·現貨": 151.5, "主帳戶·理財": None,
                           "AI 子帳戶": 96.87, "預測下注（持倉市值）": 11.72}
     text = holdings_text(rows, today=3.0, week=None)
-    assert text.startswith("💰 全部資產 467.53 U（今天 +3.00）")
+    assert text.startswith("💰 全部資產 617.53 U（今天 +3.00）")
     assert "主帳戶·理財：讀取失敗，未計入" in text
+
+
+class FakeEarnDoge(FakeWallets):
+    def sapiGetSimpleEarnFlexiblePosition(self, _p):
+        return {"rows": [{"asset": "DOGE", "totalAmount": "2899.26"}, {"asset": "USDC", "totalAmount": "0.02"}]}
+
+
+def test_holdings_value_coins_in_earn_at_the_usdt_price():
+    from cryptobot.money import holdings
+    rows = dict(holdings(FakeEarnDoge(), 0.0, None, None))
+    assert rows["主帳戶·理財"] == pytest.approx(2899.26 * 0.07 + 0.02)
+    assert rows["主帳戶·現貨"] == pytest.approx(151.5)  # LDDOGE is the earn position again: not counted twice
 
 
 def test_total_changes_keep_the_first_reading_of_each_day(tmp_path):

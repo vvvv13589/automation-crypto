@@ -44,9 +44,21 @@ def rebates(ex, cfg: dict, rows: list[dict] | None = None) -> float:
 
 def holdings(ex, futures: float, ai: float | None, predict: dict | None) -> list[tuple[str, float | None]]:
     """Every place the money sits, in U: (label, amount; None when it could not be read).
-    Wallets count stablecoins only; prediction bets count at their current price."""
+    Wallets count stablecoins at 1 and other coins at their USDT price (coins without a USDT pair are
+    dust and skipped; spot "LD..." tokens mirror Simple Earn and are counted there); prediction bets
+    count at their current price."""
+    prices: dict[str, float] = {}
+
+    def price(asset: str) -> float:
+        if asset in STABLES:
+            return 1.0
+        if not prices:
+            prices.update((r["symbol"], float(r["price"])) for r in ex.publicGetTickerPrice())
+        return prices.get(f"{asset}USDT", 0.0)
+
     def stables(rows, asset="asset", *amounts):
-        return sum(float(r.get(a) or 0) for r in rows if r.get(asset) in STABLES for a in amounts)
+        return sum(float(r.get(a) or 0) * price(r.get(asset)) for r in rows for a in amounts
+                   if float(r.get(a) or 0))
 
     out: list[tuple[str, float | None]] = [("主帳戶·合約", futures)]
     for label, read in [
@@ -158,7 +170,7 @@ def holdings_text(rows: list[tuple[str, float | None]], today: float | None, wee
             lines.append(f"  • {label}：讀取失敗，未計入")
         elif abs(v) >= 0.01:
             lines.append(f"  • {label}：{v:.2f} U")
-    lines.append("  （只算穩定幣；今天、7 天的漲跌含轉入轉出，真實損益看下面）")
+    lines.append("  （其他幣用 USDT 市價換算；今天、7 天的漲跌含轉入轉出，真實損益看下面）")
     return "\n".join(lines)
 
 
