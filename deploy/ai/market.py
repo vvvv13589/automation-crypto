@@ -13,6 +13,7 @@ import glob
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 # ccxt lives in a dedicated sandbox venv (the AI user's home is denyRead, so a
@@ -36,10 +37,22 @@ def coin(value: str) -> str:
 
 
 TW = timezone(timedelta(hours=8))  # the user is in Taiwan: all times are UTC+8
+RETRY_WAITS = (10, 20, 30)  # seconds; rides out a short network drop (e.g. 11-23 08:33–08:36) inside a 2-min tool call
 
 
 def ts(ms) -> str:
     return datetime.fromtimestamp(ms / 1000, TW).strftime("%Y-%m-%d %H:%M")
+
+
+def call(fn, *args, **kwargs):
+    for wait in (*RETRY_WAITS, None):
+        try:
+            return fn(*args, **kwargs)
+        except ccxt.NetworkError as exc:  # timeouts, unreachable, 5xx; not bad symbols
+            if wait is None:
+                sys.exit(f"network error after {len(RETRY_WAITS)} retries: {exc}")
+            print(f"network error ({exc}), retrying in {wait}s", file=sys.stderr)
+            time.sleep(wait)
 
 
 def main(argv=None) -> int:
@@ -66,25 +79,25 @@ def main(argv=None) -> int:
     for k, v in list(os.environ.items()):
         if k.lower().endswith("_proxy"):
             os.environ[k] = re.sub(r"(//|@)localhost:", r"\g<1>127.0.0.1:", v)
-    ex = ccxt.binanceusdm({"enableRateLimit": True})
+    ex = ccxt.binanceusdm({"enableRateLimit": True, "timeout": 10000})
     if os.getenv("HTTPS_PROXY"):  # ccxt ignores the proxy environment variables
         ex.https_proxy = os.environ["HTTPS_PROXY"]
     if a.cmd == "klines":
         print("time_tw,open,high,low,close,volume")
-        for t0, op, hi, lo, cl, vol in ex.fetch_ohlcv(a.coin, a.tf, limit=limit):
+        for t0, op, hi, lo, cl, vol in call(ex.fetch_ohlcv, a.coin, a.tf, limit=limit):
             print(f"{ts(t0)},{op:.6g},{hi:.6g},{lo:.6g},{cl:.6g},{vol:.6g}")
     elif a.cmd == "funding":
-        now = ex.fetch_funding_rate(a.coin)
+        now = call(ex.fetch_funding_rate, a.coin)
         print(f"current {now.get('fundingRate')} next {now.get('fundingDatetime')} mark {now.get('markPrice')}")
         print("time_tw,rate")
-        for r in ex.fetch_funding_rate_history(a.coin, limit=limit):
+        for r in call(ex.fetch_funding_rate_history, a.coin, limit=limit):
             print(f"{ts(r['timestamp'])},{r['fundingRate']}")
     elif a.cmd == "oi":
         print("time_tw,open_interest_contracts,open_interest_usdt")
-        for r in ex.fetch_open_interest_history(a.coin, a.tf, limit=limit):
+        for r in call(ex.fetch_open_interest_history, a.coin, a.tf, limit=limit):
             print(f"{ts(r['timestamp'])},{r.get('openInterestAmount')},{r.get('openInterestValue')}")
     else:
-        for sym, tk in ex.fetch_tickers(a.coins).items():
+        for sym, tk in call(ex.fetch_tickers, a.coins).items():
             print(f"{sym.split('/')[0]} last {tk.get('last')} 24h {tk.get('percentage')}% "
                   f"high {tk.get('high')} low {tk.get('low')} quote_volume {tk.get('quoteVolume')}")
     return 0

@@ -11,12 +11,14 @@ import argparse
 import os
 import re
 import sys
+import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 TW = timezone(timedelta(hours=8))  # the user is in Taiwan: all times are UTC+8
 TFS = {"1d": "2y", "1wk": "5y", "60m": "3mo", "30m": "1mo", "15m": "1mo", "5m": "5d"}
 UA = {"User-Agent": "Mozilla/5.0 (cryptobot tw-stock)"}
+RETRY_WAITS = (10, 20, 30)  # seconds; rides out a short network drop (e.g. 11-23 08:33–08:36) inside a 2-min tool call
 
 
 def symbol(value: str) -> str:
@@ -29,9 +31,20 @@ def symbol(value: str) -> str:
 def get(url: str) -> dict:
     # requests (not urllib): it trusts the sandbox proxy's CA via REQUESTS_CA_BUNDLE, like ccxt in market.py
     import requests
-    r = requests.get(url, headers=UA, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    for wait in (*RETRY_WAITS, None):
+        try:
+            r = requests.get(url, headers=UA, timeout=10)
+            if r.status_code < 500:
+                r.raise_for_status()
+                return r.json()
+            err = f"HTTP {r.status_code}"
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            err = exc
+        if wait is None:
+            # SystemExit, not an exception: the klines .TW/.TWO fallback must not swallow it
+            sys.exit(f"network error after {len(RETRY_WAITS)} retries: {err}")
+        print(f"network error ({err}), retrying in {wait}s", file=sys.stderr)
+        time.sleep(wait)
 
 
 def main(argv=None) -> int:
